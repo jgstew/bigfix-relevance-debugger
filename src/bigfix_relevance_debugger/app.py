@@ -35,6 +35,7 @@ from bigfix_relevance_debugger.evaluation import (
     ResultRow,
     TargetForm,
     build_targets,
+    choose_breakdown_target,
     load_inventory_targets,
     run_breakdown,
     stream_results,
@@ -402,25 +403,21 @@ async def root() -> None:
         if collected is None:
             return
         targets, opts = collected
-        if len(targets) == 1:
-            [target] = targets
-        else:
-            # The breakdown runs one probe batch on one endpoint, but every
-            # inventory host is selected by default, so ask rather than refuse.
-            picked = await _choose_target(targets)
-            if picked is None:
-                return
-            target = picked
+        # Every inventory host is selected by default, so pick the best fit
+        # rather than ask; selecting a single target is the override.
+        choice = choose_breakdown_target(view, targets)
+        target = choice.target
         breakdown_box.clear()
         with breakdown_box:
             ui.label(f"Breakdown on {target.label} ...").classes("text-subtitle1")
+            ui.label(choice.reason).classes("text-caption opacity-70").mark("breakdown-reason")
             ui.spinner()
 
         async def job() -> None:
             levels = await run_breakdown(view, target, opts)
             breakdown_box.clear()
             with breakdown_box:
-                _breakdown_table(target, levels, on_hover=hover)
+                _breakdown_table(target, levels, reason=choice.reason, on_hover=hover)
 
         start(job)
 
@@ -451,25 +448,6 @@ async def root() -> None:
     client.on_delete(cancel)
 
     reanalyze()
-
-
-async def _choose_target(targets: list[Target]) -> Target | None:
-    """Ask which of several selected targets to break down on."""
-    with ui.dialog() as dialog, ui.card():
-        ui.label("Break down on which target?").classes("text-subtitle1")
-        choice = ui.radio({i: _target_option(t) for i, t in enumerate(targets)}, value=0).mark(
-            "breakdown-target-choice"
-        )
-        with ui.row().classes("w-full justify-end"):
-            ui.button("Cancel", on_click=lambda: dialog.submit(None)).props("flat").mark(
-                "breakdown-choice-cancel"
-            )
-            ui.button("Break down", on_click=lambda: dialog.submit(choice.value)).mark(
-                "breakdown-go"
-            )
-    index = await dialog
-    dialog.delete()
-    return targets[index] if index is not None else None
 
 
 def _target_option(target: Target) -> str:
@@ -510,9 +488,11 @@ def _breakdown_table(
     target: Target,
     levels: list[LevelResult],
     *,
+    reason: str,
     on_hover: Callable[[tuple[int, int] | None], None],
 ) -> None:
     ui.label(f"Breakdown on {target.label}").classes("text-subtitle1")
+    ui.label(reason).classes("text-caption opacity-70").mark("breakdown-reason")
     ui.label(
         "Objects each level produced, whole expression first. Hover a row to see it in "
         "the editor. 0 can mean empty or an error flattened to empty; -1 means not "

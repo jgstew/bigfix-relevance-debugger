@@ -63,6 +63,10 @@ class AnalysisView:
     type_summary: str | None
     """E.g. ``"singular string"``; None when the text did not parse."""
     type_errors: tuple[str, ...]
+    platforms: tuple[str, ...]
+    """Client platforms the expression's inspectors exist on (``"debian"``,
+    ``"macos"``, ``"rhel"``, ``"ubuntu"``, ``"windows"``), sorted. Empty when
+    the text did not parse."""
     complexity_score: float
     evaluation_cost: float
     costly_inspectors: tuple[str, ...]
@@ -103,6 +107,13 @@ def summarize(text: str) -> AnalysisView:
 
     check = analysis.check
     type_errors = tuple(d.message for d in check.diagnostics) if check is not None else ()
+    # The type check also lists session environments ("session:rest_api", ...);
+    # only client platforms can be matched against an endpoint.
+    platforms = (
+        tuple(sorted(p for p in check.value.platforms if not p.startswith("session:")))
+        if check is not None
+        else ()
+    )
 
     levels = tuple(
         LevelView(
@@ -134,6 +145,7 @@ def summarize(text: str) -> AnalysisView:
         dialect=dialect,
         type_summary=_type_summary(check),
         type_errors=type_errors,
+        platforms=platforms,
         complexity_score=complexity.score,
         evaluation_cost=complexity.evaluation_cost,
         costly_inspectors=tuple(complexity.costly_inspectors),

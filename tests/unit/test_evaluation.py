@@ -22,9 +22,11 @@ from bigfix_relevance_debugger.evaluation import (
     TargetForm,
     TargetFormError,
     build_targets,
+    choose_breakdown_target,
     load_inventory_targets,
     run_breakdown,
     stream_results,
+    target_platform,
     total_work,
 )
 
@@ -656,3 +658,153 @@ def test_cleared_inventory_selection_means_no_inventory_targets():
     targets = build_targets(TargetForm(local=True, inventory_selected=None), inventory)
 
     assert [t.kind for t in targets] == ["local"]
+
+
+# --- choosing the breakdown target ----------------------------------------------------
+
+REGISTRY = 'exists key "HKLM\\\\Software" of registry'
+RPM = 'names of rpm package "bash" of rpm'
+
+
+def container(image):
+    return Target(kind="container", name=image, image=image, arch="x86_64")
+
+
+@pytest.mark.parametrize(
+    ("target", "platform"),
+    [
+        (Target(kind="ssh", name="win", platform="windows"), "windows"),
+        (Target(kind="ssh", name="pi", platform="raspbian"), "debian"),
+        (Target(kind="ssh", name="sles", platform="suse"), None),
+        (Target(kind="ssh", name="unknown"), None),
+        (container("debian:11"), "debian"),
+        (container("ubuntu:24.04"), "ubuntu"),
+        (container("almalinux:9"), "rhel"),
+        (container("amazonlinux:2023"), "rhel"),
+        (container("oraclelinux:9"), "rhel"),
+        (container("registry.access.redhat.com/ubi9/ubi"), "rhel"),
+        (container("opensuse/leap:15"), None),
+        (container("mystery:1"), None),
+        # An explicit platform beats the image name.
+        (
+            Target(kind="container", name="x", image="debian:11", platform="ubuntu"),
+            "ubuntu",
+        ),
+    ],
+)
+def test_target_platform(target, platform):
+    assert target_platform(target) == platform
+
+
+@pytest.mark.parametrize(
+    ("sys_platform", "platform"), [("darwin", "macos"), ("win32", "windows"), ("linux", None)]
+)
+def test_local_target_platform_is_this_machine(monkeypatch, sys_platform, platform):
+    monkeypatch.setattr("sys.platform", sys_platform)
+
+    assert target_platform(Target(kind="local", name="local")) == platform
+
+
+def test_single_target_is_used_as_is():
+    only = Target(kind="ssh", name="only")
+
+    choice = choose_breakdown_target(summarize(REGISTRY), [only])
+
+    assert choice.target is only
+    assert "only selected target" in choice.reason
+
+
+def test_platform_match_wins():
+    windows = Target(kind="ssh", name="win", platform="windows")
+
+    choice = choose_breakdown_target(summarize(REGISTRY), [container("debian:11"), windows])
+
+    assert choice.target is windows
+    assert "windows" in choice.reason
+
+
+def test_rpm_expression_picks_rpm_family_container():
+    alma = container("almalinux:9")
+
+    choice = choose_breakdown_target(summarize(RPM), [container("debian:11"), alma])
+
+    assert choice.target is alma
+
+
+def test_known_match_beats_unknown_platform():
+    windows = Target(kind="ssh", name="win", platform="windows")
+
+    choice = choose_breakdown_target(
+        summarize(REGISTRY), [Target(kind="ssh", name="unknown"), windows]
+    )
+
+    assert choice.target is windows
+
+
+def test_unknown_platform_beats_known_mismatch():
+    unknown = Target(kind="ssh", name="unknown")
+
+    choice = choose_breakdown_target(summarize(REGISTRY), [container("debian:11"), unknown])
+
+    assert choice.target is unknown
+
+
+def test_portable_expression_prefers_containers_then_ssh_and_avoids_online_evaluator():
+    deb = container("debian:11")
+    targets = [
+        Target(kind="online_evaluator", name="dev", base_url="https://example.invalid"),
+        Target(kind="local", name="local", platform="macos"),
+        Target(kind="ssh", name="lab", platform="ubuntu"),
+        deb,
+    ]
+
+    assert choose_breakdown_target(summarize("name of operating system"), targets).target is deb
+
+
+def test_ties_keep_selection_order():
+    first, second = container("debian:11"), container("debian:12")
+
+    choice = choose_breakdown_target(summarize("name of operating system"), [first, second])
+
+    assert choice.target is first
+
+
+def test_no_compatible_target_still_picks_one_and_says_so():
+    deb = container("debian:11")
+
+    choice = choose_breakdown_target(summarize(REGISTRY), [deb])
+
+    assert choice.target is deb
+    choice = choose_breakdown_target(summarize(REGISTRY), [deb, container("ubuntu:24.04")])
+    assert "windows" in choice.reason
+    assert "no selected target" in choice.reason
+
+
+def test_choose_from_nothing_is_an_error():
+    with pytest.raises(TargetFormError):
+        choose_breakdown_target(summarize(REGISTRY), [])
+
+
+@pytest.mark.parametrize(
+    ("machine", "native"), [("arm64", "arm64"), ("aarch64", "arm64"), ("AMD64", "x86_64")]
+)
+def test_native_arch_container_preferred(monkeypatch, machine, native):
+    monkeypatch.setattr("platform.machine", lambda: machine)
+    x86 = Target(kind="container", name="d", image="debian:12")  # unset arch means x86_64
+    arm = Target(kind="container", name="d@arm64", image="debian:11", arch="arm64")
+    expected = arm if native == "arm64" else x86
+
+    choice = choose_breakdown_target(summarize("name of operating system"), [x86, arm])
+
+    assert choice.target is expected
+    assert native in choice.reason
+
+
+def test_platform_fit_still_beats_native_arch(monkeypatch):
+    monkeypatch.setattr("platform.machine", lambda: "arm64")
+    alma_x86 = Target(kind="container", name="alma", image="almalinux:9", arch="x86_64")
+    deb_arm = Target(kind="container", name="deb", image="debian:11", arch="arm64")
+
+    choice = choose_breakdown_target(summarize(RPM), [deb_arm, alma_x86])
+
+    assert choice.target is alma_x86

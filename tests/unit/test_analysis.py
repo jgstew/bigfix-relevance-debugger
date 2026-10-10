@@ -209,3 +209,31 @@ def test_out_of_range_or_empty_highlight_is_dropped():
 
     assert editor_decorations(view, highlight=(5, 5)) == []
     assert editor_decorations(view, highlight=(0, 999)) == []
+
+
+# --- platforms ----------------------------------------------------------------
+
+
+def test_platform_specific_expression_reports_its_platform():
+    assert summarize('exists key "HKLM\\\\Software" of registry').platforms == ("windows",)
+
+
+def test_portable_expression_reports_every_client_platform():
+    assert summarize("name of operating system").platforms == (
+        "debian",
+        "macos",
+        "rhel",
+        "ubuntu",
+        "windows",
+    )
+
+
+def test_platforms_exclude_session_environments():
+    platforms = summarize('exists debianpackage "bash"').platforms
+
+    assert platforms
+    assert not any(p.startswith("session:") for p in platforms)
+
+
+def test_unparseable_expression_has_no_platforms():
+    assert summarize("name of (operating system").platforms == ()

@@ -71,8 +71,24 @@ and doesn't stop the app.
 whole inventory (plus any Local/Container/SSH target you tick). Remove hosts
 from the picker to narrow a run. With many container hosts, the first run
 against images that aren't cached yet is slow; **Max parallel** limits how
-many targets run at once. **Breakdown** runs on one endpoint, so when more
-than one target is selected it asks which one.
+many targets run at once.
+
+**Breakdown** runs on one endpoint and picks it for you from the selected
+targets, without asking:
+
+1. **Platform fit.** The analyzer reports which platforms the expression's
+   inspectors exist on (e.g. `registry` is Windows-only, `rpm` is RHEL-family).
+   A target's platform comes from its inventory `platform`, its container
+   image name, or this machine for `local`. A known match wins, then unknown,
+   then a known mismatch.
+2. **Kind.** Containers, then SSH, local, fastquery, and the online evaluator
+   last, since that one sends the relevance to an outside service.
+3. **Native arch.** A container in this machine's arch (e.g. arm64 on Apple
+   Silicon) beats an emulated one.
+4. **Selection order.**
+
+The breakdown header says which target was picked and why. To break down on
+a specific target, select only that one.
 
 ## Demo script
 
@@ -89,7 +105,8 @@ than one target is selected it asks which one.
 4. Type a typo, e.g. `name of operating sytem`. The text gets a wavy
    underline and a lint finding appears with suggestions.
 5. Type `names of files whose (size of it > 1000) of folder "/etc"` (or pick
-   it from **Examples**) and click **Breakdown**. Per-level counts appear.
+   it from **Examples**) and click **Breakdown**. With several targets
+   selected, it picks the best fit itself and says why. Per-level counts appear.
    The `whose` level shows filtered vs unfiltered counts, e.g. `7 of 43`.
    Hover a row to highlight that level in the editor.
 6. Change the folder to one that doesn't exist (`"/nope"`) and break it down

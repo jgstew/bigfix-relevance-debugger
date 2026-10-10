@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import itertools
 import logging
+import platform
+import re
+import sys
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from contextlib import aclosing
 from dataclasses import dataclass, field
@@ -114,6 +117,134 @@ def build_targets(form: TargetForm, inventory: Sequence[Target] = ()) -> list[Ta
     if not targets:
         raise TargetFormError("Pick at least one target.")
     return targets
+
+
+# --- choosing the breakdown target --------------------------------------------------
+
+# Library platform keys the analyzer has no separate name for. suse is left
+# out on purpose: the analyzer has no SUSE platform, so its fit is unknown.
+_PLATFORM_ALIASES = {"raspbian": "debian"}
+
+# Container image-name tokens -> analyzer platform. Mirrors the os-release
+# families bigfix-remote-client-relevance classifies a probed image into.
+_IMAGE_TOKENS = {
+    "debian": "debian",
+    "raspbian": "debian",
+    "ubuntu": "ubuntu",
+    "rhel": "rhel",
+    "ubi": "rhel",
+    "ubi8": "rhel",
+    "ubi9": "rhel",
+    "redhat": "rhel",
+    "fedora": "rhel",
+    "centos": "rhel",
+    "almalinux": "rhel",
+    "rockylinux": "rhel",
+    "rocky": "rhel",
+    "oraclelinux": "rhel",
+    "amazonlinux": "rhel",
+    "windows": "windows",
+    "servercore": "windows",
+    "nanoserver": "windows",
+}
+
+_SYS_PLATFORMS = {"darwin": "macos", "win32": "windows"}
+
+# Tie-break among equally suitable targets: containers are the reliable path,
+# the online evaluator sends the relevance to a third-party service.
+_KIND_PREFERENCE = ("container", "ssh", "local", "fastquery", "online_evaluator")
+
+
+def target_platform(target: Target) -> str | None:
+    """The analyzer platform a target will evaluate on, if knowable without connecting.
+
+    An explicit (or inventory-recorded) platform wins; otherwise a container
+    is read from its image name and ``local`` from this machine. None means
+    unknown -- e.g. an SSH host never probed, or a Linux controller's distro.
+    """
+    if target.platform:
+        if target.platform == "suse":
+            return None
+        return _PLATFORM_ALIASES.get(target.platform, target.platform)
+    if target.kind == "container":
+        image = (target.image or target.name).lower()
+        for token in re.split(r"[/:._@-]", image):
+            if token in _IMAGE_TOKENS:
+                return _IMAGE_TOKENS[token]
+        return None
+    if target.kind == "local":
+        return _SYS_PLATFORMS.get(sys.platform)
+    return None
+
+
+_ARCH_ALIASES = {"aarch64": "arm64", "amd64": "x86_64", "x64": "x86_64"}
+
+
+def _host_arch() -> str:
+    machine = platform.machine().lower()
+    return _ARCH_ALIASES.get(machine, machine)
+
+
+def _native_container(target: Target, host_arch: str) -> bool:
+    # An unset container arch runs as x86_64, the library's default.
+    return target.kind == "container" and (target.arch or "x86_64") == host_arch
+
+
+@dataclass(frozen=True)
+class BreakdownChoice:
+    target: Target
+    reason: str
+    """User-facing: why this target, e.g. which platform it matched."""
+
+
+def choose_breakdown_target(analysis: AnalysisView, targets: Sequence[Target]) -> BreakdownChoice:
+    """Pick the selected target a breakdown is most likely to be meaningful on.
+
+    Ranked by platform fit with the expression (a known match, then unknown,
+    then a known mismatch), then by kind (see ``_KIND_PREFERENCE``), then by
+    selection order. Selecting a single target is how a user overrides this.
+    """
+    if not targets:
+        raise TargetFormError("Pick at least one target.")
+    if len(targets) == 1:
+        return BreakdownChoice(targets[0], "the only selected target")
+
+    wanted = set(analysis.platforms)
+    host_arch = _host_arch()
+
+    def rank(item: tuple[int, Target]) -> tuple[int, int, int, int]:
+        index, target = item
+        platform = target_platform(target)
+        fit = 1 if platform is None else (0 if platform in wanted else 2)
+        kind = (
+            _KIND_PREFERENCE.index(target.kind)
+            if target.kind in _KIND_PREFERENCE
+            else len(_KIND_PREFERENCE)
+        )
+        # A container in this machine's arch runs natively, not emulated.
+        emulated = 0 if target.kind != "container" or _native_container(target, host_arch) else 1
+        return fit, kind, emulated, index
+
+    _, best = min(enumerate(targets), key=rank)
+    platform = target_platform(best)
+    portable = wanted >= {"debian", "macos", "rhel", "ubuntu", "windows"}
+    if platform is not None and platform in wanted:
+        why = f"its platform ({platform}) supports this expression"
+        if portable:
+            why = f"a {best.kind} target; this expression runs on every platform"
+    elif platform is None:
+        why = (
+            f"no selected target is known to be {' / '.join(sorted(wanted))}; "
+            "this one's platform is unknown"
+        )
+    else:
+        why = (
+            f"no selected target matches {' / '.join(sorted(wanted)) or 'this expression'}; "
+            "expect empty or error counts"
+        )
+    if _native_container(best, host_arch):
+        why += f" (native {host_arch})"
+    return BreakdownChoice(best, f"picked from {len(targets)} selected: {why}")
 
 
 @dataclass(frozen=True)

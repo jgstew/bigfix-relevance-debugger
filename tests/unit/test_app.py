@@ -484,7 +484,7 @@ async def test_evaluate_defaults_to_every_inventory_target(inventory_user, monke
     assert seen["targets"] == TWO_HOSTS
 
 
-async def test_breakdown_with_several_targets_asks_which_one(inventory_user, monkeypatch):
+async def test_breakdown_with_several_targets_picks_one_without_asking(inventory_user, monkeypatch):
     seen: dict = {}
 
     async def fake_breakdown(view, target, opts, **upstream):
@@ -496,29 +496,38 @@ async def test_breakdown_with_several_targets_asks_which_one(inventory_user, mon
     await set_text(inventory_user, "name of operating system")
 
     inventory_user.find(marker="breakdown").click()
-    await inventory_user.should_see(marker="breakdown-target-choice")
-    [choice] = inventory_user.find(marker="breakdown-target-choice").elements
-    choice.set_value(1)
-    inventory_user.find(marker="breakdown-go").click()
     await asyncio.sleep(0.1)
 
-    assert seen["target"] == TWO_HOSTS[1]
+    # Equal fit, same kind: selection order decides.
+    assert seen["target"] == TWO_HOSTS[0]
+    await inventory_user.should_not_see(marker="breakdown-target-choice")
+    await inventory_user.should_see(marker="breakdown-reason")
 
 
-async def test_breakdown_target_choice_can_be_cancelled(inventory_user, monkeypatch):
+async def test_breakdown_picks_the_target_matching_the_expressions_platform(monkeypatch, tmp_path):
+    windows = Target(kind="ssh", name="win-box", platform="windows")
+    inventory = [Target(kind="container", name="debian:11", image="debian:11"), windows]
+    monkeypatch.setattr(app_module, "_inventory_path", tmp_path / "remote_clients.toml")
+    monkeypatch.setattr(
+        app_module,
+        "load_inventory_targets",
+        lambda path: InventoryLoad(path=path, targets=inventory, error=None),
+    )
+    seen: dict = {}
+
     async def fake_breakdown(view, target, opts, **upstream):
-        pytest.fail("should not run")
+        seen["target"] = target
+        return []
 
     monkeypatch.setattr(app_module, "run_breakdown", fake_breakdown)
-    await inventory_user.open("/")
-    await set_text(inventory_user, "name of operating system")
+    async with user_simulation(root=app_module.root) as user:
+        await user.open("/")
+        await set_text(user, 'exists key "HKLM\\Software" of registry')
 
-    inventory_user.find(marker="breakdown").click()
-    await inventory_user.should_see(marker="breakdown-target-choice")
-    inventory_user.find(marker="breakdown-choice-cancel").click()
-    await asyncio.sleep(0.1)
+        user.find(marker="breakdown").click()
+        await asyncio.sleep(0.1)
 
-    assert button(inventory_user, "evaluate").enabled
+    assert seen["target"] is windows
 
 
 async def test_inventory_picker_is_clearable(inventory_user):
