@@ -1,0 +1,53 @@
+---
+# run on staged files:          pre-commit
+# install the git hook:         pre-commit install
+# check all files in repo:      pre-commit run --all-files
+# include the slower hooks:     pre-commit run --all-files --hook-stage manual
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: 3e8a8703264a2f4a69428a0aa4dcb512790b2c8c # v6.0.0
+    hooks:
+      - id: check-yaml
+      - id: check-toml
+      - id: check-json
+      - id: check-added-large-files
+        args: ["--maxkb=500"]
+      - id: check-ast
+      - id: check-case-conflict
+      - id: check-merge-conflict
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: mixed-line-ending
+      - id: detect-private-key
+      - id: debug-statements
+      - id: name-tests-test
+        args: ["--pytest-test-first"]
+        exclude: ^tests/conftest\.py$
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: a56c0b927e6465d37cae3e97d35d4d18ab2b96cd # v0.16.9
+    hooks:
+      - id: ruff-check
+        args: [--fix, --exit-non-zero-on-fix]
+      - id: ruff-format
+
+  - repo: https://github.com/astral-sh/uv-pre-commit
+    rev: fecaddcd0b0601a3c02f729ae7a110511d2b52a6 # 0.12.20
+    hooks:
+      - id: uv-lock
+
+  - repo: local
+    hooks:
+      - id: pyright
+        name: pyright (uv run pyright src tests)
+        language: system
+        pass_filenames: false
+        types: [python]
+        entry: uv run --frozen pyright src tests
+      - id: pytest
+        name: pytest (offline unit suite)
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push, manual]
+        entry: uv run --frozen pytest -q

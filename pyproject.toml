@@ -1,0 +1,74 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bigfix-relevance-debugger"
+version = "0.1.0"
+description = "A browser GUI for BigFix client relevance: live static analysis, remote evaluation with qna, and a per-level breakdown."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [
+    { name = "JGStew", email = "admin@jgstew.com" },
+]
+requires-python = ">=3.11"
+keywords = ["bigfix", "qna", "client-relevance", "relevance", "debugger", "nicegui"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: System Administrators",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: System :: Systems Administration",
+  "Typing :: Typed",
+]
+dependencies = [
+    "bigfix-relevance-analyzer>=1.29.1",
+    "bigfix-remote-client-relevance>=1.5.2",
+    "nicegui>=3.18.0",
+]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.414",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.17.0",
+]
+
+[project.scripts]
+bigfix-relevance-debugger = "bigfix_relevance_debugger.app:main"
+
+[project.urls]
+Homepage = "https://github.com/jgstew/bigfix-relevance-debugger"
+Issues   = "https://github.com/jgstew/bigfix-relevance-debugger/issues"
+Source   = "https://github.com/jgstew/bigfix-relevance-debugger"
+
+# --- Build backend ---------------------------------------------------------
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bigfix_relevance_debugger"]
+
+# --- uv --------------------------------------------------------------------
+
+[tool.uv]
+python-preference = "managed"
+
+# --- Tooling ---------------------------------------------------------------
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Logging, never print -- same rule as bigfix-remote-client-relevance.
+extend-select = ["T20"]
