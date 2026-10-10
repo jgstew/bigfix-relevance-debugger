@@ -143,6 +143,8 @@ async def root() -> None:
     ui.page_title(TITLE)
     state = _PageState()
     inventory = load_inventory_targets(_inventory_path or find_inventory_path())
+    # Evaluate runs on the whole inventory unless hosts are deselected.
+    state.form.inventory_selected = list(range(len(inventory.targets)))
 
     with ui.header().classes("items-center"):
         ui.label(TITLE).classes("text-h6")
@@ -224,6 +226,7 @@ async def root() -> None:
                     ui.select(
                         {i: _target_option(t) for i, t in enumerate(inventory.targets)},
                         multiple=True,
+                        clearable=True,
                         label=f"Inventory ({inventory.path})",
                     ).bind_value(state.form, "inventory_selected").classes("w-full").mark(
                         "inventory"
@@ -399,10 +402,15 @@ async def root() -> None:
         if collected is None:
             return
         targets, opts = collected
-        if len(targets) != 1:
-            ui.notify("Breakdown runs on exactly one target; select just one.", type="warning")
-            return
-        [target] = targets
+        if len(targets) == 1:
+            [target] = targets
+        else:
+            # The breakdown runs one probe batch on one endpoint, but every
+            # inventory host is selected by default, so ask rather than refuse.
+            picked = await _choose_target(targets)
+            if picked is None:
+                return
+            target = picked
         breakdown_box.clear()
         with breakdown_box:
             ui.label(f"Breakdown on {target.label} ...").classes("text-subtitle1")
@@ -443,6 +451,25 @@ async def root() -> None:
     client.on_delete(cancel)
 
     reanalyze()
+
+
+async def _choose_target(targets: list[Target]) -> Target | None:
+    """Ask which of several selected targets to break down on."""
+    with ui.dialog() as dialog, ui.card():
+        ui.label("Break down on which target?").classes("text-subtitle1")
+        choice = ui.radio({i: _target_option(t) for i, t in enumerate(targets)}, value=0).mark(
+            "breakdown-target-choice"
+        )
+        with ui.row().classes("w-full justify-end"):
+            ui.button("Cancel", on_click=lambda: dialog.submit(None)).props("flat").mark(
+                "breakdown-choice-cancel"
+            )
+            ui.button("Break down", on_click=lambda: dialog.submit(choice.value)).mark(
+                "breakdown-go"
+            )
+    index = await dialog
+    dialog.delete()
+    return targets[index] if index is not None else None
 
 
 def _target_option(target: Target) -> str:

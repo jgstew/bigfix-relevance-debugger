@@ -67,12 +67,20 @@ the all-users config dir. Hosts added there, by hand or by its
 different file. A file that fails to load is shown as an error in the picker
 and doesn't stop the app.
 
+**Every inventory host is selected by default**, so **Evaluate** runs on the
+whole inventory (plus any Local/Container/SSH target you tick). Remove hosts
+from the picker to narrow a run. With many container hosts, the first run
+against images that aren't cached yet is slow; **Max parallel** limits how
+many targets run at once. **Breakdown** runs on one endpoint, so when more
+than one target is selected it asks which one.
+
 ## Demo script
 
 1. `uvx --from git+https://github.com/jgstew/bigfix-relevance-debugger bigfix-relevance-debugger`
 2. Type `name of operating system`. Live analysis shows a clean parse, the
    type `singular string` and a low complexity score.
-3. Tick **Container**, keep image `debian:11`, set Arch to `arm64` (on Apple
+3. Clear the **Inventory** picker (every host in it is selected by default),
+   then tick **Container**, keep image `debian:11`, set Arch to `arm64` (on Apple
    Silicon) and qna version to `11.0.7.61`, then click **Evaluate**. An answer
    row appears with the qna version, platform/arch and elapsed time. If the
    library had to step back to an older qna build for that image, the row
@@ -88,8 +96,9 @@ and doesn't stop the app.
    again. The first level that fails is highlighted with an arrow, and its
    error ("Singular expression refers to nonexistent object") is shown
    inline.
-7. Optional: add a second image (`debian:11, ubuntu:24.04`), both arches, or
-   an SSH host, then **Evaluate** to watch results stream in completion order.
+7. Optional: put the inventory hosts back, add a second image
+   (`debian:11, ubuntu:24.04`) or both arches, then **Evaluate** to watch
+   results stream in completion order.
    **Cancel** stops a run and cleans up its containers. **Export JSON**
    saves the results.
 

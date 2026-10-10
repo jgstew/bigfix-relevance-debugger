@@ -63,8 +63,8 @@ class TargetForm:
     ssh_become: bool = False
     ssh_verify_host_key: bool = True
 
-    inventory_selected: list[int] = field(default_factory=list)
-    """Indexes into the loaded inventory's targets."""
+    inventory_selected: list[int] | None = field(default_factory=list)
+    """Indexes into the loaded inventory's targets. None when the picker is cleared."""
 
 
 def build_targets(form: TargetForm, inventory: Sequence[Target] = ()) -> list[Target]:
@@ -108,7 +108,8 @@ def build_targets(form: TargetForm, inventory: Sequence[Target] = ()) -> list[Ta
             )
         )
 
-    targets.extend(inventory[i] for i in form.inventory_selected if 0 <= i < len(inventory))
+    selected = form.inventory_selected or []
+    targets.extend(inventory[i] for i in selected if 0 <= i < len(inventory))
 
     if not targets:
         raise TargetFormError("Pick at least one target.")

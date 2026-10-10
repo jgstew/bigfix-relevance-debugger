@@ -647,3 +647,12 @@ def test_count_text_without_unfiltered():
     lr = LevelResult(_level(), _probe("not-evaluable"), None, False)
 
     assert lr.count_text == "not-evaluable"
+
+
+def test_cleared_inventory_selection_means_no_inventory_targets():
+    # A cleared multi-select reports None, not [].
+    inventory = [Target(kind="ssh", name="a")]
+
+    targets = build_targets(TargetForm(local=True, inventory_selected=None), inventory)
+
+    assert [t.kind for t in targets] == ["local"]
