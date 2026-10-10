@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 from bigfix_remote_client_relevance import ClientRelevanceResult, ResolvedQna, Target
 
+from bigfix_relevance_debugger import evaluation
 from bigfix_relevance_debugger.analysis import summarize
 from bigfix_relevance_debugger.evaluation import (
     EvalOptions,
@@ -21,12 +22,13 @@ from bigfix_relevance_debugger.evaluation import (
     ResultRow,
     TargetForm,
     TargetFormError,
+    analyzer_platform,
     build_targets,
     choose_breakdown_target,
     load_inventory_targets,
+    resolve_container_arches,
     run_breakdown,
     stream_results,
-    target_platform,
     total_work,
 )
 
@@ -123,11 +125,102 @@ def test_container_target_single_arch():
     assert target.label == "container:debian:11@arm64"
 
 
-def test_container_default_image_is_debian_11():
+def test_container_default_image_is_debian_11_on_auto_arch():
+    form = TargetForm(container=True)
+
+    assert form.container_images == "debian:11"
+    assert form.container_arches == ["auto"]
+
+
+def test_auto_arch_without_a_resolver_is_this_machine(monkeypatch):
+    monkeypatch.setattr(evaluation, "host_arch", lambda: "arm64")
+
     [target] = build_targets(TargetForm(container=True))
 
-    assert target.image == "debian:11"
-    assert target.arch == "x86_64"
+    assert target.arch == "arm64"
+
+
+def test_auto_arch_runs_every_published_arch():
+    targets = build_targets(
+        TargetForm(container=True), image_arches={"debian:11": ["x86_64", "arm64"]}
+    )
+
+    assert [t.label for t in targets] == [
+        "container:debian:11@x86_64",
+        "container:debian:11@arm64",
+    ]
+    assert len({t.name for t in targets}) == 2
+
+
+def test_auto_arch_per_image():
+    targets = build_targets(
+        TargetForm(container=True, container_images="debian:11, x86-only:1"),
+        image_arches={"debian:11": ["x86_64", "arm64"], "x86-only:1": ["x86_64"]},
+    )
+
+    assert [t.label for t in targets] == [
+        "container:debian:11@x86_64",
+        "container:debian:11@arm64",
+        "container:x86-only:1@x86_64",
+    ]
+
+
+def test_auto_plus_explicit_arch_is_deduplicated():
+    targets = build_targets(
+        TargetForm(container=True, container_arches=["auto", "arm64"]),
+        image_arches={"debian:11": ["x86_64", "arm64"]},
+    )
+
+    assert [t.arch for t in targets] == ["x86_64", "arm64"]
+
+
+class FakeImages:
+    def __init__(self, published):
+        self.published = published
+        self.asked: list[str] = []
+
+    def local_tags(self):
+        return []
+
+    def platforms(self, image):
+        self.asked.append(image)
+        return self.published.get(image)
+
+
+async def test_resolve_container_arches_asks_the_registry_per_image():
+    images = FakeImages({"debian:11": {"x86_64", "arm64"}, "x86-only:1": {"x86_64"}})
+
+    resolved = await resolve_container_arches(
+        TargetForm(container=True, container_images="debian:11, x86-only:1"),
+        images_factory=lambda: images,
+    )
+
+    assert resolved == {"debian:11": ["x86_64", "arm64"], "x86-only:1": ["x86_64"]}
+
+
+async def test_resolve_container_arches_skips_the_registry_when_not_needed():
+    def explode():
+        raise AssertionError("no engine lookup expected")
+
+    assert await resolve_container_arches(TargetForm(), images_factory=explode) == {}
+    assert (
+        await resolve_container_arches(
+            TargetForm(container=True, container_arches=["arm64"]), images_factory=explode
+        )
+        == {}
+    )
+
+
+async def test_resolve_container_arches_without_an_engine_is_this_machine(monkeypatch):
+    from bigfix_relevance_debugger.upstream import remote_client_relevance
+
+    monkeypatch.setattr(remote_client_relevance, "host_arch", lambda: "arm64")
+
+    resolved = await resolve_container_arches(
+        TargetForm(container=True), images_factory=lambda: None
+    )
+
+    assert resolved == {"debian:11": ["arm64"]}
 
 
 def test_container_rebuild_image():
@@ -673,36 +766,16 @@ def container(image):
 @pytest.mark.parametrize(
     ("target", "platform"),
     [
-        (Target(kind="ssh", name="win", platform="windows"), "windows"),
         (Target(kind="ssh", name="pi", platform="raspbian"), "debian"),
         (Target(kind="ssh", name="sles", platform="suse"), None),
-        (Target(kind="ssh", name="unknown"), None),
-        (container("debian:11"), "debian"),
-        (container("ubuntu:24.04"), "ubuntu"),
-        (container("almalinux:9"), "rhel"),
-        (container("amazonlinux:2023"), "rhel"),
-        (container("oraclelinux:9"), "rhel"),
-        (container("registry.access.redhat.com/ubi9/ubi"), "rhel"),
         (container("opensuse/leap:15"), None),
-        (container("mystery:1"), None),
-        # An explicit platform beats the image name.
-        (
-            Target(kind="container", name="x", image="debian:11", platform="ubuntu"),
-            "ubuntu",
-        ),
+        (container("almalinux:9"), "rhel"),
+        (Target(kind="ssh", name="unknown"), None),
     ],
 )
-def test_target_platform(target, platform):
-    assert target_platform(target) == platform
-
-
-@pytest.mark.parametrize(
-    ("sys_platform", "platform"), [("darwin", "macos"), ("win32", "windows"), ("linux", None)]
-)
-def test_local_target_platform_is_this_machine(monkeypatch, sys_platform, platform):
-    monkeypatch.setattr("sys.platform", sys_platform)
-
-    assert target_platform(Target(kind="local", name="local")) == platform
+def test_analyzer_platform_translates_library_keys(target, platform):
+    # The analyzer has no raspbian (it is debian) and no SUSE at all (unknown fit).
+    assert analyzer_platform(target) == platform
 
 
 def test_single_target_is_used_as_is():

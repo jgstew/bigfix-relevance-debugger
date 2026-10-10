@@ -17,6 +17,8 @@ from bigfix_relevance_analyzer import (
     lint_text,
 )
 
+from bigfix_relevance_debugger.upstream.relevance_analyzer import client_platforms
+
 
 @dataclass(frozen=True)
 class ParseErrorView:
@@ -107,13 +109,7 @@ def summarize(text: str) -> AnalysisView:
 
     check = analysis.check
     type_errors = tuple(d.message for d in check.diagnostics) if check is not None else ()
-    # The type check also lists session environments ("session:rest_api", ...);
-    # only client platforms can be matched against an endpoint.
-    platforms = (
-        tuple(sorted(p for p in check.value.platforms if not p.startswith("session:")))
-        if check is not None
-        else ()
-    )
+    platforms = client_platforms(analysis)
 
     levels = tuple(
         LevelView(

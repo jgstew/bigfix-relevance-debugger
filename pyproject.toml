@@ -30,7 +30,7 @@ classifiers = [
 dependencies = [
     "bigfix-relevance-analyzer>=1.29.1",
     "bigfix-remote-client-relevance>=1.5.2",
-    "nicegui>=3.18.0",
+    "nicegui[native]>=3.18.0",
 ]
 
 [dependency-groups]

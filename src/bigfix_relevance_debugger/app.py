@@ -13,6 +13,9 @@ import importlib.util
 import inspect
 import json
 import logging
+import os
+import sys
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -30,18 +33,22 @@ from bigfix_relevance_debugger import __version__
 from bigfix_relevance_debugger.analysis import AnalysisView, editor_decorations, summarize
 from bigfix_relevance_debugger.evaluation import (
     ARCHES,
+    AUTO_ARCH,
     EvalOptions,
+    InventoryLoad,
     LevelResult,
     ResultRow,
     TargetForm,
     build_targets,
     choose_breakdown_target,
     load_inventory_targets,
+    resolve_container_arches,
     run_breakdown,
     stream_results,
     total_work,
 )
 from bigfix_relevance_debugger.log_bridge import attach, detach
+from bigfix_relevance_debugger.upstream.remote_client_relevance import find_or_discover_inventory
 
 logger = logging.getLogger(__name__)
 
@@ -143,9 +150,9 @@ async def root() -> None:
     ui.add_css(_CSS)
     ui.page_title(TITLE)
     state = _PageState()
-    inventory = load_inventory_targets(_inventory_path or find_inventory_path())
-    # Evaluate runs on the whole inventory unless hosts are deselected.
-    state.form.inventory_selected = list(range(len(inventory.targets)))
+    # Filled in by load_inventory() once the page is up: first-run discovery
+    # can take minutes and must not hold up the page.
+    inventory = InventoryLoad(path=None, targets=[], error=None)
 
     with ui.header().classes("items-center"):
         ui.label(TITLE).classes("text-h6")
@@ -198,9 +205,12 @@ async def root() -> None:
                     ui.input("Image(s), comma-separated").bind_value(
                         state.form, "container_images"
                     ).classes("w-full")
-                    ui.select(list(ARCHES), multiple=True, label="Arch").bind_value(
-                        state.form, "container_arches"
-                    ).classes("w-full")
+                    ui.select(
+                        {AUTO_ARCH: "auto (every arch the image publishes)"}
+                        | {a: a for a in ARCHES},
+                        multiple=True,
+                        label="Arch",
+                    ).bind_value(state.form, "container_arches").classes("w-full")
                     ui.checkbox("Rebuild image").bind_value(state.form, "rebuild_image")
                 container_opts.bind_visibility_from(state.form, "container")
 
@@ -219,19 +229,7 @@ async def root() -> None:
                     )
                 ssh_opts.bind_visibility_from(state.form, "ssh")
 
-                if inventory.error:
-                    ui.label(f"Inventory {inventory.path}: {inventory.error}").classes(
-                        "text-negative text-caption"
-                    ).mark("inventory-error")
-                elif inventory.targets:
-                    ui.select(
-                        {i: _target_option(t) for i, t in enumerate(inventory.targets)},
-                        multiple=True,
-                        clearable=True,
-                        label=f"Inventory ({inventory.path})",
-                    ).bind_value(state.form, "inventory_selected").classes("w-full").mark(
-                        "inventory"
-                    )
+                inventory_box = ui.column().classes("w-full gap-0")
 
             with ui.card().classes("w-full"):
                 ui.label("Options").classes("text-subtitle1")
@@ -332,9 +330,12 @@ async def root() -> None:
 
     # --- running ----------------------------------------------------------------
 
-    def collect() -> tuple[list[Target], EvalOptions] | None:
+    async def collect() -> tuple[list[Target], EvalOptions] | None:
         try:
-            targets = build_targets(state.form, inventory.targets)
+            image_arches = await resolve_container_arches(state.form)
+            # Shielded: cancelling a run must not cancel the shared inventory load.
+            await asyncio.shield(inventory_task)
+            targets = build_targets(state.form, inventory.targets, image_arches)
             opts = EvalOptions(
                 qna_version=state.qna_version or "",
                 timeout_s=float(state.timeout_s or 30),
@@ -369,7 +370,7 @@ async def root() -> None:
         update_buttons()
 
     async def evaluate() -> None:
-        collected = collect()
+        collected = await collect()
         if collected is None:
             return
         targets, opts = collected
@@ -399,7 +400,7 @@ async def root() -> None:
         if not view.can_breakdown:
             ui.notify(view.breakdown_disabled_reason or "cannot break down", type="warning")
             return
-        collected = collect()
+        collected = await collect()
         if collected is None:
             return
         targets, opts = collected
@@ -447,7 +448,64 @@ async def root() -> None:
     client.on_delete(debouncer.cancel)
     client.on_delete(cancel)
 
+    # --- inventory -------------------------------------------------------------------
+
+    def render_inventory(discovering: bool = False) -> None:
+        inventory_box.clear()
+        with inventory_box:
+            if discovering:
+                with ui.row().classes("items-center gap-2").mark("inventory-discovering"):
+                    ui.spinner(size="sm")
+                    ui.label(
+                        "No remote_clients.toml found: running auto-discovery, which "
+                        "writes ~/.bigfix/remote_clients.toml (progress in the activity log)."
+                    ).classes("text-caption")
+            elif inventory.error:
+                where = f" {inventory.path}" if inventory.path else ""
+                ui.label(f"Inventory{where}: {inventory.error}").classes(
+                    "text-negative text-caption"
+                ).mark("inventory-error")
+            elif inventory.targets:
+                ui.select(
+                    {i: _target_option(t) for i, t in enumerate(inventory.targets)},
+                    multiple=True,
+                    clearable=True,
+                    label=f"Inventory ({inventory.path})",
+                ).bind_value(state.form, "inventory_selected").classes("w-full").mark("inventory")
+            else:
+                ui.label("No inventory hosts; tick a target above.").classes(
+                    "text-caption opacity-70"
+                ).mark("inventory-none")
+
+    async def load_inventory() -> None:
+        nonlocal inventory
+        try:
+            path = _inventory_path or find_inventory_path()
+            if path is None:
+                render_inventory(discovering=True)
+                path = await asyncio.to_thread(_discover_inventory_once)
+            inventory = load_inventory_targets(path)
+        except Exception as exc:
+            logger.debug("inventory discovery failed", exc_info=True)
+            inventory = InventoryLoad(path=None, targets=[], error=f"auto-discovery failed: {exc}")
+        # Evaluate runs on the whole inventory unless hosts are deselected.
+        state.form.inventory_selected = list(range(len(inventory.targets)))
+        render_inventory()
+
+    # Started after the log handler is attached, so discovery's progress shows.
+    inventory_task = asyncio.create_task(load_inventory())
+
     reanalyze()
+
+
+# Two tabs opened on a first run must not both run discovery; the second
+# waits, then finds the file the first one wrote.
+_discovery_lock = threading.Lock()
+
+
+def _discover_inventory_once() -> Path | None:
+    with _discovery_lock:
+        return find_or_discover_inventory()
 
 
 def _target_option(target: Target) -> str:
@@ -534,18 +592,52 @@ def _breakdown_table(
 # --- entry point -------------------------------------------------------------------
 
 
+WINDOW_SIZE = (1400, 900)
+
+
+def native_window_problem() -> str | None:
+    """Why a native window can't open here, or None if it can.
+
+    pywebview ships with this package, but on Linux it brings no GUI toolkit
+    of its own: it needs PyGObject (GTK) or Qt bindings, and a display.
+    """
+    if importlib.util.find_spec("webview") is None:
+        return "pywebview isn't installed"
+    if sys.platform.startswith("linux"):
+        if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+            return "no display (DISPLAY / WAYLAND_DISPLAY unset)"
+        if importlib.util.find_spec("gi") is None and importlib.util.find_spec("qtpy") is None:
+            return (
+                "pywebview needs GTK (PyGObject) or Qt on Linux, e.g. "
+                "uvx --with 'pywebview[qt]' bigfix-relevance-debugger"
+            )
+    return None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="bigfix-relevance-debugger",
-        description=TITLE + ": live analysis, evaluation and per-level breakdown.",
+        description=TITLE + ": live analysis, evaluation and per-level breakdown. "
+        "Opens in a native window by default.",
     )
     parser.add_argument(
         "--host", default="127.0.0.1", help="interface to bind (default: 127.0.0.1)"
     )
-    parser.add_argument("--port", type=int, default=None, help="port (default: NiceGUI's)")
-    parser.add_argument("--no-browser", action="store_true", help="don't open a browser window")
     parser.add_argument(
-        "--native", action="store_true", help="open in a native window (needs pywebview)"
+        "--port",
+        type=int,
+        default=None,
+        help="port (default: a free port for the native window, 8080 otherwise)",
+    )
+    parser.add_argument(
+        "--browser",
+        action="store_true",
+        help="open in a browser tab instead of a native window",
+    )
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="open no window at all; just serve (browse to the printed URL)",
     )
     parser.add_argument(
         "--inventory",
@@ -568,22 +660,26 @@ def main(argv: list[str] | None = None) -> None:
     _log_level = logging.DEBUG if args.verbose else logging.INFO
     _inventory_path = args.inventory
 
-    if args.native and importlib.util.find_spec("webview") is None:
-        raise SystemExit(
-            "--native needs pywebview: uvx --with pywebview bigfix-relevance-debugger --native"
-        )
+    native = not (args.browser or args.no_browser)
+    if native:
+        problem = native_window_problem()
+        if problem is not None:
+            logger.warning("native window unavailable (%s); opening a browser tab", problem)
+            native = False
 
     kwargs: dict[str, Any] = {
         "host": args.host,
         "title": TITLE,
-        "show": not args.no_browser,
+        "native": native,
+        "show": not native and not args.no_browser,
         # Follow the OS light/dark setting.
         "dark": None,
-        "native": args.native,
         # A console script has no source file to watch; reload would re-exec it.
         "reload": False,
         "show_welcome_message": True,
     }
+    if native:
+        kwargs["window_size"] = WINDOW_SIZE
     if args.port is not None:
         kwargs["port"] = args.port
     ui.run(root, **kwargs)

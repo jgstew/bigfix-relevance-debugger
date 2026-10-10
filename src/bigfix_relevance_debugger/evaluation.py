@@ -8,18 +8,14 @@ orchestrator against fakes.
 
 from __future__ import annotations
 
-import itertools
+import asyncio
 import logging
-import platform
-import re
-import sys
-from collections.abc import AsyncGenerator, AsyncIterator, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
 from contextlib import aclosing
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
 
-from bigfix_relevance_analyzer import Outcome, interpret_count_results
 from bigfix_remote_client_relevance import (
     ClientRelevanceResult,
     InventoryError,
@@ -29,13 +25,22 @@ from bigfix_remote_client_relevance import (
     evaluate_many_stream,
     load_inventory,
 )
+from bigfix_remote_client_relevance.bootstrap.targets import host_arch, normalize_arch
+from bigfix_remote_client_relevance.discovery import ImageSource, default_image_source
 
 from bigfix_relevance_debugger.analysis import AnalysisView, LevelView
+from bigfix_relevance_debugger.upstream.relevance_analyzer import summarize_count_results
+from bigfix_relevance_debugger.upstream.remote_client_relevance import (
+    published_arches,
+    target_platform,
+)
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONTAINER_IMAGE = "debian:11"
 ARCHES = ("x86_64", "arm64")
+AUTO_ARCH = "auto"
+"""Every arch the image's registry manifest publishes (this machine's if unknown)."""
 
 
 # --- targets ---------------------------------------------------------------------
@@ -54,7 +59,7 @@ class TargetForm:
     container: bool = False
     container_images: str = DEFAULT_CONTAINER_IMAGE
     """Comma-separated, so one run can compare several images."""
-    container_arches: list[str] = field(default_factory=lambda: ["x86_64"])
+    container_arches: list[str] = field(default_factory=lambda: [AUTO_ARCH])
     rebuild_image: bool = False
 
     ssh: bool = False
@@ -70,8 +75,20 @@ class TargetForm:
     """Indexes into the loaded inventory's targets. None when the picker is cleared."""
 
 
-def build_targets(form: TargetForm, inventory: Sequence[Target] = ()) -> list[Target]:
-    """Turn the picker into Targets, the way the library CLI builds them."""
+def _images(form: TargetForm) -> list[str]:
+    return [i.strip() for i in form.container_images.split(",") if i.strip()]
+
+
+def build_targets(
+    form: TargetForm,
+    inventory: Sequence[Target] = (),
+    image_arches: Mapping[str, Sequence[str]] | None = None,
+) -> list[Target]:
+    """Turn the picker into Targets, the way the library CLI builds them.
+
+    ``image_arches`` is what :func:`resolve_container_arches` found for the
+    ``auto`` arch; an image missing from it runs as this machine's arch.
+    """
     targets: list[Target] = []
 
     if form.local:
@@ -80,22 +97,29 @@ def build_targets(form: TargetForm, inventory: Sequence[Target] = ()) -> list[Ta
         targets.append(Target(kind="local", name="local"))
 
     if form.container:
-        images = [i.strip() for i in form.container_images.split(",") if i.strip()]
+        images = _images(form)
         if not images:
             raise TargetFormError("Container target needs an image, e.g. debian:11.")
         if not form.container_arches:
             raise TargetFormError("Container target needs at least one arch.")
-        multi_arch = len(form.container_arches) > 1
-        targets.extend(
-            Target(
-                kind="container",
-                name=f"{image}@{arch}" if multi_arch else image,
-                image=image,
-                arch=arch,
-                rebuild_image=form.rebuild_image,
+        for image in images:
+            arches: list[str] = []
+            for choice in form.container_arches:
+                if choice == AUTO_ARCH:
+                    arches.extend((image_arches or {}).get(image) or [host_arch()])
+                else:
+                    arches.append(choice)
+            arches = list(dict.fromkeys(arches))
+            targets.extend(
+                Target(
+                    kind="container",
+                    name=f"{image}@{arch}" if len(arches) > 1 else image,
+                    image=image,
+                    arch=arch,
+                    rebuild_image=form.rebuild_image,
+                )
+                for arch in arches
             )
-            for image, arch in itertools.product(images, form.container_arches)
-        )
 
     if form.ssh:
         host = form.ssh_host.strip()
@@ -121,73 +145,31 @@ def build_targets(form: TargetForm, inventory: Sequence[Target] = ()) -> list[Ta
 
 # --- choosing the breakdown target --------------------------------------------------
 
-# Library platform keys the analyzer has no separate name for. suse is left
-# out on purpose: the analyzer has no SUSE platform, so its fit is unknown.
-_PLATFORM_ALIASES = {"raspbian": "debian"}
-
-# Container image-name tokens -> analyzer platform. Mirrors the os-release
-# families bigfix-remote-client-relevance classifies a probed image into.
-_IMAGE_TOKENS = {
+# Library platform key -> analyzer platform. The analyzer folds Raspberry Pi
+# OS into debian and has no SUSE at all, so a SUSE target's fit is unknown.
+_ANALYZER_PLATFORMS = {
+    "macos": "macos",
+    "windows": "windows",
     "debian": "debian",
     "raspbian": "debian",
     "ubuntu": "ubuntu",
     "rhel": "rhel",
-    "ubi": "rhel",
-    "ubi8": "rhel",
-    "ubi9": "rhel",
-    "redhat": "rhel",
-    "fedora": "rhel",
-    "centos": "rhel",
-    "almalinux": "rhel",
-    "rockylinux": "rhel",
-    "rocky": "rhel",
-    "oraclelinux": "rhel",
-    "amazonlinux": "rhel",
-    "windows": "windows",
-    "servercore": "windows",
-    "nanoserver": "windows",
 }
-
-_SYS_PLATFORMS = {"darwin": "macos", "win32": "windows"}
 
 # Tie-break among equally suitable targets: containers are the reliable path,
 # the online evaluator sends the relevance to a third-party service.
 _KIND_PREFERENCE = ("container", "ssh", "local", "fastquery", "online_evaluator")
 
 
-def target_platform(target: Target) -> str | None:
-    """The analyzer platform a target will evaluate on, if knowable without connecting.
-
-    An explicit (or inventory-recorded) platform wins; otherwise a container
-    is read from its image name and ``local`` from this machine. None means
-    unknown -- e.g. an SSH host never probed, or a Linux controller's distro.
-    """
-    if target.platform:
-        if target.platform == "suse":
-            return None
-        return _PLATFORM_ALIASES.get(target.platform, target.platform)
-    if target.kind == "container":
-        image = (target.image or target.name).lower()
-        for token in re.split(r"[/:._@-]", image):
-            if token in _IMAGE_TOKENS:
-                return _IMAGE_TOKENS[token]
-        return None
-    if target.kind == "local":
-        return _SYS_PLATFORMS.get(sys.platform)
-    return None
+def analyzer_platform(target: Target) -> str | None:
+    """The target's platform in the analyzer's vocabulary; None when unknown."""
+    platform = target_platform(target)
+    return _ANALYZER_PLATFORMS.get(platform) if platform is not None else None
 
 
-_ARCH_ALIASES = {"aarch64": "arm64", "amd64": "x86_64", "x64": "x86_64"}
-
-
-def _host_arch() -> str:
-    machine = platform.machine().lower()
-    return _ARCH_ALIASES.get(machine, machine)
-
-
-def _native_container(target: Target, host_arch: str) -> bool:
+def _native_container(target: Target, arch: str) -> bool:
     # An unset container arch runs as x86_64, the library's default.
-    return target.kind == "container" and (target.arch or "x86_64") == host_arch
+    return target.kind == "container" and normalize_arch(target.arch or "x86_64") == arch
 
 
 @dataclass(frozen=True)
@@ -210,11 +192,11 @@ def choose_breakdown_target(analysis: AnalysisView, targets: Sequence[Target]) -
         return BreakdownChoice(targets[0], "the only selected target")
 
     wanted = set(analysis.platforms)
-    host_arch = _host_arch()
+    native_arch = host_arch()
 
     def rank(item: tuple[int, Target]) -> tuple[int, int, int, int]:
         index, target = item
-        platform = target_platform(target)
+        platform = analyzer_platform(target)
         fit = 1 if platform is None else (0 if platform in wanted else 2)
         kind = (
             _KIND_PREFERENCE.index(target.kind)
@@ -222,11 +204,11 @@ def choose_breakdown_target(analysis: AnalysisView, targets: Sequence[Target]) -
             else len(_KIND_PREFERENCE)
         )
         # A container in this machine's arch runs natively, not emulated.
-        emulated = 0 if target.kind != "container" or _native_container(target, host_arch) else 1
+        emulated = 0 if target.kind != "container" or _native_container(target, native_arch) else 1
         return fit, kind, emulated, index
 
     _, best = min(enumerate(targets), key=rank)
-    platform = target_platform(best)
+    platform = analyzer_platform(best)
     portable = wanted >= {"debian", "macos", "rhel", "ubuntu", "windows"}
     if platform is not None and platform in wanted:
         why = f"its platform ({platform}) supports this expression"
@@ -242,9 +224,29 @@ def choose_breakdown_target(analysis: AnalysisView, targets: Sequence[Target]) -
             f"no selected target matches {' / '.join(sorted(wanted)) or 'this expression'}; "
             "expect empty or error counts"
         )
-    if _native_container(best, host_arch):
-        why += f" (native {host_arch})"
+    if _native_container(best, native_arch):
+        why += f" (native {native_arch})"
     return BreakdownChoice(best, f"picked from {len(targets)} selected: {why}")
+
+
+async def resolve_container_arches(
+    form: TargetForm,
+    *,
+    images_factory: Callable[[], ImageSource | None] = default_image_source,
+) -> dict[str, list[str]]:
+    """Look up the ``auto`` arch for each container image; {} when not needed.
+
+    Asks the container engine (and through it the registry) in a worker
+    thread, since both block.
+    """
+    if not form.container or AUTO_ARCH not in form.container_arches:
+        return {}
+
+    def lookup() -> dict[str, list[str]]:
+        images = images_factory()
+        return {image: published_arches(image, images) for image in _images(form)}
+
+    return await asyncio.to_thread(lookup)
 
 
 @dataclass(frozen=True)
@@ -441,19 +443,12 @@ def _probe_view(relevance: str, result: ClientRelevanceResult | None) -> ProbeVi
             error_kind=result.error_kind,
         )
     try:
-        outcomes = interpret_count_results(result.answers)
+        summary = summarize_count_results(result.answers)
     except ValueError as exc:
         return ProbeView(relevance, "error", None, len(result.answers), 0, error=str(exc))
-
-    contexts = len(outcomes)
-    not_evaluable = sum(o.outcome is Outcome.NOT_EVALUABLE for o in outcomes)
-    if contexts == 0:
-        return ProbeView(relevance, "no-context", None, 0, 0)
-    if not_evaluable == contexts:
-        return ProbeView(relevance, "not-evaluable", None, contexts, not_evaluable)
-    total = sum(o.count or 0 for o in outcomes if o.outcome is not Outcome.NOT_EVALUABLE)
-    outcome = "count" if total > 0 else "empty-or-error"
-    return ProbeView(relevance, outcome, total, contexts, not_evaluable)
+    return ProbeView(
+        relevance, summary.outcome, summary.total, summary.contexts, summary.not_evaluable
+    )
 
 
 async def run_breakdown(

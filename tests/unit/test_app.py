@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from collections.abc import AsyncIterator
 
 import pytest
-from bigfix_remote_client_relevance import ClientRelevanceResult, Target
+from bigfix_remote_client_relevance import ClientRelevanceResult, InventoryError, Target
 from nicegui import ui
 from nicegui.testing.user_simulation import user_simulation
 
@@ -33,16 +34,19 @@ def test_parser_defaults_bind_localhost():
     assert args.host == "127.0.0.1"
     assert args.port is None
     assert args.no_browser is False
-    assert args.native is False
+    assert args.browser is False
     assert args.verbose is False
 
 
 def test_parser_flags():
-    args = build_parser().parse_args(["--host", "0.0.0.0", "--port", "9000", "--no-browser", "-v"])
+    args = build_parser().parse_args(
+        ["--host", "0.0.0.0", "--port", "9000", "--no-browser", "--browser", "-v"]
+    )
 
     assert args.host == "0.0.0.0"
     assert args.port == 9000
     assert args.no_browser is True
+    assert args.browser is True
     assert args.verbose is True
 
 
@@ -55,6 +59,8 @@ def captured_run(monkeypatch):
 
     monkeypatch.setattr(app_module.ui, "run", fake_run)
     monkeypatch.setattr(app_module, "_log_level", logging.INFO)
+    # Native mode is available unless a test says otherwise.
+    monkeypatch.setattr(app_module, "native_window_problem", lambda: None)
     return calls
 
 
@@ -64,18 +70,49 @@ def test_main_runs_without_reload(captured_run):
     [call] = captured_run
     assert call["reload"] is False
     assert call["host"] == "127.0.0.1"
-    assert call["show"] is True
     assert call["root"] is app_module.root
     assert call["dark"] is None
-    assert "port" not in call  # NiceGUI's default
 
 
-def test_main_passes_port_and_no_browser(captured_run):
+def test_main_defaults_to_a_native_window(captured_run):
+    main([])
+
+    [call] = captured_run
+    assert call["native"] is True
+    assert call["window_size"] == app_module.WINDOW_SIZE
+    # Native mode finds its own free port.
+    assert "port" not in call
+
+
+def test_browser_flag_opens_a_tab_instead(captured_run):
+    main(["--browser"])
+
+    [call] = captured_run
+    assert call["native"] is False
+    assert call["show"] is True
+    assert "window_size" not in call
+
+
+def test_no_browser_serves_without_any_window(captured_run):
     main(["--port", "9123", "--no-browser"])
 
     [call] = captured_run
-    assert call["port"] == 9123
+    assert call["native"] is False
     assert call["show"] is False
+    assert call["port"] == 9123
+
+
+def test_native_unavailable_falls_back_to_a_browser_tab(captured_run, monkeypatch, caplog):
+    monkeypatch.setattr(app_module, "native_window_problem", lambda: "no GUI toolkit")
+
+    with caplog.at_level(logging.WARNING):
+        main([])
+
+    [call] = captured_run
+    assert call["native"] is False
+    assert call["show"] is True
+    assert "no GUI toolkit" in caplog.text
+    assert "browser" in caplog.text
 
 
 def test_main_verbose_sets_debug(captured_run):
@@ -90,20 +127,49 @@ def test_main_default_log_level_is_info(captured_run):
     assert app_module._log_level == logging.INFO
 
 
-def test_native_without_pywebview_exits_with_hint(captured_run, monkeypatch):
-    monkeypatch.setattr(app_module.importlib.util, "find_spec", lambda name: None)
-
-    with pytest.raises(SystemExit, match="pywebview"):
-        main(["--native"])
-    assert captured_run == []
+# --- native_window_problem ----------------------------------------------------------
 
 
-def test_native_with_pywebview_runs_native(captured_run, monkeypatch):
-    monkeypatch.setattr(app_module.importlib.util, "find_spec", lambda name: object())
+@pytest.fixture
+def specs(monkeypatch):
+    present: set[str] = {"webview"}
+    monkeypatch.setattr(
+        app_module.importlib.util,
+        "find_spec",
+        lambda name: object() if name in present else None,
+    )
+    return present
 
-    main(["--native"])
 
-    assert captured_run[0]["native"] is True
+def test_native_ok_on_macos_with_pywebview(monkeypatch, specs):
+    monkeypatch.setattr("sys.platform", "darwin")
+
+    assert app_module.native_window_problem() is None
+
+
+def test_native_needs_pywebview(monkeypatch, specs):
+    monkeypatch.setattr("sys.platform", "darwin")
+    specs.clear()
+
+    assert "pywebview" in (app_module.native_window_problem() or "")
+
+
+def test_native_on_linux_needs_a_display(monkeypatch, specs):
+    monkeypatch.setattr("sys.platform", "linux")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    specs.add("gi")
+
+    assert "display" in (app_module.native_window_problem() or "")
+
+
+def test_native_on_linux_needs_gtk_or_qt(monkeypatch, specs):
+    monkeypatch.setattr("sys.platform", "linux")
+    monkeypatch.setenv("DISPLAY", ":0")
+
+    assert "GTK" in (app_module.native_window_problem() or "")
+    specs.add("qtpy")
+    assert app_module.native_window_problem() is None
 
 
 # --- Debouncer ---------------------------------------------------------------------
@@ -151,6 +217,7 @@ async def test_debouncer_supports_async_callbacks():
 @pytest.fixture
 def no_inventory(monkeypatch):
     monkeypatch.setattr(app_module, "find_inventory_path", lambda: None)
+    monkeypatch.setattr(app_module, "find_or_discover_inventory", lambda: None)
 
 
 @pytest.fixture
@@ -535,3 +602,124 @@ async def test_inventory_picker_is_clearable(inventory_user):
 
     [select] = inventory_user.find(marker="inventory").elements
     assert select.props.get("clearable") is True
+
+
+async def test_container_auto_arch_evaluates_every_published_arch(user, monkeypatch):
+    seen: dict = {}
+
+    async def fake_resolve(form, **kwargs):
+        return {"debian:11": ["x86_64", "arm64"]}
+
+    async def fake_stream(text, targets, opts, **upstream):
+        seen["targets"] = targets
+        for target in targets:
+            yield ClientRelevanceResult(
+                host=target.label, transport="container", client_relevance=text
+            )
+
+    monkeypatch.setattr(app_module, "resolve_container_arches", fake_resolve)
+    monkeypatch.setattr(app_module, "stream_results", fake_stream)
+    await user.open("/")
+    await set_text(user, "name of operating system")
+    user.find(marker="target-container").click()
+
+    user.find(marker="evaluate").click()
+
+    await user.should_see("2 / 2")
+    assert [t.label for t in seen["targets"]] == [
+        "container:debian:11@x86_64",
+        "container:debian:11@arm64",
+    ]
+
+
+# --- first-run auto-discovery -------------------------------------------------------------
+
+
+async def test_no_inventory_runs_discovery_and_selects_what_it_found(monkeypatch, tmp_path):
+    written = tmp_path / ".bigfix" / "remote_clients.toml"
+    monkeypatch.setattr(app_module, "_inventory_path", None)
+    monkeypatch.setattr(app_module, "find_inventory_path", lambda: None)
+    monkeypatch.setattr(app_module, "find_or_discover_inventory", lambda: written)
+    monkeypatch.setattr(
+        app_module,
+        "load_inventory_targets",
+        lambda path: (
+            InventoryLoad(path=path, targets=list(TWO_HOSTS), error=None)
+            if path == written
+            else pytest.fail(f"loaded {path}")
+        ),
+    )
+
+    async with user_simulation(root=app_module.root) as user:
+        await user.open("/")
+        await user.should_see(marker="inventory")
+        [select] = user.find(marker="inventory").elements
+        assert select.value == [0, 1]
+
+
+async def test_discovery_progress_shows_while_it_runs(monkeypatch):
+    release = threading.Event()
+
+    def slow_discovery():
+        release.wait(5)
+
+    monkeypatch.setattr(app_module, "_inventory_path", None)
+    monkeypatch.setattr(app_module, "find_inventory_path", lambda: None)
+    monkeypatch.setattr(app_module, "find_or_discover_inventory", slow_discovery)
+
+    async with user_simulation(root=app_module.root) as user:
+        await user.open("/")
+        try:
+            await user.should_see(marker="inventory-discovering")
+        finally:
+            release.set()
+        await user.should_not_see(marker="inventory-discovering", retries=20)
+
+
+async def test_discovery_failure_is_shown_not_raised(monkeypatch):
+    def broken():
+        raise InventoryError("~/.bigfix is not writable")
+
+    monkeypatch.setattr(app_module, "_inventory_path", None)
+    monkeypatch.setattr(app_module, "find_inventory_path", lambda: None)
+    monkeypatch.setattr(app_module, "find_or_discover_inventory", broken)
+
+    async with user_simulation(root=app_module.root) as user:
+        await user.open("/")
+        await user.should_see(marker="inventory-error")
+
+
+async def test_evaluate_waits_for_discovery_to_finish(monkeypatch, tmp_path):
+    release = threading.Event()
+    written = tmp_path / "remote_clients.toml"
+    seen: dict = {}
+
+    def slow_discovery():
+        release.wait(5)
+        return written
+
+    async def fake_stream(text, targets, opts, **upstream):
+        seen["targets"] = targets
+        for target in targets:
+            yield ClientRelevanceResult(host=target.label, transport="ssh", client_relevance=text)
+
+    monkeypatch.setattr(app_module, "_inventory_path", None)
+    monkeypatch.setattr(app_module, "find_inventory_path", lambda: None)
+    monkeypatch.setattr(app_module, "find_or_discover_inventory", slow_discovery)
+    monkeypatch.setattr(
+        app_module,
+        "load_inventory_targets",
+        lambda path: InventoryLoad(path=path, targets=list(TWO_HOSTS), error=None),
+    )
+    monkeypatch.setattr(app_module, "stream_results", fake_stream)
+
+    async with user_simulation(root=app_module.root) as user:
+        await user.open("/")
+        await set_text(user, "name of operating system")
+        user.find(marker="evaluate").click()
+        await asyncio.sleep(0.2)
+        assert "targets" not in seen
+        release.set()
+        await user.should_see("2 / 2", retries=20)
+
+    assert seen["targets"] == TWO_HOSTS

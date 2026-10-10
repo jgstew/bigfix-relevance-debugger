@@ -34,14 +34,22 @@ or `uv run bigfix-relevance-debugger`, or
 `uv run python -m bigfix_relevance_debugger`. Once it's published to
 PyPI, plain `uvx bigfix-relevance-debugger` will work.
 
+It opens in a **native app window** by default (via pywebview, which is
+installed with it). Closing the window stops the app.
+
 | Option | Meaning |
 | --- | --- |
+| `--browser` | open in a browser tab instead of a native window |
+| `--no-browser` | open no window at all, just serve (browse to the printed URL) |
 | `--host HOST` | interface to bind (default `127.0.0.1`) |
-| `--port PORT` | port (default: NiceGUI's, 8080) |
-| `--no-browser` | don't open a browser tab |
+| `--port PORT` | port (default: a free port for the native window, 8080 for a browser tab) |
 | `--inventory PATH` | `remote_clients.toml` to offer as targets (default: see below) |
-| `--native` | native window; needs pywebview: `uvx --with pywebview ... --native` |
 | `-v`, `--verbose` | show library DEBUG logs in the activity log (default INFO) |
+
+**Linux:** pywebview brings no GUI toolkit of its own there, so without
+GTK (PyGObject) or Qt bindings, or without a display, the app says why and
+opens a browser tab instead. For a native window, add a toolkit, e.g.
+`uvx --with 'pywebview[qt]' bigfix-relevance-debugger`.
 
 ## Prerequisites
 
@@ -66,6 +74,16 @@ the all-users config dir. Hosts added there, by hand or by its
 `--auto-discovery`, show up here too. `--inventory PATH` points at a
 different file. A file that fails to load is shown as an error in the picker
 and doesn't stop the app.
+
+**No inventory yet?** On first start, when none of those places has a file,
+the app runs the library's **first-run auto-discovery**, as its CLI does. It
+tries this machine's BigFix client, the developer.bigfix.com online
+evaluator, and containers for each arch (images you have already pulled
+first, else defaults), and **writes the hosts that work to
+`~/.bigfix/remote_clients.toml`**. If none work, it writes a placeholder so
+discovery doesn't repeat on every start. The page opens right away; the
+picker fills in when discovery finishes, and its progress is in the activity
+log.
 
 **Every inventory host is selected by default**, so **Evaluate** runs on the
 whole inventory (plus any Local/Container/SSH target you tick). Remove hosts
@@ -96,9 +114,10 @@ a specific target, select only that one.
 2. Type `name of operating system`. Live analysis shows a clean parse, the
    type `singular string` and a low complexity score.
 3. Clear the **Inventory** picker (every host in it is selected by default),
-   then tick **Container**, keep image `debian:11`, set Arch to `arm64` (on Apple
-   Silicon) and qna version to `11.0.7.61`, then click **Evaluate**. An answer
-   row appears with the qna version, platform/arch and elapsed time. If the
+   then tick **Container**, keep image `debian:11` and Arch `auto`, set qna
+   version to `11.0.7.61`, and click **Evaluate**. `auto` runs every arch the
+   image publishes, so two rows appear, x86_64 and arm64, each with its qna
+   version, platform/arch and elapsed time. If the
    library had to step back to an older qna build for that image, the row
    says so ("fell back from ..."). The first run shows download and
    image-prep progress in the activity log.
