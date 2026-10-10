@@ -16,7 +16,7 @@ import logging
 import os
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +39,7 @@ from bigfix_relevance_debugger.evaluation import (
     LevelResult,
     ResultRow,
     TargetForm,
+    breakdown_qna_note,
     build_targets,
     choose_breakdown_target,
     load_inventory_targets,
@@ -139,6 +140,8 @@ class _PageState:
     view: AnalysisView = dataclasses.field(default_factory=lambda: summarize(""))
     task: asyncio.Task[None] | None = None
     results: list[ClientRelevanceResult] = dataclasses.field(default_factory=list)
+    breakdown_text: str | None = None
+    """The expression the breakdown on screen was run on."""
 
     @property
     def running(self) -> bool:
@@ -239,25 +242,29 @@ async def root() -> None:
                 with ui.row().classes("w-full no-wrap"):
                     ui.number("Timeout (s)", min=1, format="%.0f").bind_value(
                         state, "timeout_s"
-                    ).classes("w-1/2")
+                    ).classes("w-1/2").mark("option-timeout")
                     ui.number("Max parallel", min=1, precision=0).bind_value(
                         state, "max_parallel"
-                    ).classes("w-1/2")
+                    ).classes("w-1/2").mark("option-parallel")
 
             with ui.card().classes("w-full"):
                 ui.label("Activity log").classes("text-subtitle1")
                 activity = ui.log(max_lines=500).classes("w-full h-64 text-xs")
 
+    client = ui.context.client
+
     # --- live analysis --------------------------------------------------------
 
-    def apply_analysis(highlight: tuple[int, int] | None = None) -> None:
-        view = state.view
+    def set_highlight(span: tuple[int, int] | None) -> None:
+        """Editor marks only; cheap enough for every hover event."""
         try:
-            code.decorations = editor_decorations(view, highlight)
+            code.decorations = editor_decorations(state.view, span)
         except ValueError:
             logger.debug("decorations rejected", exc_info=True)
-        if highlight is not None:
-            return
+
+    def apply_analysis() -> None:
+        view = state.view
+        set_highlight(None)
 
         pe = view.parse_error
         parse_banner.set_text(
@@ -310,6 +317,7 @@ async def root() -> None:
                         for f in shown
                     ],
                 ).props("dense flat").classes("w-full").mark("findings")
+        update_stale()
         update_buttons()
 
     def reanalyze() -> None:
@@ -318,6 +326,17 @@ async def root() -> None:
 
     debouncer = Debouncer(DEBOUNCE_S, reanalyze)
     code.on_value_change(lambda _: debouncer.trigger())
+
+    def current_view() -> AnalysisView:
+        """The analysis of what the editor shows *now*, not 300 ms ago.
+
+        Called synchronously in the click handlers, before any await, so both
+        buttons act on the same text the user sees.
+        """
+        debouncer.cancel()
+        if state.view.text != (code.value or ""):
+            reanalyze()
+        return state.view
 
     def update_buttons() -> None:
         running = state.running
@@ -328,63 +347,103 @@ async def root() -> None:
         reason = state.view.breakdown_disabled_reason
         breakdown_reason.set_text(reason if reason and state.view.text.strip() else "")
 
+    def breakdown_is_stale() -> bool:
+        return state.breakdown_text is not None and state.breakdown_text != state.view.text
+
+    def update_stale() -> None:
+        # The table stays as evidence after an edit, but its spans belong to
+        # the old text, so dim it and stop highlighting.
+        stale = breakdown_is_stale()
+        breakdown_box.classes(
+            add="opacity-50" if stale else "", remove="" if stale else "opacity-50"
+        )
+        for element in breakdown_box.descendants():
+            if "breakdown-stale" in element._markers:
+                element.set_visibility(stale)
+
+    def hover(span: tuple[int, int] | None) -> None:
+        if span is not None and breakdown_is_stale():
+            return
+        set_highlight(span)
+
     # --- running ----------------------------------------------------------------
 
     async def collect() -> tuple[list[Target], EvalOptions] | None:
         try:
             image_arches = await resolve_container_arches(state.form)
-            # Shielded: cancelling a run must not cancel the shared inventory load.
-            await asyncio.shield(inventory_task)
+            form = state.form
+            explicit = form.local or form.container or form.ssh
+            # Wait for the inventory only when the run needs it: hosts are
+            # selected, or discovery is still going and nothing else is ticked
+            # (its hosts will be the default). A first-run Local/Container/SSH
+            # evaluation starts at once.
+            if form.inventory_selected or (not inventory_task.done() and not explicit):
+                if not inventory_task.done():
+                    progress_label.set_text("waiting for inventory auto-discovery ...")
+                # Shielded: cancelling a run must not cancel the shared load.
+                await asyncio.shield(inventory_task)
+                progress_label.set_text("")
             targets = build_targets(state.form, inventory.targets, image_arches)
             opts = EvalOptions(
                 qna_version=state.qna_version or "",
-                timeout_s=float(state.timeout_s or 30),
-                max_parallel=int(state.max_parallel or 8),
+                # None only when the field was cleared; 0 must reach validation.
+                timeout_s=30.0 if state.timeout_s is None else float(state.timeout_s),
+                max_parallel=8 if state.max_parallel is None else int(state.max_parallel),
             )
         except ValueError as exc:
             ui.notify(str(exc), type="warning")
             return None
         return targets, opts
 
-    def start(job: Callable[[], Any]) -> None:
+    def start(job: Callable[[], Awaitable[None]]) -> None:
+        """Run ``job`` as the page's one task, created before the click returns.
+
+        Setting ``state.task`` synchronously is what disables the buttons
+        before any await, so a second click can't start a second run.
+        """
+        if state.running:
+            return
+
         async def wrapper() -> None:
             try:
                 await job()
             except asyncio.CancelledError:
-                activity.push("cancelled")
-                ui.notify("Cancelled", type="info")
+                if not client.is_deleted:
+                    activity.push("cancelled")
+                    ui.notify("Cancelled", type="info")
                 raise
             except BigFixRelevanceError as exc:
-                ui.notify(str(exc), type="negative", multi_line=True)
-                activity.push(f"error: {exc}")
+                if not client.is_deleted:
+                    ui.notify(str(exc), type="negative", multi_line=True)
+                    activity.push(f"error: {exc}")
             except Exception as exc:
                 logger.exception("run failed")
-                ui.notify(f"{type(exc).__name__}: {exc}", type="negative", multi_line=True)
+                if not client.is_deleted:
+                    ui.notify(f"{type(exc).__name__}: {exc}", type="negative", multi_line=True)
             finally:
                 # This task is still running while its own finally executes, so
                 # `state.running` would read True; clear it before re-rendering.
                 state.task = None
-                update_buttons()
+                if not client.is_deleted:
+                    update_buttons()
 
         state.task = asyncio.create_task(wrapper())
         update_buttons()
 
-    async def evaluate() -> None:
-        collected = await collect()
-        if collected is None:
-            return
-        targets, opts = collected
-        text = code.value or ""
-        total = total_work(targets, opts)
-        done = 0
-        state.results = []
-        results_box.clear()
-        breakdown_box.clear()
-        progress.set_value(0)
-        progress_label.set_text(f"0 / {total}")
+    def evaluate() -> None:
+        text = current_view().text
 
         async def job() -> None:
-            nonlocal done
+            collected = await collect()
+            if collected is None:
+                return
+            targets, opts = collected
+            total = total_work(targets, opts)
+            done = 0
+            state.results = []
+            results_box.clear()
+            progress.set_value(0)
+            progress_label.set_text(f"0 / {total}")
             async for result in stream_results(text, targets, opts):
                 state.results.append(result)
                 done += 1
@@ -395,35 +454,42 @@ async def root() -> None:
 
         start(job)
 
-    async def breakdown() -> None:
-        view = state.view
+    def breakdown() -> None:
+        view = current_view()
         if not view.can_breakdown:
             ui.notify(view.breakdown_disabled_reason or "cannot break down", type="warning")
             return
-        collected = await collect()
-        if collected is None:
-            return
-        targets, opts = collected
-        # Every inventory host is selected by default, so pick the best fit
-        # rather than ask; selecting a single target is the override.
-        choice = choose_breakdown_target(view, targets)
-        target = choice.target
-        breakdown_box.clear()
-        with breakdown_box:
-            ui.label(f"Breakdown on {target.label} ...").classes("text-subtitle1")
-            ui.label(choice.reason).classes("text-caption opacity-70").mark("breakdown-reason")
-            ui.spinner()
 
         async def job() -> None:
+            collected = await collect()
+            if collected is None:
+                return
+            targets, opts = collected
+            # Every inventory host is selected by default, so pick the best fit
+            # rather than ask; selecting a single target is the override.
+            choice = choose_breakdown_target(view, targets)
+            target = choice.target
+            note = breakdown_qna_note(target)
+            reason = f"{choice.reason}; {note}" if note else choice.reason
+            state.breakdown_text = None
+            breakdown_box.clear()
+            update_stale()
+            with breakdown_box:
+                ui.label(f"Breakdown on {target.label} ...").classes("text-subtitle1")
+                ui.label(reason).classes("text-caption opacity-70").mark("breakdown-reason")
+                ui.spinner()
             levels = await run_breakdown(view, target, opts)
             breakdown_box.clear()
+            state.breakdown_text = view.text
             with breakdown_box:
-                _breakdown_table(target, levels, reason=choice.reason, on_hover=hover)
+                ui.label(
+                    "The expression has changed since this breakdown ran; "
+                    "run Breakdown again to update it."
+                ).classes("text-caption text-warning").mark("breakdown-stale")
+                _breakdown_table(target, levels, reason=reason, on_hover=hover)
+            update_stale()
 
         start(job)
-
-    def hover(span: tuple[int, int] | None) -> None:
-        apply_analysis(highlight=span)
 
     def cancel() -> None:
         if state.task is not None:
@@ -441,7 +507,6 @@ async def root() -> None:
     # --- activity log -------------------------------------------------------------
 
     handler = attach(activity.push, _log_level, loop=asyncio.get_running_loop())
-    client = ui.context.client
     # on_delete, not on_disconnect: a brief websocket drop reconnects to the
     # same client, and its log should keep flowing.
     client.on_delete(lambda: detach(handler))
@@ -485,6 +550,10 @@ async def root() -> None:
                 render_inventory(discovering=True)
                 path = await asyncio.to_thread(_discover_inventory_once)
             inventory = load_inventory_targets(path)
+        except asyncio.CancelledError:
+            # The page closed mid-discovery. The worker thread finishes on its
+            # own (its file write is still wanted); there is no page to update.
+            return
         except Exception as exc:
             logger.debug("inventory discovery failed", exc_info=True)
             inventory = InventoryLoad(path=None, targets=[], error=f"auto-discovery failed: {exc}")
@@ -494,6 +563,7 @@ async def root() -> None:
 
     # Started after the log handler is attached, so discovery's progress shows.
     inventory_task = asyncio.create_task(load_inventory())
+    client.on_delete(inventory_task.cancel)
 
     reanalyze()
 
@@ -519,7 +589,7 @@ def _result_row(row: ResultRow) -> None:
         caption_bits.append(f"{row.elapsed_ms} ms")
     with (
         ui.expansion(
-            f"{row.host}: {row.answers_text if row.ok else row.error}",
+            row.headline,
             caption=" | ".join(b for b in caption_bits if b) or None,
             icon=icon,
         )
@@ -563,7 +633,7 @@ def _breakdown_table(
             cells: list[ui.element] = []
             row_classes = "bg-red-1 text-bold" if lr.is_first_failure else ""
             cells.append(ui.label(str(lr.level.index)).classes(row_classes))
-            with ui.column().classes(f"gap-0 {row_classes}") as level_cell:
+            with ui.column().classes(f"gap-0 {row_classes}").mark("breakdown-level") as level_cell:
                 label = ui.label(lr.level.label).classes("bfrd-mono")
                 if lr.level.is_whole_expression:
                     label.tooltip("whole expression")

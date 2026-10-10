@@ -723,3 +723,242 @@ async def test_evaluate_waits_for_discovery_to_finish(monkeypatch, tmp_path):
         await user.should_see("2 / 2", retries=20)
 
     assert seen["targets"] == TWO_HOSTS
+
+
+# --- review fixes ------------------------------------------------------------------------
+
+
+async def slow_arches(form, **kwargs):
+    await asyncio.sleep(0.2)  # stands in for the registry lookup
+    return {}
+
+
+async def test_double_click_starts_one_run(user, monkeypatch):
+    runs: list[int] = []
+
+    async def slow(text, targets, opts, **upstream):
+        runs.append(1)
+        await asyncio.sleep(1)
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(app_module, "stream_results", slow)
+    monkeypatch.setattr(app_module, "resolve_container_arches", slow_arches)
+    await user.open("/")
+    await set_text(user, "name of operating system")
+    user.find(marker="target-local").click()
+
+    user.find(marker="evaluate").click()
+    assert not button(user, "evaluate").enabled
+    assert not button(user, "breakdown").enabled
+    assert button(user, "cancel").enabled
+    await asyncio.sleep(0.05)
+    user.find(marker="evaluate").click()
+    await asyncio.sleep(0.5)
+
+    assert len(runs) == 1
+
+
+async def test_cancel_works_during_the_registry_lookup(user, monkeypatch):
+    called: list[int] = []
+
+    async def stream(text, targets, opts, **upstream):
+        called.append(1)
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(app_module, "stream_results", stream)
+    monkeypatch.setattr(app_module, "resolve_container_arches", slow_arches)
+    await user.open("/")
+    await set_text(user, "name of operating system")
+    user.find(marker="target-local").click()
+
+    user.find(marker="evaluate").click()
+    await asyncio.sleep(0.05)
+    user.find(marker="cancel").click()
+    await asyncio.sleep(0.4)
+
+    assert called == []
+    assert button(user, "evaluate").enabled
+
+
+async def test_breakdown_uses_the_current_editor_text(user, monkeypatch):
+    seen: list[str] = []
+
+    async def fake_breakdown(analysis, target, opts, **upstream):
+        seen.append(analysis.text)
+        return []
+
+    monkeypatch.setattr(app_module, "run_breakdown", fake_breakdown)
+    await user.open("/")
+    await set_text(user, "name of operating system")
+    user.find(marker="target-local").click()
+
+    editor(user).set_value('exists folder "/etc"')  # no sleep: inside the debounce
+    user.find(marker="breakdown").click()
+    await asyncio.sleep(0.1)
+
+    assert seen == ['exists folder "/etc"']
+
+
+async def test_breakdown_refuses_fresh_parse_error_inside_the_debounce(user, monkeypatch):
+    ran: list[str] = []
+
+    async def fake_breakdown(analysis, target, opts, **upstream):
+        ran.append(analysis.text)
+        return []
+
+    monkeypatch.setattr(app_module, "run_breakdown", fake_breakdown)
+    await user.open("/")
+    await set_text(user, "name of operating system")
+    user.find(marker="target-local").click()
+
+    editor(user).set_value("name of (operating system")
+    user.find(marker="breakdown").click()
+    await asyncio.sleep(0.1)
+
+    assert ran == []  # not the stale clean parse
+
+
+async def test_evaluate_uses_the_current_editor_text(user, monkeypatch):
+    seen: list[str] = []
+
+    async def stream(text, targets, opts, **upstream):
+        seen.append(text)
+        yield ClientRelevanceResult(host="local", transport="local", client_relevance=text)
+
+    monkeypatch.setattr(app_module, "stream_results", stream)
+    await user.open("/")
+    await set_text(user, "name of operating system")
+    user.find(marker="target-local").click()
+
+    editor(user).set_value("version of client")
+    user.find(marker="evaluate").click()
+    await asyncio.sleep(0.1)
+
+    assert seen == ["version of client"]
+
+
+async def test_first_run_discovery_does_not_hold_up_an_explicit_target(monkeypatch):
+    release = threading.Event()
+    called: list[int] = []
+
+    def slow_discovery():
+        release.wait(5)
+
+    async def stream(text, targets, opts, **upstream):
+        called.append(1)
+        yield ClientRelevanceResult(host="local", transport="local", client_relevance=text)
+
+    monkeypatch.setattr(app_module, "_inventory_path", None)
+    monkeypatch.setattr(app_module, "find_inventory_path", lambda: None)
+    monkeypatch.setattr(app_module, "find_or_discover_inventory", slow_discovery)
+    monkeypatch.setattr(app_module, "stream_results", stream)
+
+    async with user_simulation(root=app_module.root) as user:
+        await user.open("/")
+        try:
+            await set_text(user, "name of operating system")
+            user.find(marker="target-local").click()
+            user.find(marker="evaluate").click()
+            await asyncio.sleep(0.2)
+            assert called == [1]
+        finally:
+            release.set()
+
+
+@pytest.mark.parametrize(("field", "value"), [("timeout", 0), ("parallel", 0)])
+async def test_zero_timeout_or_parallel_is_rejected_not_defaulted(user, monkeypatch, field, value):
+    async def stream(text, targets, opts, **upstream):
+        pytest.fail("should not run")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(app_module, "stream_results", stream)
+    await user.open("/")
+    await set_text(user, "name of operating system")
+    user.find(marker="target-local").click()
+    [number] = user.find(marker=f"option-{field}").elements
+    number.set_value(value)
+
+    user.find(marker="evaluate").click()
+
+    await user.should_see("must be")
+
+
+async def breakdown_table(user, monkeypatch, text):
+    async def fake_breakdown(view, target, opts, **upstream):
+        return [
+            LevelResult(level, ProbeView(level.probe, "count", 1, 1, 0), None, False)
+            for level in view.levels
+        ]
+
+    monkeypatch.setattr(app_module, "run_breakdown", fake_breakdown)
+    await user.open("/")
+    await set_text(user, text)
+    user.find(marker="target-local").click()
+    user.find(marker="breakdown").click()
+    await user.should_see(marker="breakdown-level")
+
+
+async def test_leaving_a_breakdown_cell_does_not_rebuild_the_findings(user, monkeypatch):
+    await breakdown_table(user, monkeypatch, "name of operating sytem")
+    [before] = user.find(marker="findings").elements
+    cell = next(iter(user.find(marker="breakdown-level").elements))
+
+    cell.props  # noqa: B018 - element exists
+    user.find(marker="breakdown-level").trigger("mouseenter")
+    user.find(marker="breakdown-level").trigger("mouseleave")
+
+    [after] = user.find(marker="findings").elements
+    assert after is before
+
+
+async def test_hover_highlights_the_level_span(user, monkeypatch):
+    await breakdown_table(user, monkeypatch, WHOSE)
+
+    user.find(marker="breakdown-level").trigger("mouseenter")
+
+    assert any(d.get("class") == "bfrd-level" for d in editor(user).decorations)
+
+
+async def test_hover_after_editing_the_text_highlights_nothing_and_dims_the_table(
+    user, monkeypatch
+):
+    await breakdown_table(user, monkeypatch, WHOSE)
+
+    await set_text(user, WHOSE.replace("/etc", "/var"))
+    user.find(marker="breakdown-level").trigger("mouseenter")
+
+    assert not any(d.get("class") == "bfrd-level" for d in editor(user).decorations)
+    await user.should_see(marker="breakdown-stale")
+
+
+WHOSE = 'names of files whose (size of it > 1000) of folder "/etc"'
+
+
+async def test_closing_the_tab_after_a_double_click_cleans_up_the_one_run(user, monkeypatch):
+    started: list[int] = []
+    cleaned: list[int] = []
+
+    async def slow(text, targets, opts, **upstream):
+        started.append(1)
+        try:
+            await asyncio.sleep(5)
+            yield  # pragma: no cover
+        finally:
+            cleaned.append(1)
+
+    monkeypatch.setattr(app_module, "stream_results", slow)
+    monkeypatch.setattr(app_module, "resolve_container_arches", slow_arches)
+    await user.open("/")
+    await set_text(user, "name of operating system")
+    user.find(marker="target-local").click()
+    user.find(marker="evaluate").click()
+    await asyncio.sleep(0.05)
+    user.find(marker="evaluate").click()
+    await asyncio.sleep(0.4)
+
+    [button_element] = user.find(marker="evaluate").elements
+    button_element.client.delete()
+    await asyncio.sleep(0.2)
+
+    assert started == [1]
+    assert cleaned == [1]

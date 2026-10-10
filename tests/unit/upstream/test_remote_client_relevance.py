@@ -105,9 +105,14 @@ def test_published_arches_no_engine_means_this_machine(monkeypatch):
     assert published_arches("debian:11", None) == ["x86_64"]
 
 
-def test_published_arches_ignores_arches_qna_has_no_build_for():
-    # e.g. ppc64le / s390x: discovery's SUPPORTED_ARCHS is the filter.
-    assert published_arches("debian:11", FakeImages({"x86_64", "ppc64le"})) == ["x86_64"]
+def test_published_arches_trusts_the_engine_filter_and_keeps_new_arches():
+    # EngineImageSource.platforms already filters to what qna supports; a
+    # second local filter would drop an arch the library starts returning.
+    assert published_arches("debian:11", FakeImages({"riscv64", "arm64", "x86_64"})) == [
+        "x86_64",
+        "arm64",
+        "riscv64",
+    ]
 
 
 # --- find_or_discover_inventory ----------------------------------------------------

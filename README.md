@@ -16,6 +16,10 @@ A small browser GUI for BigFix **client relevance**:
 
 It is a localhost tool: it binds to `127.0.0.1` by default and has no auth.
 
+The **activity log is per process**, not per window: with `--browser` or
+`--no-browser` and several tabs open, each tab's log shows the library's
+progress for every tab's runs.
+
 ## Run
 
 With [uv](https://docs.astral.sh/uv/) installed:

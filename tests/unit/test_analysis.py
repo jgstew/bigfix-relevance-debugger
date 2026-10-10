@@ -237,3 +237,17 @@ def test_platforms_exclude_session_environments():
 
 def test_unparseable_expression_has_no_platforms():
     assert summarize("name of (operating system").platforms == ()
+
+
+def test_levels_after_the_whole_expression_are_innermost_first():
+    # run_breakdown flags the first failing level after index 0 as the root
+    # cause; that is only right while the analyzer emits post-order
+    # (an object before the level that consumes it).
+    labels = [lv.label for lv in summarize(WHOSE_EXAMPLE).levels]
+
+    assert labels == [
+        WHOSE_EXAMPLE,
+        'files whose (size of it > 1000) of folder "/etc"',
+        "size of it",
+        WHOSE_EXAMPLE,
+    ]

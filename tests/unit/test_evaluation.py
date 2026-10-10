@@ -23,6 +23,7 @@ from bigfix_relevance_debugger.evaluation import (
     TargetForm,
     TargetFormError,
     analyzer_platform,
+    breakdown_qna_note,
     build_targets,
     choose_breakdown_target,
     load_inventory_targets,
@@ -881,3 +882,74 @@ def test_platform_fit_still_beats_native_arch(monkeypatch):
     choice = choose_breakdown_target(summarize(RPM), [deb_arm, alma_x86])
 
     assert choice.target is alma_x86
+
+
+# --- review fixes ----------------------------------------------------------------
+
+
+class VersionedTransport:
+    """Answers "1" under qna 11.0.6.1 and "0" under anything else."""
+
+    def __init__(self, target):
+        self.target = target
+
+    async def evaluate_client_relevance(
+        self, client_relevance, *, qna_path=None, qna=None, timeout_s=30.0
+    ):
+        version = qna.version if qna else None
+        return ClientRelevanceResult(
+            host=self.target.label,
+            transport="fake",
+            client_relevance=client_relevance,
+            answers=["1" if version == "11.0.6.1" else "0"],
+            qna_version=version,
+        )
+
+
+async def test_breakdown_pins_one_qna_version_when_a_host_lists_several():
+    view = summarize(WHOSE_EXAMPLE)
+    target = Target(kind="ssh", name="multi", qna_version=["11.0.6.1", "11.0.7.2"])
+
+    levels = await run_breakdown(
+        view, target, EvalOptions(), transport_factory=VersionedTransport, resolver=fake_resolver
+    )
+
+    # Every level from the first listed version, never a mix.
+    assert {lr.filtered.total for lr in levels} == {1}
+    assert {lr.qna_version for lr in levels} == {"11.0.6.1"}
+
+
+def test_breakdown_version_pin_is_named(monkeypatch):
+    assert breakdown_qna_note(Target(kind="ssh", name="m", qna_version=["a", "b"])) == (
+        "qna a (first of a, b listed for this host)"
+    )
+    assert breakdown_qna_note(Target(kind="ssh", name="m", qna_version="a")) is None
+    assert breakdown_qna_note(Target(kind="ssh", name="m")) is None
+
+
+def test_result_row_headline_never_reads_none():
+    row = ResultRow.from_result(
+        ClientRelevanceResult(host="h", transport="ssh", client_relevance="x", error_kind="qna")
+    )
+
+    assert row.headline == "h: qna"
+
+
+def test_result_row_headline_ok_and_error():
+    ok = ResultRow.from_result(
+        ClientRelevanceResult(host="h", transport="ssh", client_relevance="x", answers=["y"])
+    )
+    bad = ResultRow.from_result(
+        ClientRelevanceResult(
+            host="h", transport="ssh", client_relevance="x", error="boom", error_kind="transport"
+        )
+    )
+
+    assert ok.headline == "h: y"
+    assert bad.headline == "h: boom"
+
+
+def test_arch_picker_and_arch_lookup_share_one_list():
+    from bigfix_relevance_debugger.upstream.remote_client_relevance import SUPPORTED_ARCHS
+
+    assert evaluation.ARCHES is SUPPORTED_ARCHS

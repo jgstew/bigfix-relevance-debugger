@@ -19,8 +19,8 @@ from bigfix_remote_client_relevance.discovery import (
 )
 from bigfix_remote_client_relevance.inventory_paths import user_inventory_path
 
-# The arches qna ships builds for. discovery.SUPPORTED_ARCHS holds the same
-# tuple but isn't in that module's __all__; use it once it is exported.
+# The arches qna ships builds for, in display order. discovery.SUPPORTED_ARCHS
+# holds the same tuple but isn't in that module's __all__; use it once it is.
 SUPPORTED_ARCHS = ("x86_64", "arm64")
 
 # Image-name tokens -> KNOWN_TARGETS key. Upstream this would merge with
@@ -87,7 +87,10 @@ def published_arches(image: str, images: ImageSource | None) -> list[str]:
     published = images.platforms(image) if images is not None else None
     if not published:
         return [host_arch()]
-    return [arch for arch in SUPPORTED_ARCHS if arch in published] or [host_arch()]
+    # EngineImageSource already filters to what qna supports; SUPPORTED_ARCHS
+    # only orders the result, so an arch the library adds later still comes through.
+    known = [arch for arch in SUPPORTED_ARCHS if arch in published]
+    return known + sorted(published - set(SUPPORTED_ARCHS))
 
 
 def find_or_discover_inventory(

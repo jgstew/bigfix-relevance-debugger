@@ -9,6 +9,7 @@ orchestrator against fakes.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
 from contextlib import aclosing
@@ -31,6 +32,7 @@ from bigfix_remote_client_relevance.discovery import ImageSource, default_image_
 from bigfix_relevance_debugger.analysis import AnalysisView, LevelView
 from bigfix_relevance_debugger.upstream.relevance_analyzer import summarize_count_results
 from bigfix_relevance_debugger.upstream.remote_client_relevance import (
+    SUPPORTED_ARCHS,
     published_arches,
     target_platform,
 )
@@ -38,7 +40,8 @@ from bigfix_relevance_debugger.upstream.remote_client_relevance import (
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONTAINER_IMAGE = "debian:11"
-ARCHES = ("x86_64", "arm64")
+# One list for the arch picker and the "auto" lookup, so they can't drift.
+ARCHES = SUPPORTED_ARCHS
 AUTO_ARCH = "auto"
 """Every arch the image's registry manifest publishes (this machine's if unknown)."""
 
@@ -355,6 +358,11 @@ class ResultRow:
     error: str | None
     raw_qna_output: str
 
+    @property
+    def headline(self) -> str:
+        """``host: answers`` on success, ``host: error`` (or its kind) on failure."""
+        return f"{self.host}: {self.answers_text if self.ok else (self.error or self.status)}"
+
     @classmethod
     def from_result(cls, result: ClientRelevanceResult) -> ResultRow:
         if result.ok:
@@ -407,6 +415,7 @@ class ProbeView:
     not_evaluable: int
     error: str | None = None
     error_kind: str | None = None
+    qna_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -415,6 +424,10 @@ class LevelResult:
     filtered: ProbeView
     unfiltered: ProbeView | None
     is_first_failure: bool
+
+    @property
+    def qna_version(self) -> str | None:
+        return self.filtered.qna_version
 
     @property
     def count_text(self) -> str:
@@ -432,6 +445,7 @@ def _probe_view(relevance: str, result: ClientRelevanceResult | None) -> ProbeVi
         # The orchestrator owes one result per expression; this only happens
         # if the run was cut short.
         return ProbeView(relevance, "error", None, 0, 0, error="no result returned")
+    version = result.qna_version
     if not result.ok:
         return ProbeView(
             relevance,
@@ -441,14 +455,35 @@ def _probe_view(relevance: str, result: ClientRelevanceResult | None) -> ProbeVi
             0,
             error=result.error,
             error_kind=result.error_kind,
+            qna_version=version,
         )
     try:
         summary = summarize_count_results(result.answers)
     except ValueError as exc:
-        return ProbeView(relevance, "error", None, len(result.answers), 0, error=str(exc))
+        return ProbeView(
+            relevance, "error", None, len(result.answers), 0, error=str(exc), qna_version=version
+        )
     return ProbeView(
-        relevance, summary.outcome, summary.total, summary.contexts, summary.not_evaluable
+        relevance,
+        summary.outcome,
+        summary.total,
+        summary.contexts,
+        summary.not_evaluable,
+        qna_version=version,
     )
+
+
+def _listed_versions(target: Target) -> list[str]:
+    version = target.qna_version
+    return [] if version is None or isinstance(version, str) else list(version)
+
+
+def breakdown_qna_note(target: Target) -> str | None:
+    """Which qna a breakdown pins when the host lists several; None when it doesn't."""
+    listed = _listed_versions(target)
+    if len(listed) < 2:
+        return None
+    return f"qna {listed[0]} (first of {', '.join(listed)} listed for this host)"
 
 
 async def run_breakdown(
@@ -464,6 +499,13 @@ async def run_breakdown(
     """
     if not analysis.can_breakdown:
         raise ValueError(analysis.breakdown_disabled_reason or "cannot break down")
+
+    # A host can list several qna versions, and its own list beats the
+    # run-wide spec, so every probe would answer once per version. Pin the
+    # first, or levels would silently mix builds (see breakdown_qna_note).
+    listed = _listed_versions(target)
+    if len(listed) > 1:
+        target = dataclasses.replace(target, qna_version=listed[0])
 
     # Probe text can repeat (the same sub-expression twice), so evaluate each
     # distinct text once and fan the answer back out to every level using it.
@@ -496,7 +538,9 @@ async def run_breakdown(
         views.append((level, filtered, unfiltered))
 
     # The whole expression is level 0 and fails whenever anything does, so it
-    # only answers "where" when nothing deeper does.
+    # only answers "where" when nothing else does. The rest come innermost
+    # first (post-order: an object before the level consuming it), so the first
+    # failure among them is the innermost one, i.e. the root cause.
     failing = [lv.index for lv, f, _ in views if f.outcome in FAILURE_OUTCOMES]
     deeper = [i for i in failing if i != 0]
     if deeper:
