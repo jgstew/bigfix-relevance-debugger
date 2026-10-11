@@ -42,6 +42,7 @@ from bigfix_relevance_debugger.evaluation import (
     evaluate_session,
     load_inventory_targets,
     order_results,
+    pick_label,
     pick_phrase,
     resolve_container_arches,
     results_row_details,
@@ -1675,6 +1676,11 @@ def test_pick_key_round_trips_answers_containing_colons():
 
     assert row("h", ["a:b:c"]).has_key(key)
     assert pick_phrase(key) == 'answering "a:b:c"'
+
+
+def test_pick_labels_match_the_summary_rows():
+    for r in (TallyRow("answer", "a:b", 1), TallyRow("empty", "", 1), TallyRow("error", "qna", 1)):
+        assert pick_label(r.key) == r.label
 
 
 def test_pick_phrases():

@@ -58,6 +58,7 @@ from bigfix_relevance_debugger.evaluation import (
     choose_breakdown_target,
     evaluate_session,
     load_inventory_targets,
+    pick_label,
     resolve_container_arches,
     results_row_details,
     results_summary,
@@ -191,7 +192,8 @@ _RESULTS_BODY_SLOT = r"""
 """
 
 # Answer summary: one row per distinct answer, from tally_table_row(), already
-# in display order (most systems first; no answers and errors last).
+# in display order (most systems first; no answers and errors last). Clicking
+# a row picks it: the results then show only the systems it counted.
 _ANSWER_COLUMNS = [
     {"name": "label", "label": "Answer", "field": "label", "align": "left"},
     {"name": "systems", "label": "Systems", "field": "systems", "align": "right"},
@@ -200,9 +202,11 @@ _ANSWER_COLUMNS = [
 
 # Answers come from the endpoint: interpolate ({{ }}), never v-html.
 _ANSWERS_BODY_SLOT = r"""
-<q-tr :props="props"
-      :class="[props.row.kind === 'error' ? 'text-negative' : '',
-               props.row.kind === 'empty' ? 'opacity-70' : '']">
+<q-tr :props="props" class="cursor-pointer"
+      :class="[props.row.picked ? 'bg-blue-1 text-bold' : '',
+               props.row.kind === 'error' ? 'text-negative' : '',
+               props.row.kind === 'empty' ? 'opacity-70' : '']"
+      @click="() => $parent.$emit('pick', props.row.key)">
   <q-td key="label" :props="props" class="bfrd-mono">{{ props.row.label }}</q-td>
   <q-td key="systems" :props="props">{{ props.row.systems }}</q-td>
   <q-td key="share" :props="props" style="min-width: 10rem">
@@ -272,6 +276,9 @@ class _PageState:
     """The expression the breakdown on screen was run on."""
     tally: AnswerTally = dataclasses.field(default_factory=AnswerTally)
     """Systems per answer over the whole run, for the answer summary."""
+    pick: str | None = None
+    """The answer-summary row clicked (its key): results show only the systems it
+    counted. Kept across runs like the filter; Clear drops it."""
 
     @property
     def running(self) -> bool:
@@ -357,6 +364,13 @@ async def root() -> None:
             answers_section.set_visibility(False)
             with ui.column().classes("w-full gap-1").mark("results-section") as results_section:
                 ui.label("Results by system").classes("text-subtitle1").mark("results-title")
+                pick_chip = (
+                    ui.chip(icon="filter_alt", removable=True)
+                    .props("dense outline color=primary")
+                    .mark("results-pick")
+                    .tooltip("Picked in the answer summary; click the row again or ✕ to show all")
+                )
+                pick_chip.set_visibility(False)
                 results_filter = (
                     ui.input(placeholder="Filter by answer or error text")
                     .props("clearable dense")
@@ -721,7 +735,7 @@ async def root() -> None:
         prebuilt summary cells; only open rows add their answers and raw output.
         """
         query = state.filter_text
-        order = visible_results(state.rows, query)
+        order = visible_results(state.rows, query, state.pick)
         if query.strip():
             # A search opens matching hosts the first time they show (including
             # ones streaming in), then leaves them to the user.
@@ -735,7 +749,11 @@ async def root() -> None:
         ]
         results_table.props["expanded"] = sorted(state.expanded)
         results_table.update()
-        results_summary_label.set_text(results_summary(state.rows, len(order), query))
+        results_summary_label.set_text(results_summary(state.rows, len(order), query, state.pick))
+        if state.pick is not None:
+            pick_chip.set_text(f"Only: {pick_label(state.pick)}")
+            pick_chip.value = True  # its ✕ set it False; a new pick shows it again
+        pick_chip.set_visibility(state.pick is not None)
         results_section.set_visibility(bool(state.rows))
         render_answers()
 
@@ -743,7 +761,7 @@ async def root() -> None:
         """The answer summary: the whole run, whatever the filter hides."""
         tally = state.tally
         rows, hidden = tally.rows(TALLY_LIMIT)
-        answers_table.rows = [tally_table_row(r, tally.systems, None) for r in rows]
+        answers_table.rows = [tally_table_row(r, tally.systems, state.pick) for r in rows]
         answers_table.update()
         systems = f"{tally.systems} system" + ("" if tally.systems == 1 else "s")
         answers_title.set_text(f"Answers · {systems}")
@@ -759,6 +777,22 @@ async def root() -> None:
         render_results()  # a newly opened row needs its details
 
     results_table.on("update:expanded", on_expanded)
+
+    def on_pick(e: GenericEventArguments) -> None:
+        # The picked row again un-picks. No auto-expand: the answer is known
+        # already, and opening every match would resend all their raw output.
+        key = str(e.args)
+        state.pick = None if state.pick == key else key
+        render_results()
+
+    answers_table.on("pick", on_pick)
+
+    def on_pick_removed(e: ValueChangeEventArguments) -> None:
+        if not e.value and state.pick is not None:
+            state.pick = None
+            render_results()
+
+    pick_chip.on_value_change(on_pick_removed)
 
     pending_filter = ""
 
@@ -838,6 +872,7 @@ async def root() -> None:
         filter_debouncer.cancel()  # cleared now, not after the debounce
         state.table_rows = []
         state.tally = AnswerTally()
+        state.pick = None
         state.filter_text = ""
         state.filter_seen = set()
         render_results()

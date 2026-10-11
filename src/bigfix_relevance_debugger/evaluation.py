@@ -827,6 +827,12 @@ def _split_key(key: str) -> tuple[str, str]:
     return kind, value
 
 
+def pick_label(key: str) -> str:
+    """The summary-row label of a pick, e.g. for the chip saying what's picked."""
+    kind, value = _split_key(key)
+    return TallyRow(kind, value, 0).label
+
+
 def pick_phrase(key: str) -> str:
     """How the results summary describes the hosts a pick keeps."""
     kind, value = _split_key(key)

@@ -1862,3 +1862,190 @@ async def test_each_result_is_tallied_once(user, monkeypatch):
     await clear_search(user)
 
     assert sorted(calls) == sorted(r.host for r in SUMMARY_FLEET)
+
+
+# --- drill-down from the answer summary (issue 8) --------------------------------------------
+
+# "multi" lists two qna versions: one answers like deb, the other answers nothing.
+PICK_FLEET = (
+    result("deb", ["Linux Debian 11"], qna_version="a"),
+    result("rh", ["Linux Red Hat 9"], qna_version="a"),
+    result("multi", ["Linux Debian 11"], qna_version="a"),
+    result("multi", [], qna_version="b"),
+    result("down", error="Permission denied (publickey)", error_kind="transport"),
+)
+
+
+async def pick(user, label):
+    [row] = [r for r in answers_table(user).rows if r["label"] == label]
+    user.find(marker="answers").trigger("pick", row["key"])
+    await asyncio.sleep(0.1)
+
+
+def pick_chip(user):
+    return hidden_element(user, "results-pick")
+
+
+def summary_text(user) -> str:
+    [label] = user.find(marker="results-summary").elements
+    return label.text
+
+
+async def test_clicking_an_answer_shows_only_systems_with_it(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+
+    await pick(user, "Linux Debian 11")
+
+    # multi keeps both its rows, the one without the answer too.
+    assert result_hosts(user) == ["deb", "multi", "multi"]
+    await user.should_see(marker="results-pick")
+    assert "Linux Debian 11" in pick_chip(user).text
+
+
+async def test_picked_summary_row_is_marked(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+
+    await pick(user, "Linux Debian 11")
+
+    assert [r["label"] for r in answers_table(user).rows if r["picked"]] == ["Linux Debian 11"]
+
+
+async def test_clicking_the_picked_answer_again_removes_the_pick(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+    await pick(user, "Linux Debian 11")
+    await user.should_see(marker="results-pick")
+
+    await pick(user, "Linux Debian 11")
+
+    assert sorted(set(result_hosts(user))) == ["deb", "down", "multi", "rh"]
+    await user.should_not_see(marker="results-pick")
+    assert not any(r["picked"] for r in answers_table(user).rows)
+
+
+async def test_removing_the_pick_chip_shows_everything(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+    await pick(user, "Linux Debian 11")
+
+    pick_chip(user).set_value(False)  # what its ✕ does
+    await asyncio.sleep(0.1)
+
+    assert len(result_hosts(user)) == len(PICK_FLEET)
+    await user.should_not_see(marker="results-pick")
+
+
+async def test_a_new_pick_after_removing_the_chip_shows_the_chip_again(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+    await pick(user, "Linux Debian 11")
+    pick_chip(user).set_value(False)
+    await asyncio.sleep(0.1)
+
+    await pick(user, "Linux Red Hat 9")
+
+    await user.should_see(marker="results-pick")
+    assert result_hosts(user) == ["rh"]
+
+
+async def test_pick_no_answers_and_error_rows(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+
+    await pick(user, "(no answers)")
+    assert result_hosts(user) == ["multi", "multi"]
+
+    await pick(user, "error: transport")
+    assert result_hosts(user) == ["down"]
+
+
+async def test_pick_and_filter_combine(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+    await pick(user, "(no answers)")
+
+    await search(user, "debian")
+    assert result_hosts(user) == ["multi", "multi"]
+
+    await search(user, "red hat")
+    assert result_hosts(user) == []
+
+
+async def test_pick_summary_line(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+
+    await pick(user, "Linux Debian 11")
+
+    assert summary_text(user) == 'Showing 3 of 5 results: hosts answering "Linux Debian 11"'
+
+
+async def test_pick_does_not_auto_expand(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+
+    await pick(user, "Linux Debian 11")
+
+    assert result_hosts(user) == ["deb", "multi", "multi"]
+    assert results_table(user).props["expanded"] == []
+
+
+async def test_pick_keeps_what_the_user_expanded(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+    [rh] = [r for r in results_table(user).rows if r["host"] == "rh"]
+    user.find(marker="results").trigger("update:expanded", [rh["id"]])
+
+    await pick(user, "Linux Debian 11")
+    assert "rh" not in result_hosts(user)
+    await pick(user, "Linux Debian 11")
+
+    assert results_table(user).props["expanded"] == [rh["id"]]
+
+
+async def rerun(user, monkeypatch, *results):
+    monkeypatch.setattr(app_module, "stream_results", stream_of(*results))
+    monkeypatch.setattr(app_module, "total_work", lambda targets, opts: len(results))
+    user.find(marker="evaluate").click()
+    await user.should_see(f"{len(results)} / {len(results)}")
+    await asyncio.sleep(0.1)
+
+
+async def test_pick_survives_evaluate(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+    await pick(user, "Linux Debian 11")
+
+    await rerun(user, monkeypatch, *PICK_FLEET)
+
+    assert result_hosts(user) == ["deb", "multi", "multi"]
+    await user.should_see(marker="results-pick")
+
+
+async def test_pick_with_no_matching_host_after_a_rerun_says_so(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+    await pick(user, "Linux Debian 11")
+
+    await rerun(user, monkeypatch, result("a", ["Windows 11"]), result("b", ["Windows 11"]))
+
+    assert result_hosts(user) == []
+    assert summary_text(user).startswith("Showing 0 of 2 results")
+    await user.should_see(marker="results-pick")
+
+
+async def test_clear_removes_the_pick(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+    await pick(user, "Linux Debian 11")
+    assert pick_chip(user).visible
+
+    user.find(marker="clear").click()
+    await rerun(user, monkeypatch, *PICK_FLEET)
+
+    assert len(result_hosts(user)) == len(PICK_FLEET)
+    await user.should_not_see(marker="results-pick")
+
+
+async def test_export_ignores_the_pick(user, monkeypatch):
+    exported: list[str] = []
+    monkeypatch.setattr(
+        UserDownload, "content", lambda self, payload, *a, **k: exported.append(payload)
+    )
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+    await pick(user, "error: transport")
+    assert result_hosts(user) == ["down"]
+
+    user.find(marker="export").click()
+
+    [payload] = exported
+    assert len(json.loads(payload)) == len(PICK_FLEET)
