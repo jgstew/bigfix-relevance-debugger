@@ -126,8 +126,12 @@ trusted publishing. **Never tag by hand:** an existing tag is how the
 workflow knows a version is already released, so a hand-made tag means that
 version never reaches PyPI.
 
-The whole workflow is a no-op until the repository variable `PYPI_PUBLISH`
-is `true`. A version with an `a`, `b`, `rc` or `.dev` part becomes a GitHub
+Until the repository variable `PYPI_PUBLISH` is `true`, the release job
+(tag, GitHub release, PyPI) is skipped, but the version check and the test
+and pre-commit gates still run, so Run workflow on `main` tests everything
+up to the release without publishing.
+
+A version with an `a`, `b`, `rc` or `.dev` part becomes a GitHub
 pre-release, and the version must be in normalized PEP 440 form (`1.0.0b1`,
 not `1.0.0-beta`) so the tag matches PyPI.
 
