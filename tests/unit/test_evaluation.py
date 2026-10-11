@@ -31,6 +31,7 @@ from bigfix_relevance_debugger.evaluation import (
     load_inventory_targets,
     order_results,
     resolve_container_arches,
+    results_row_details,
     results_summary,
     results_table_row,
     run_breakdown,
@@ -494,7 +495,6 @@ def test_result_row_ok():
     assert row.status == "ok"
     assert row.ok is True
     assert row.host == "container:debian:11@arm64"
-    assert row.answers_text == "Linux Debian 11; x"
     assert row.answer_types_text == "string"
     assert row.qna_version_text == "11.0.7.61"
     assert row.platform_text == "debian/arm64"
@@ -532,7 +532,6 @@ def test_result_row_error():
     assert row.status == "transport"
     assert row.ok is False
     assert row.error == "Permission denied (publickey)"
-    assert row.answers_text == ""
 
 
 def test_result_row_no_answers_is_ok_but_says_so():
@@ -541,7 +540,7 @@ def test_result_row_no_answers_is_ok_but_says_so():
     )
 
     assert row.ok is True
-    assert row.answers_text == "(no answers)"
+    assert results_row_details(row)["answers"] == "(no answers)"
 
 
 # --- run_breakdown ----------------------------------------------------------------
@@ -942,13 +941,13 @@ def test_arch_picker_and_arch_lookup_share_one_list():
 # --- results view (issue 4) ---------------------------------------------------------
 
 
-def row(host, answers=(), *, error=None, error_kind=None, qna_version=None):
+def row(host, answers=(), *, error=None, error_kind=None, qna_version=None, transport="ssh"):
     if error is not None and error_kind is None:
         error_kind = "transport"
     return ResultRow.from_result(
         ClientRelevanceResult(
             host=host,
-            transport="ssh",
+            transport=transport,
             client_relevance="x",
             answers=list(answers),
             error=error,
@@ -1061,14 +1060,66 @@ def test_table_row_cells_are_scalars():
     )
 
     cells = results_table_row(7, r)
+    details = results_row_details(r)
 
     assert cells["id"] == 7
-    assert all(isinstance(v, str | int | bool | type(None)) for v in cells.values())
-    assert cells["answers"] == "a\nb"
+    for values in (cells.values(), details.values()):
+        assert all(isinstance(v, str | int | bool | type(None)) for v in values)
     assert cells["count"] == 2
     assert cells["host"] == "h"
     assert cells["platform"] == "debian/arm64"
     assert cells["qna"] == "11.0.7.61"
+    assert details == {
+        "answers": "a\nb",
+        "types": "string",
+        "error": None,
+        "raw": "Q: x\nA: a\nA: b\n",
+    }
+
+
+def test_collapsed_row_cells_leave_out_the_details():
+    # Every streamed result resends the whole table; only open rows carry the bulk.
+    cells = results_table_row(0, row("h", ["a" * 1000]))
+
+    assert not set(cells) & {"answers", "types", "error", "raw"}
+
+
+def test_details_show_an_empty_string_answer_as_quotes():
+    # relevance like "" answers one empty string: that is an answer, not none.
+    assert results_row_details(row("h", [""]))["answers"] == '""'
+    assert results_row_details(row("h", ["a", ""]))["answers"] == 'a\n""'
+    assert results_row_details(row("h"))["answers"] == "(no answers)"
+
+
+def test_preview_shows_an_empty_string_answer_as_quotes():
+    assert answers_preview(row("h", [""])) == '""'
+
+
+def test_ssh_and_fastquery_entries_for_one_address_are_separate_hosts():
+    # An inventory can list both for one address; render.display_host tells them apart.
+    rows = [
+        row("192.168.4.115", ["via ssh"], transport="ssh"),
+        row("192.168.4.115", ["via fastquery"], transport="fastquery"),
+    ]
+
+    assert [r.display_host for r in rows] == ["ssh:192.168.4.115", "fastquery:192.168.4.115"]
+    assert visible_results(rows, "via ssh") == [0]
+    assert results_table_row(1, rows[1])["host"] == "fastquery:192.168.4.115"
+
+
+def test_container_display_host_is_the_host():
+    assert row("container:debian:11@arm64", transport="container").display_host == (
+        "container:debian:11@arm64"
+    )
+
+
+def test_match_includes_the_status_of_an_error_without_a_message():
+    # The preview shows the status then, so the filter has to find it too.
+    timed_out = row("h", error_kind="timeout")
+
+    assert answers_preview(timed_out) == "timeout"
+    assert timed_out.matches("timeout")
+    assert not row("h", ["a"]).matches("ok")  # an ok row's status isn't shown
 
 
 def test_preview_fits_whole_answers_then_says_how_many_more():

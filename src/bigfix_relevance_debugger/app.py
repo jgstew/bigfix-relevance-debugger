@@ -35,6 +35,7 @@ from bigfix_relevance_debugger.analysis import AnalysisView, editor_decorations,
 from bigfix_relevance_debugger.evaluation import (
     ARCHES,
     AUTO_ARCH,
+    Cells,
     EvalOptions,
     InventoryLoad,
     LevelResult,
@@ -45,6 +46,7 @@ from bigfix_relevance_debugger.evaluation import (
     choose_breakdown_target,
     load_inventory_targets,
     resolve_container_arches,
+    results_row_details,
     results_summary,
     results_table_row,
     run_breakdown,
@@ -59,6 +61,8 @@ logger = logging.getLogger(__name__)
 
 TITLE = "BigFix Relevance Debugger"
 DEBOUNCE_S = 0.3
+FILTER_DEBOUNCE_S = 0.2
+"""Each filter change resends the results table, so wait for typing to pause."""
 
 EXAMPLES = {
     "name of operating system": "name of operating system",
@@ -153,7 +157,7 @@ _RESULTS_BODY_SLOT = r"""
 </q-tr>
 <q-tr v-show="props.expand" :props="props">
   <q-td colspan="100%">
-    <div class="bfrd-mono" style="white-space: pre-wrap">{{ props.row.answers || '(no answers)' }}</div>
+    <div class="bfrd-mono" style="white-space: pre-wrap">{{ props.row.answers }}</div>
     <div class="text-caption opacity-70">
       {{ props.row.status }} · types: {{ props.row.types || '-' }} · qna {{ props.row.qna || '?' }}
     </div>
@@ -203,7 +207,13 @@ class _PageState:
     """``results`` preformatted, kept in step so a new arrival converts only itself."""
     expanded: set[int] = dataclasses.field(default_factory=set)
     """Keys (indexes into ``rows``) of the results-table rows that are open."""
+    table_rows: list[Cells] = dataclasses.field(default_factory=list)
+    """``results_table_row`` of each of ``rows``, built once when it arrives."""
     filter_text: str = ""
+    """The filter the table shows; the input's value lands here after the debounce."""
+    filter_seen: set[int] = dataclasses.field(default_factory=set)
+    """Keys already shown under the current filter. Only rows new to it auto-open,
+    so a match the user collapsed stays collapsed while results stream in."""
     expanded_before_filter: set[int] | None = None
     """What the user had open before a search auto-opened the matches; restored after."""
     breakdown_text: str | None = None
@@ -543,7 +553,9 @@ async def root() -> None:
             done = 0
             state.results = []
             state.rows = []
+            state.table_rows = []
             state.expanded = set()
+            state.filter_seen = set()
             if state.expanded_before_filter is not None:
                 state.expanded_before_filter = set()  # old keys mean nothing now
             render_results()
@@ -551,7 +563,9 @@ async def root() -> None:
             progress_label.set_text(f"0 / {total}")
             async for result in stream_results(text, targets, opts):
                 state.results.append(result)
-                state.rows.append(ResultRow.from_result(result))
+                row = ResultRow.from_result(result)
+                state.table_rows.append(results_table_row(len(state.rows), row))
+                state.rows.append(row)
                 done += 1
                 progress.set_value(done / total if total else 1)
                 progress_label.set_text(f"{done} / {total}")
@@ -560,13 +574,24 @@ async def root() -> None:
         start(job)
 
     def render_results() -> None:
-        """Re-sort the results table; called per streamed result, so it stays cheap."""
+        """Re-sort and resend the results table, once per streamed result.
+
+        NiceGUI resends the whole ``rows`` prop, so collapsed rows are the
+        prebuilt summary cells; only open rows add their answers and raw output.
+        """
         query = state.filter_text
         order = visible_results(state.rows, query)
         if query.strip():
-            # A search opens the matching hosts, including ones streaming in.
-            state.expanded |= set(order)
-        results_table.rows = [results_table_row(i, state.rows[i]) for i in order]
+            # A search opens matching hosts the first time they show (including
+            # ones streaming in), then leaves them to the user.
+            state.expanded |= set(order) - state.filter_seen
+            state.filter_seen |= set(order)
+        results_table.rows = [
+            {**state.table_rows[i], **results_row_details(state.rows[i])}
+            if i in state.expanded
+            else state.table_rows[i]
+            for i in order
+        ]
         results_table.props["expanded"] = sorted(state.expanded)
         results_table.update()
         results_summary_label.set_text(results_summary(state.rows, len(order), query))
@@ -574,24 +599,32 @@ async def root() -> None:
 
     def on_expanded(e: GenericEventArguments) -> None:
         state.expanded = {int(key) for key in e.args or []}
-        results_table.props["expanded"] = sorted(state.expanded)
-        results_table.update()
+        render_results()  # a newly opened row needs its details
 
     results_table.on("update:expanded", on_expanded)
 
-    def apply_filter(e: ValueChangeEventArguments) -> None:
-        # A cleared Quasar input sends None.
-        state.filter_text = e.value or ""
+    pending_filter = ""
+
+    def apply_filter() -> None:
+        state.filter_text = pending_filter
+        state.filter_seen = set()
         if state.filter_text.strip():
             if state.expanded_before_filter is None:
                 state.expanded_before_filter = state.expanded
-            state.expanded = set(visible_results(state.rows, state.filter_text))
+            state.expanded = set()  # render_results opens the matches
         elif state.expanded_before_filter is not None:
             state.expanded = state.expanded_before_filter
             state.expanded_before_filter = None
         render_results()
 
-    results_filter.on_value_change(apply_filter)
+    filter_debouncer = Debouncer(FILTER_DEBOUNCE_S, apply_filter)
+
+    def on_filter_input(e: ValueChangeEventArguments) -> None:
+        nonlocal pending_filter
+        pending_filter = e.value or ""  # a cleared Quasar input sends None
+        filter_debouncer.trigger()
+
+    results_filter.on_value_change(on_filter_input)
 
     def breakdown() -> None:
         view = current_view()
@@ -643,7 +676,11 @@ async def root() -> None:
         state.expanded = set()
         state.expanded_before_filter = None
         state.breakdown_text = None
-        results_filter.set_value("")  # fires apply_filter only if it changed
+        results_filter.set_value("")
+        filter_debouncer.cancel()  # cleared now, not after the debounce
+        state.table_rows = []
+        state.filter_text = ""
+        state.filter_seen = set()
         render_results()
         breakdown_box.clear()
         update_stale()
@@ -669,6 +706,7 @@ async def root() -> None:
     # same client, and its log should keep flowing.
     client.on_delete(lambda: detach(handler))
     client.on_delete(debouncer.cancel)
+    client.on_delete(filter_debouncer.cancel)
     client.on_delete(cancel)
 
     # --- inventory -------------------------------------------------------------------

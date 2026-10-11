@@ -28,6 +28,7 @@ from bigfix_remote_client_relevance import (
 )
 from bigfix_remote_client_relevance.bootstrap.targets import host_arch, normalize_arch
 from bigfix_remote_client_relevance.discovery import ImageSource, default_image_source
+from bigfix_remote_client_relevance.render import display_host
 
 from bigfix_relevance_debugger.analysis import AnalysisView, LevelView
 from bigfix_relevance_debugger.upstream.relevance_analyzer import summarize_count_results
@@ -349,8 +350,10 @@ class ResultRow:
     """``"ok"`` or the ``error_kind``."""
     ok: bool
     host: str
+    display_host: str
+    """``host`` with its transport where that's ambiguous (``ssh:`` / ``fastquery:``):
+    an inventory can list both for one address. Rows group and show by this."""
     answers: tuple[str, ...]
-    answers_text: str
     answer_types_text: str
     qna_version_text: str
     platform_text: str
@@ -360,10 +363,6 @@ class ResultRow:
 
     @classmethod
     def from_result(cls, result: ClientRelevanceResult) -> ResultRow:
-        if result.ok:
-            answers_text = "; ".join(result.answers) if result.answers else "(no answers)"
-        else:
-            answers_text = "; ".join(result.answers)
         qna_version = result.qna_version or ""
         if result.qna_fallback_from:
             qna_version = f"{qna_version} (fell back from {result.qna_fallback_from})"
@@ -371,8 +370,8 @@ class ResultRow:
             status="ok" if result.ok else (result.error_kind or "error"),
             ok=result.ok,
             host=result.host,
+            display_host=display_host(result),
             answers=tuple(result.answers),
-            answers_text=answers_text,
             # Usually all one type; showing each repeat would only add noise.
             answer_types_text=", ".join(dict.fromkeys(result.answer_types)),
             qna_version_text=qna_version,
@@ -396,16 +395,21 @@ class ResultRow:
     def matches(self, query: str) -> bool:
         """Whether an answer or the error contains ``query``, ignoring case. Blank matches all.
 
-        Host, platform and qna version are left out on purpose: in a debian:11 /
-        qna 11.x run, ``11`` would otherwise match every row.
+        An error with no message matches on its status, which is what the
+        preview shows for it. Host, platform and qna version are left out on
+        purpose: in a debian:11 / qna 11.x run, ``11`` would otherwise match
+        every row.
         """
         needle = query.strip().casefold()
         if not needle:
             return True
-        return any(needle in text.casefold() for text in (*self.answers, self.error or ""))
+        error = self.error or ("" if self.ok else self.status)
+        return any(needle in text.casefold() for text in (*self.answers, error))
 
 
 # --- results view ---------------------------------------------------------------------
+
+NO_ANSWERS = "(no answers)"
 
 PREVIEW_CHARS = 60
 """Longest answers preview in a collapsed results-table row: about one line of
@@ -415,14 +419,15 @@ the results column in the native window's default size."""
 def order_results(rows: Sequence[ResultRow]) -> list[int]:
     """Indexes into ``rows`` in display order.
 
-    Grouped by host, since a host listing several qna versions yields one
-    result per version and they belong together. Hosts are ranked by their
+    Grouped by ``display_host``, since a host listing several qna versions
+    yields one result per version and they belong together (while an ssh and
+    a fastquery entry for one address stay apart). Hosts are ranked by their
     best result (see ``ResultRow.rank``), then by name ignoring case, then by
     first arrival; a host's own results stay in arrival order.
     """
     groups: dict[str, list[int]] = {}
     for index, row in enumerate(rows):
-        groups.setdefault(row.host, []).append(index)
+        groups.setdefault(row.display_host, []).append(index)
 
     def host_key(item: tuple[str, list[int]]) -> tuple[tuple[int, int], str, int]:
         host, indexes = item
@@ -437,8 +442,13 @@ def visible_results(rows: Sequence[ResultRow], query: str) -> list[int]:
     A matching host keeps *all* its results, so a search shows each
     computer's whole answer set rather than just the matching rows.
     """
-    hosts = {row.host for row in rows if row.matches(query)}
-    return [i for i in order_results(rows) if rows[i].host in hosts]
+    hosts = {row.display_host for row in rows if row.matches(query)}
+    return [i for i in order_results(rows) if rows[i].display_host in hosts]
+
+
+def _shown(answer: str) -> str:
+    # relevance like "" answers one empty string; that's an answer, so show it.
+    return answer or '""'
 
 
 def _cut(text: str, limit: int) -> str:
@@ -453,10 +463,11 @@ def answers_preview(row: ResultRow, limit: int = PREVIEW_CHARS) -> str:
     if not row.ok:
         return _cut(row.error or row.status, limit)
     if not row.answers:
-        return "(no answers)"
+        return NO_ANSWERS
+    answers = [_shown(a) for a in row.answers]
     shown: list[str] = []
     length = 0
-    for answer in row.answers:
+    for answer in answers:
         extra = len(answer) + (2 if shown else 0)
         if length + extra > limit:
             break
@@ -464,27 +475,38 @@ def answers_preview(row: ResultRow, limit: int = PREVIEW_CHARS) -> str:
         length += extra
     if not shown:
         # Not even the first answer fits: cut it.
-        shown = [_cut(row.answers[0], limit)]
+        shown = [_cut(answers[0], limit)]
     text = "; ".join(shown)
     hidden = row.answer_count - len(shown)
     return f"{text} (+{hidden} more)" if hidden else text
 
 
-def results_table_row(key: int, row: ResultRow) -> dict[str, str | int | bool | None]:
-    """One results-table row. Every cell is a scalar: NiceGUI warns list cells can
-    crash the browser, so the answers are newline-joined for the expanded view."""
+Cells = dict[str, str | int | bool | None]
+"""A results-table row. Scalars only: NiceGUI warns list cells can crash the browser."""
+
+
+def results_table_row(key: int, row: ResultRow) -> Cells:
+    """The cells of a collapsed row. A row never changes once it has arrived,
+    so build this once per result."""
     return {
         "id": key,
         "ok": row.ok,
         "status": row.status,
-        "host": row.host,
+        "host": row.display_host,
         "count": row.answer_count,
         "preview": answers_preview(row),
         "platform": row.platform_text,
-        "elapsed_ms": row.elapsed_ms,
-        "answers": "\n".join(row.answers),
-        "types": row.answer_types_text,
         "qna": row.qna_version_text,
+        "elapsed_ms": row.elapsed_ms,
+    }
+
+
+def results_row_details(row: ResultRow) -> Cells:
+    """What an expanded row adds. Kept off collapsed rows: the whole table is
+    resent on each update, and raw qna output is the bulk of it."""
+    return {
+        "answers": "\n".join(_shown(a) for a in row.answers) or NO_ANSWERS,
+        "types": row.answer_types_text,
         "error": row.error,
         "raw": row.raw_qna_output,
     }

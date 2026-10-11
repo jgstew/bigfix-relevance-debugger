@@ -314,9 +314,10 @@ async def test_evaluate_streams_result_rows(user, monkeypatch):
     [table] = user.find(marker="results").elements
     [row] = table.rows
     assert row["host"] == "local"
-    assert row["answers"] == "Linux Debian 11"
     assert row["preview"] == "Linux Debian 11"
     assert row["elapsed_ms"] == 42
+    user.find(marker="results").trigger("update:expanded", [row["id"]])
+    assert table.rows[0]["answers"] == "Linux Debian 11"
     assert [t.kind for t in seen["targets"]] == ["local"]
 
 
@@ -1048,8 +1049,9 @@ def result_hosts(user) -> list[str]:
 
 
 def result(host, answers=(), **kwargs):
+    # container: its display host is the host as given (ssh would read "ssh:<host>").
     return ClientRelevanceResult(
-        host=host, transport="ssh", client_relevance="x", answers=list(answers), **kwargs
+        host=host, transport="container", client_relevance="x", answers=list(answers), **kwargs
     )
 
 
@@ -1149,7 +1151,7 @@ async def test_answer_text_is_not_rendered_as_html(user, monkeypatch):
 
     slots = "".join(str(s.template) for s in results_table(user).slots.values() if s.template)
     assert "v-html" not in slots
-    assert results_table(user).rows[0]["answers"] == "<b>x</b>"
+    assert results_table(user).rows[0]["preview"] == "<b>x</b>"
 
 
 # --- search (issue 4) ----------------------------------------------------------------------
@@ -1170,14 +1172,20 @@ async def evaluated_fleet(user, monkeypatch):
     await asyncio.sleep(0.1)
 
 
-def search(user, text):
+async def search(user, text):
     user.find(marker="results-filter").clear().type(text)
+    await asyncio.sleep(app_module.FILTER_DEBOUNCE_S + 0.1)
+
+
+async def clear_search(user):
+    user.find(marker="results-filter").clear()
+    await asyncio.sleep(app_module.FILTER_DEBOUNCE_S + 0.1)
 
 
 async def test_search_hides_hosts_without_a_matching_result(user, monkeypatch):
     await evaluated_fleet(user, monkeypatch)
 
-    search(user, "debian")
+    await search(user, "debian")
 
     assert result_hosts(user) == ["deb", "multi", "multi"]
 
@@ -1185,7 +1193,7 @@ async def test_search_hides_hosts_without_a_matching_result(user, monkeypatch):
 async def test_search_shows_every_result_of_a_matching_host(user, monkeypatch):
     await evaluated_fleet(user, monkeypatch)
 
-    search(user, "DEBIAN 12")
+    await search(user, "DEBIAN 12")
 
     rows = results_table(user).rows
     assert [(r["host"], r["qna"]) for r in rows] == [("multi", "a"), ("multi", "b")]
@@ -1194,7 +1202,7 @@ async def test_search_shows_every_result_of_a_matching_host(user, monkeypatch):
 async def test_search_expands_matching_hosts(user, monkeypatch):
     await evaluated_fleet(user, monkeypatch)
 
-    search(user, "debian")
+    await search(user, "debian")
 
     table = results_table(user)
     assert table.props["expanded"] == sorted(r["id"] for r in table.rows)
@@ -1205,8 +1213,8 @@ async def test_clearing_search_restores_all_rows_and_what_was_expanded(user, mon
     rh = next(r["id"] for r in results_table(user).rows if r["host"] == "rh")
     user.find(marker="results").trigger("update:expanded", [rh])
 
-    search(user, "debian")
-    user.find(marker="results-filter").clear()
+    await search(user, "debian")
+    await clear_search(user)
 
     assert len(results_table(user).rows) == len(FLEET)
     assert results_table(user).props["expanded"] == [rh]
@@ -1215,7 +1223,7 @@ async def test_clearing_search_restores_all_rows_and_what_was_expanded(user, mon
 async def test_search_matches_error_text(user, monkeypatch):
     await evaluated_fleet(user, monkeypatch)
 
-    search(user, "publickey")
+    await search(user, "publickey")
 
     assert result_hosts(user) == ["down"]
 
@@ -1223,7 +1231,7 @@ async def test_search_matches_error_text(user, monkeypatch):
 async def test_search_summary_says_showing_n_of_m(user, monkeypatch):
     await evaluated_fleet(user, monkeypatch)
 
-    search(user, "debian")
+    await search(user, "debian")
 
     await user.should_see(
         'Showing 3 of 5 results: hosts with an answer or error containing "debian"'
@@ -1233,7 +1241,7 @@ async def test_search_summary_says_showing_n_of_m(user, monkeypatch):
 async def test_search_with_no_matches_empties_the_table_and_says_so(user, monkeypatch):
     await evaluated_fleet(user, monkeypatch)
 
-    search(user, "solaris")
+    await search(user, "solaris")
 
     assert results_table(user).rows == []
     await user.should_see("Showing 0 of 5 results")
@@ -1241,7 +1249,7 @@ async def test_search_with_no_matches_empties_the_table_and_says_so(user, monkey
 
 async def test_search_persists_across_evaluate(user, monkeypatch):
     await evaluated_fleet(user, monkeypatch)
-    search(user, "red hat")
+    await search(user, "red hat")
 
     user.find(marker="evaluate").click()
     await asyncio.sleep(0.3)
@@ -1258,7 +1266,7 @@ async def test_new_matches_streaming_in_are_expanded(user, monkeypatch):
         stream_of(result("a", ["debian"]), result("b", ["debian too"]), gate=gate, after=1),
     )
     await user.should_see("1 / 2")
-    search(user, "debian")
+    await search(user, "debian")
 
     gate.set()
     await user.should_see("2 / 2")
@@ -1275,7 +1283,7 @@ async def test_export_includes_results_hidden_by_the_search(user, monkeypatch):
         UserDownload, "content", lambda self, payload, *a, **k: exported.append(payload)
     )
     await evaluated_fleet(user, monkeypatch)
-    search(user, "debian")
+    await search(user, "debian")
 
     user.find(marker="export").click()
 
@@ -1299,7 +1307,7 @@ async def test_clear_is_disabled_until_there_is_something_to_clear(user):
 
 async def test_clear_removes_results_breakdown_progress_and_search(user, monkeypatch):
     await evaluate_and_break_down(user, monkeypatch, breakdown_first=False)
-    search(user, "debian")
+    await search(user, "debian")
     assert button(user, "clear").enabled
 
     user.find(marker="clear").click()
@@ -1373,3 +1381,68 @@ async def test_results_table_shows_the_qna_version_so_a_hosts_rows_differ(user, 
     assert "qna" in [c["name"] for c in table.columns]
     multi = [r["qna"] for r in table.rows if r["host"] == "multi"]
     assert multi == ["a", "b"]
+
+
+# --- PR #5 review ---------------------------------------------------------------------------
+
+
+async def test_rows_the_user_collapses_stay_collapsed_while_filtered_results_stream_in(
+    user, monkeypatch
+):
+    gate = asyncio.Event()
+    await evaluate_with(
+        user,
+        monkeypatch,
+        stream_of(result("a", ["debian"]), result("b", ["debian too"]), gate=gate, after=1),
+    )
+    await user.should_see("1 / 2")
+    await search(user, "debian")
+    [a] = results_table(user).rows
+    assert results_table(user).props["expanded"] == [a["id"]]
+
+    user.find(marker="results").trigger("update:expanded", [])  # the user collapses it
+    gate.set()
+    await user.should_see("2 / 2")
+
+    table = results_table(user)
+    b = next(r["id"] for r in table.rows if r["host"] == "b")
+    assert table.props["expanded"] == [b]  # the new match opens; "a" stays shut
+
+
+async def test_each_result_is_converted_to_a_table_row_once(user, monkeypatch):
+    calls: list[int] = []
+    real = app_module.results_table_row
+
+    def counting(key, row):
+        calls.append(key)
+        return real(key, row)
+
+    monkeypatch.setattr(app_module, "results_table_row", counting)
+    await evaluated_fleet(user, monkeypatch)
+    await search(user, "debian")
+    await clear_search(user)
+
+    assert sorted(calls) == list(range(len(FLEET)))
+
+
+async def test_only_expanded_rows_carry_their_details(user, monkeypatch):
+    await evaluated_fleet(user, monkeypatch)
+    table = results_table(user)
+    assert all("raw" not in r and "answers" not in r for r in table.rows)
+
+    deb = next(r["id"] for r in table.rows if r["host"] == "deb")
+    user.find(marker="results").trigger("update:expanded", [deb])
+
+    [opened] = [r for r in table.rows if "answers" in r]
+    assert opened["id"] == deb
+    assert opened["answers"] == "Linux Debian 11"
+
+
+async def test_the_filter_waits_for_typing_to_pause(user, monkeypatch):
+    await evaluated_fleet(user, monkeypatch)
+
+    user.find(marker="results-filter").type("debian")
+    assert len(results_table(user).rows) == len(FLEET)  # not yet
+
+    await asyncio.sleep(app_module.FILTER_DEBOUNCE_S + 0.1)
+    assert result_hosts(user) == ["deb", "multi", "multi"]
