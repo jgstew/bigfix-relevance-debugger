@@ -53,12 +53,14 @@ from bigfix_relevance_debugger.evaluation import (
     ResultRow,
     SessionEvaluation,
     TargetForm,
+    TargetPreview,
     breakdown_qna_note,
     build_targets,
     choose_breakdown_target,
     evaluate_session,
     load_inventory_targets,
     pick_label,
+    preview_targets,
     resolve_container_arches,
     results_row_details,
     results_summary,
@@ -81,6 +83,9 @@ TITLE = "BigFix Relevance Debugger"
 DEBOUNCE_S = 0.3
 FILTER_DEBOUNCE_S = 0.2
 """Each filter change resends the results table, so wait for typing to pause."""
+ARCH_LOOKUP_DEBOUNCE_S = 0.5
+"""The target count looks up an ``auto`` arch once typing in the image field pauses."""
+SIDE_PANEL_WIDTH = 420
 
 EXAMPLES = {
     "name of operating system": "name of operating system",
@@ -280,6 +285,10 @@ class _PageState:
     pick: str | None = None
     """The answer-summary row clicked (its key): results show only the systems it
     counted. Kept across runs like the filter; Clear drops it."""
+    image_arches: dict[str, list[str]] = dataclasses.field(default_factory=dict)
+    """``auto`` arches looked up so far, per image, so the target count is exact."""
+    inventory_ready: bool = False
+    """The inventory load (or first-run discovery) has finished."""
 
     @property
     def running(self) -> bool:
@@ -298,129 +307,144 @@ async def root() -> None:
     with ui.header().classes("items-center"):
         ui.label(TITLE).classes("text-h6")
         ui.label(f"v{__version__}").classes("text-caption opacity-70")
+        ui.space()
+        # Always in view, so the count shows whether the side panel is open or not.
+        targets_toggle = (
+            ui.button(icon="dns").props("flat no-caps color=white").mark("targets-toggle")
+        )
+        with targets_toggle:
+            targets_tooltip = ui.tooltip("").mark("targets-tooltip")
 
-    with ui.row().classes("w-full no-wrap items-start gap-4"):
-        # --- left: editor, analysis, results ---------------------------------
-        with ui.column().classes("w-2/3 gap-2"):
-            with ui.row().classes("w-full items-center"):
-                ui.label("Relevance").classes("text-subtitle1")
-                ui.space()
-                example = ui.select({v: k for k, v in EXAMPLES.items()}, label="Examples").classes(
-                    "w-72"
-                )
+    # --- main: editor, analysis, results ---------------------------------------
+    with ui.column().classes("w-full gap-2"):
+        with ui.row().classes("w-full items-center"):
+            ui.label("Relevance").classes("text-subtitle1")
+            ui.space()
+            example = ui.select({v: k for k, v in EXAMPLES.items()}, label="Examples").classes(
+                "w-72"
+            )
 
-            code = ui.codemirror("", line_wrapping=True).classes("w-full h-40 border")
-            code.mark("editor")
-            example.on_value_change(lambda e: e.value and code.set_value(e.value))
+        code = ui.codemirror("", line_wrapping=True).classes("w-full h-40 border")
+        code.mark("editor")
+        example.on_value_change(lambda e: e.value and code.set_value(e.value))
 
-            parse_banner = ui.label().classes("text-negative bfrd-mono")
-            analysis_row = ui.row().classes("items-center gap-2")
-            findings_box = ui.column().classes("w-full gap-1")
+        parse_banner = ui.label().classes("text-negative bfrd-mono")
+        analysis_row = ui.row().classes("items-center gap-2")
+        findings_box = ui.column().classes("w-full gap-1")
 
-            with ui.row().classes("w-full items-center gap-2 no-wrap"):
-                dialect_select = (
-                    ui.select(_DIALECT_LABELS, value=AUTO, label="Dialect")
-                    .bind_value(state, "dialect_mode")
-                    .classes("w-32")
-                    .mark("dialect")
-                )
-                dialect_reason = (
-                    ui.label().classes("text-caption opacity-70").mark("dialect-reason")
-                )
+        with ui.row().classes("w-full items-center gap-2 no-wrap"):
+            dialect_select = (
+                ui.select(_DIALECT_LABELS, value=AUTO, label="Dialect")
+                .bind_value(state, "dialect_mode")
+                .classes("w-32")
+                .mark("dialect")
+            )
+            dialect_reason = ui.label().classes("text-caption opacity-70").mark("dialect-reason")
 
-            with ui.row().classes("items-center gap-2"):
-                evaluate_button = ui.button("Evaluate", icon="play_arrow").mark("evaluate")
-                breakdown_button = ui.button("Breakdown", icon="account_tree").mark("breakdown")
-                cancel_button = ui.button("Cancel", icon="stop", color="negative").mark("cancel")
-                cancel_button.disable()
-                export_button = (
-                    ui.button("Export JSON", icon="download").props("flat").mark("export")
-                )
-                export_button.disable()
-                clear_button = (
-                    ui.button("Clear", icon="clear_all")
-                    .props("flat")
-                    .mark("clear")
-                    .tooltip("Clear the results and the breakdown")
-                )
-                clear_button.disable()
-                breakdown_reason = ui.label().classes("text-caption opacity-70")
+        with ui.row().classes("items-center gap-2"):
+            evaluate_button = ui.button("Evaluate", icon="play_arrow").mark("evaluate")
+            breakdown_button = ui.button("Breakdown", icon="account_tree").mark("breakdown")
+            cancel_button = ui.button("Cancel", icon="stop", color="negative").mark("cancel")
+            cancel_button.disable()
+            export_button = ui.button("Export JSON", icon="download").props("flat").mark("export")
+            export_button.disable()
+            clear_button = (
+                ui.button("Clear", icon="clear_all")
+                .props("flat")
+                .mark("clear")
+                .tooltip("Clear the results and the breakdown")
+            )
+            clear_button.disable()
+            breakdown_reason = ui.label().classes("text-caption opacity-70")
 
-            progress = ui.linear_progress(0, show_value=False).classes("w-full")
-            progress_label = ui.label().classes("text-caption")
-            # The breakdown goes above the results so it's in view whichever
-            # ran last; a long result table would push it off-screen otherwise.
-            breakdown_box = ui.column().classes("w-full gap-0").mark("breakdown-section")
-            # Then how many systems gave each answer, then the systems one by one.
-            with ui.column().classes("w-full gap-1").mark("answers-section") as answers_section:
-                answers_title = ui.label().classes("text-subtitle1").mark("answers-title")
-                answers_table = (
-                    ui.table(rows=[], columns=_ANSWER_COLUMNS, row_key="key")
-                    .props("dense flat wrap-cells")
-                    .classes("w-full")
-                    .mark("answers")
-                )
-                answers_table.add_slot("body", _ANSWERS_BODY_SLOT)
-                answers_more = ui.label().classes("text-caption opacity-70").mark("answers-more")
-            answers_section.set_visibility(False)
-            with ui.column().classes("w-full gap-1").mark("results-section") as results_section:
-                ui.label("Results by system").classes("text-subtitle1").mark("results-title")
-                pick_chip = (
-                    ui.chip(icon="filter_alt", removable=True)
-                    .props("dense outline color=primary")
-                    .mark("results-pick")
-                    .tooltip("Picked in the answer summary; click the row again or ✕ to show all")
-                )
-                pick_chip.set_visibility(False)
-                results_filter = (
-                    ui.input(placeholder="Filter by answer or error text")
-                    .props("clearable dense")
-                    .classes("w-full")
-                    .mark("results-filter")
-                )
-                results_summary_label = ui.label().classes("text-caption").mark("results-summary")
-                results_table = (
-                    ui.table(rows=[], columns=_RESULT_COLUMNS, row_key="id")
-                    .props("dense flat wrap-cells")
-                    .classes("w-full")
-                    .mark("results")
-                )
-                results_table.add_slot("header", _RESULTS_HEADER_SLOT)
-                results_table.add_slot("body", _RESULTS_BODY_SLOT)
-                # Controlled expansion: once `expanded` is set, QTable only emits
-                # update:expanded, so Python owns which rows are open.
-                results_table.props["expanded"] = []
-            results_section.set_visibility(False)
+        progress = ui.linear_progress(0, show_value=False).classes("w-full")
+        progress_label = ui.label().classes("text-caption")
+        # The breakdown goes above the results so it's in view whichever
+        # ran last; a long result table would push it off-screen otherwise.
+        breakdown_box = ui.column().classes("w-full gap-0").mark("breakdown-section")
+        # Then how many systems gave each answer, then the systems one by one.
+        with ui.column().classes("w-full gap-1").mark("answers-section") as answers_section:
+            answers_title = ui.label().classes("text-subtitle1").mark("answers-title")
+            answers_table = (
+                ui.table(rows=[], columns=_ANSWER_COLUMNS, row_key="key")
+                .props("dense flat wrap-cells")
+                .classes("w-full")
+                .mark("answers")
+            )
+            answers_table.add_slot("body", _ANSWERS_BODY_SLOT)
+            answers_more = ui.label().classes("text-caption opacity-70").mark("answers-more")
+        answers_section.set_visibility(False)
+        with ui.column().classes("w-full gap-1").mark("results-section") as results_section:
+            ui.label("Results by system").classes("text-subtitle1").mark("results-title")
+            pick_chip = (
+                ui.chip(icon="filter_alt", removable=True)
+                .props("dense outline color=primary")
+                .mark("results-pick")
+                .tooltip("Picked in the answer summary; click the row again or ✕ to show all")
+            )
+            pick_chip.set_visibility(False)
+            results_filter = (
+                ui.input(placeholder="Filter by answer or error text")
+                .props("clearable dense")
+                .classes("w-full")
+                .mark("results-filter")
+            )
+            results_summary_label = ui.label().classes("text-caption").mark("results-summary")
+            results_table = (
+                ui.table(rows=[], columns=_RESULT_COLUMNS, row_key="id")
+                .props("dense flat wrap-cells")
+                .classes("w-full")
+                .mark("results")
+            )
+            results_table.add_slot("header", _RESULTS_HEADER_SLOT)
+            results_table.add_slot("body", _RESULTS_BODY_SLOT)
+            # Controlled expansion: once `expanded` is set, QTable only emits
+            # update:expanded, so Python owns which rows are open.
+            results_table.props["expanded"] = []
+        results_section.set_visibility(False)
 
-        # --- right: targets, options, log -----------------------------------
-        with ui.column().classes("w-1/3 gap-2"):
+    # --- side panel: targets, options, log; collapsed unless there's nothing to run
+    with (
+        ui.right_drawer(value=False, bordered=True)
+        .classes("q-pa-sm")
+        .mark("side-panel") as side_panel
+    ):
+        side_panel.props["width"] = SIDE_PANEL_WIDTH  # a Number for Quasar, not a string
+        with ui.column().classes("w-full gap-2"):
+            target_count = ui.label().classes("text-caption").mark("target-count")
             with ui.card().classes("w-full"):
                 ui.label("Targets").classes("text-subtitle1")
                 ui.checkbox("Local (this machine)").bind_value(state.form, "local").mark(
                     "target-local"
-                )
+                ).on_value_change(lambda _: refresh_targets())
 
                 ui.checkbox("Container").bind_value(state.form, "container").mark(
                     "target-container"
-                )
+                ).on_value_change(lambda _: refresh_targets())
                 with ui.column().classes("pl-8 w-full gap-0") as container_opts:
                     ui.input("Image(s), comma-separated").bind_value(
                         state.form, "container_images"
-                    ).classes("w-full")
+                    ).classes("w-full").mark("container-images").on_value_change(
+                        lambda _: refresh_targets()
+                    )
                     ui.select(
                         {AUTO_ARCH: "auto (every arch the image publishes)"}
                         | {a: a for a in ARCHES},
                         multiple=True,
                         label="Arch",
-                    ).bind_value(state.form, "container_arches").classes("w-full")
+                    ).bind_value(state.form, "container_arches").classes("w-full").on_value_change(
+                        lambda _: refresh_targets()
+                    )
                     ui.checkbox("Rebuild image").bind_value(state.form, "rebuild_image")
                 container_opts.bind_visibility_from(state.form, "container")
 
-                ui.checkbox("SSH").bind_value(state.form, "ssh").mark("target-ssh")
+                ui.checkbox("SSH").bind_value(state.form, "ssh").mark("target-ssh").on_value_change(
+                    lambda _: refresh_targets()
+                )
                 with ui.column().classes("pl-8 w-full gap-0") as ssh_opts:
                     ui.input("Host (~/.ssh/config alias works)").bind_value(
                         state.form, "ssh_host"
-                    ).classes("w-full")
+                    ).classes("w-full").on_value_change(lambda _: refresh_targets())
                     ui.input("User (blank: ssh config)").bind_value(state.form, "ssh_user").classes(
                         "w-full"
                     )
@@ -437,7 +461,7 @@ async def root() -> None:
                 ui.label("Options").classes("text-subtitle1")
                 ui.input("qna version (blank: latest)", placeholder="11.0.7.61").bind_value(
                     state, "qna_version"
-                ).classes("w-full")
+                ).classes("w-full").on_value_change(lambda _: refresh_targets())
                 with ui.row().classes("w-full no-wrap"):
                     ui.number("Timeout (s)", min=1, format="%.0f").bind_value(
                         state, "timeout_s"
@@ -521,6 +545,7 @@ async def root() -> None:
                 ).props("dense flat").classes("w-full").mark("findings")
         update_stale()
         update_buttons()
+        refresh_targets()
 
     def reanalyze() -> None:
         state.view = summarize(code.value or "", state.dialect_mode)
@@ -575,6 +600,53 @@ async def root() -> None:
             return
         set_highlight(span)
 
+    # --- target count -----------------------------------------------------------
+
+    def current_preview() -> TargetPreview:
+        return preview_targets(
+            state.form,
+            inventory.targets,
+            state.image_arches,
+            qna_spec=EvalOptions(qna_version=state.qna_version or "").qna_spec,
+            inventory_pending=not state.inventory_ready,
+            client=CLIENT in state.view.run_dialects,
+            session=SESSION in state.view.run_dialects,
+        )
+
+    def refresh_targets() -> TargetPreview:
+        """Show what Evaluate would run on now, in the header and the side panel."""
+        preview = current_preview()
+        problem = preview.problem is not None
+        targets_toggle.set_text(preview.text)
+        targets_toggle.props["icon"] = "warning" if problem else "dns"
+        targets_toggle.props["color"] = "warning" if problem else "white"
+        targets_toggle.update()
+        targets_tooltip.set_text(preview.detail or preview.text)
+        target_count.set_text(
+            f"Evaluate runs on {preview.text}" + (f": {preview.detail}" if preview.detail else "")
+        )
+        target_count.classes(
+            add="text-negative" if problem else "", remove="" if problem else "text-negative"
+        )
+        if preview.unresolved_images:
+            arch_debouncer.trigger()
+        return preview
+
+    async def look_up_arches() -> None:
+        # A run looks them up itself (and fills the cache); so might the last lookup.
+        if state.running or not current_preview().unresolved_images:
+            return
+        try:
+            found = await resolve_container_arches(state.form)
+        except Exception:
+            logger.debug("arch lookup for the target count failed", exc_info=True)
+            return
+        state.image_arches.update(found)
+        refresh_targets()
+
+    arch_debouncer = Debouncer(ARCH_LOOKUP_DEBOUNCE_S, look_up_arches)
+    targets_toggle.on_click(side_panel.toggle)
+
     # --- running ----------------------------------------------------------------
 
     async def collect(
@@ -597,6 +669,8 @@ async def root() -> None:
             if not client:
                 return [], opts
             image_arches = await resolve_container_arches(state.form)
+            state.image_arches.update(image_arches)
+            refresh_targets()
             # Wait for the inventory only when the run needs it; the target
             # count applies the same rule.
             if waits_for_inventory(state.form, pending=not inventory_task.done()):
@@ -614,6 +688,7 @@ async def root() -> None:
                 targets = []
         except ValueError as exc:
             ui.notify(str(exc), type="warning")
+            side_panel.show()  # targets and options both live there
             return None
         return targets, opts
 
@@ -900,6 +975,7 @@ async def root() -> None:
     client.on_delete(lambda: detach(handler))
     client.on_delete(debouncer.cancel)
     client.on_delete(filter_debouncer.cancel)
+    client.on_delete(arch_debouncer.cancel)
     client.on_delete(cancel)
 
     # --- inventory -------------------------------------------------------------------
@@ -925,7 +1001,9 @@ async def root() -> None:
                     multiple=True,
                     clearable=True,
                     label=f"Inventory ({inventory.path})",
-                ).bind_value(state.form, "inventory_selected").classes("w-full").mark("inventory")
+                ).bind_value(state.form, "inventory_selected").classes("w-full").mark(
+                    "inventory"
+                ).on_value_change(lambda _: refresh_targets())
             else:
                 ui.label("No inventory hosts; tick a target above.").classes(
                     "text-caption opacity-70"
@@ -948,7 +1026,12 @@ async def root() -> None:
             inventory = InventoryLoad(path=None, targets=[], error=f"auto-discovery failed: {exc}")
         # Evaluate runs on the whole inventory unless hosts are deselected.
         state.form.inventory_selected = list(range(len(inventory.targets)))
+        state.inventory_ready = True
         render_inventory()
+        # Collapsed is right when there's something to run; with nothing, the
+        # panel is where to fix that.
+        if refresh_targets().problem is not None:
+            side_panel.show()
 
     # Started after the log handler is attached, so discovery's progress shows.
     inventory_task = asyncio.create_task(load_inventory())

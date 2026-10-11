@@ -242,6 +242,19 @@ async def set_text(user, text: str) -> None:
     await asyncio.sleep(0.4)
 
 
+async def notified(user, text: str, timeout: float = 2.0) -> None:
+    """Wait for a notification containing ``text``.
+
+    Not should_see: the side panel's target count shows form problems too, so
+    that would pass before the click had done anything.
+    """
+    for _ in range(int(timeout / 0.05)):
+        if user.notify.contains(text):
+            return
+        await asyncio.sleep(0.05)
+    assert user.notify.contains(text), user.notify.messages
+
+
 async def test_page_renders(user):
     await user.open("/")
 
@@ -287,7 +300,7 @@ async def test_evaluate_without_targets_warns(user):
 
     user.find(marker="evaluate").click()
 
-    await user.should_see("Pick at least one target")
+    await notified(user, "Pick at least one target")
 
 
 async def test_evaluate_streams_result_rows(user, monkeypatch):
@@ -1570,7 +1583,7 @@ async def test_both_with_a_bad_target_field_warns_and_runs_nothing(user, monkeyp
 
     user.find(marker="evaluate").click()
 
-    await user.should_see("SSH target needs a host")
+    await notified(user, "SSH target needs a host")
     await asyncio.sleep(0.1)
     assert streamed == []
     assert calls == []
@@ -2049,3 +2062,220 @@ async def test_export_ignores_the_pick(user, monkeypatch):
 
     [payload] = exported
     assert len(json.loads(payload)) == len(PICK_FLEET)
+
+
+# --- side panel and target count (issue 8) ------------------------------------------------
+
+
+def side_panel(user):
+    return hidden_element(user, "side-panel")
+
+
+def toggle(user):
+    return hidden_element(user, "targets-toggle")
+
+
+async def count_reads(user, text: str, timeout: float = 2.0) -> None:
+    """Wait for the header count to read ``text`` (inventory loads in the background).
+
+    Read from the button, not with should_see, which also matches tooltip text.
+    """
+    for _ in range(int(timeout / 0.05)):
+        if toggle(user).text == text:
+            return
+        await asyncio.sleep(0.05)
+    assert toggle(user).text == text
+
+
+async def test_side_panel_is_collapsed_by_default(inventory_user):
+    await inventory_user.open("/")
+    await count_reads(inventory_user, "2 systems")
+
+    assert side_panel(inventory_user).value is False
+
+
+async def test_toggle_opens_and_closes_the_side_panel(inventory_user):
+    await inventory_user.open("/")
+    await count_reads(inventory_user, "2 systems")
+
+    inventory_user.find(marker="targets-toggle").click()
+    assert side_panel(inventory_user).value is True
+
+    inventory_user.find(marker="targets-toggle").click()
+    assert side_panel(inventory_user).value is False
+
+
+async def test_header_shows_how_many_systems_will_be_targeted(inventory_user):
+    await inventory_user.open("/")
+
+    await count_reads(inventory_user, "2 systems")
+    assert toggle(inventory_user).props["icon"] == "dns"
+    assert "2 inventory" in hidden_element(inventory_user, "targets-tooltip").text
+
+
+async def test_open_panel_shows_the_same_count(inventory_user):
+    await inventory_user.open("/")
+    await count_reads(inventory_user, "2 systems")
+
+    text = hidden_element(inventory_user, "target-count").text
+    assert "2 systems" in text
+    assert "2 inventory" in text
+
+
+async def test_target_count_updates_when_a_target_is_ticked(inventory_user):
+    await inventory_user.open("/")
+    await count_reads(inventory_user, "2 systems")
+
+    inventory_user.find(marker="target-local").click()
+
+    await count_reads(inventory_user, "3 systems")
+
+
+def fake_arches(calls: list[str] | None = None, *, fail: bool = False):
+    async def resolve(form, **kwargs):
+        if fail:
+            raise RuntimeError("engine went away")
+        images = [i.strip() for i in form.container_images.split(",") if i.strip()]
+        if calls is not None:
+            calls.extend(images)
+        return {image: ["x86_64", "arm64"] for image in images}
+
+    return resolve
+
+
+async def after_arch_lookup() -> None:
+    await asyncio.sleep(app_module.ARCH_LOOKUP_DEBOUNCE_S + 0.2)
+
+
+async def test_target_count_with_auto_arch_is_looked_up_in_the_background(user, monkeypatch):
+    monkeypatch.setattr(app_module, "resolve_container_arches", fake_arches())
+    await user.open("/")
+    await count_reads(user, "0 systems")
+
+    user.find(marker="target-container").click()
+
+    await count_reads(user, "≥ 1 system")
+    await after_arch_lookup()
+    await count_reads(user, "2 systems")
+
+
+async def test_arch_lookup_runs_once_per_image(user, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(app_module, "resolve_container_arches", fake_arches(calls))
+    await user.open("/")
+    user.find(marker="target-container").click()
+    await after_arch_lookup()
+
+    user.find(marker="target-local").click()
+    user.find(marker="target-local").click()
+    await after_arch_lookup()
+    assert calls == ["debian:11"]
+
+    button(user, "container-images").set_value("ubuntu:24.04")
+    await after_arch_lookup()
+
+    assert calls == ["debian:11", "ubuntu:24.04"]
+    await count_reads(user, "2 systems")
+
+
+async def test_arch_lookup_failure_keeps_the_lower_bound(user, monkeypatch):
+    monkeypatch.setattr(app_module, "resolve_container_arches", fake_arches(fail=True))
+    await user.open("/")
+
+    user.find(marker="target-container").click()
+    await after_arch_lookup()
+
+    await count_reads(user, "≥ 1 system")
+
+
+async def test_evaluate_fills_the_arch_cache(user, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(app_module, "resolve_container_arches", fake_arches(calls))
+    monkeypatch.setattr(app_module, "stream_results", stream_of(result("a"), result("b")))
+    await user.open("/")
+    await set_text(user, "name of operating system")
+    user.find(marker="target-container").click()
+
+    user.find(marker="evaluate").click()  # before the background lookup's debounce
+    await user.should_see("2 / 2")
+    await after_arch_lookup()
+
+    assert calls == ["debian:11"]
+    await count_reads(user, "2 systems")
+
+
+async def test_target_count_while_discovering_says_so(monkeypatch, tmp_path):
+    release = threading.Event()
+    written = tmp_path / "remote_clients.toml"
+
+    def slow_discovery():
+        release.wait(5)
+        return written
+
+    monkeypatch.setattr(app_module, "_inventory_path", None)
+    monkeypatch.setattr(app_module, "find_inventory_path", lambda: None)
+    monkeypatch.setattr(app_module, "find_or_discover_inventory", slow_discovery)
+    monkeypatch.setattr(
+        app_module,
+        "load_inventory_targets",
+        lambda path: InventoryLoad(path=path, targets=list(TWO_HOSTS), error=None),
+    )
+
+    async with user_simulation(root=app_module.root) as user:
+        await user.open("/")
+        try:
+            await count_reads(user, "finding inventory …")
+        finally:
+            release.set()
+        await count_reads(user, "2 systems")
+        assert side_panel(user).value is False
+
+
+async def test_panel_opens_itself_when_there_is_nothing_to_target(user):
+    await user.open("/")
+
+    await count_reads(user, "0 systems")
+    assert side_panel(user).value is True
+    assert toggle(user).props["icon"] == "warning"
+    assert "Pick at least one target." in hidden_element(user, "target-count").text
+
+
+async def test_panel_opens_itself_after_an_inventory_error(no_inventory, monkeypatch, tmp_path):
+    bad = tmp_path / "remote_clients.toml"
+    bad.write_text("= nope", encoding="utf-8")
+    monkeypatch.setattr(app_module, "find_inventory_path", lambda: bad)
+
+    async with user_simulation(root=app_module.root) as user:
+        await user.open("/")
+        await user.should_see(marker="inventory-error")
+        await count_reads(user, "0 systems")
+        assert side_panel(user).value is True
+
+
+async def test_evaluate_with_no_targets_opens_the_panel(user):
+    await user.open("/")
+    await count_reads(user, "0 systems")
+    user.find(marker="targets-toggle").click()
+    assert side_panel(user).value is False
+
+    user.find(marker="evaluate").click()
+
+    await notified(user, "Pick at least one target")
+    assert side_panel(user).value is True
+
+
+async def test_session_only_count_says_bigfix_server(user):
+    await user.open("/")
+
+    await set_text(user, "number of bes computers")
+
+    await count_reads(user, "BigFix server")
+    assert toggle(user).props["icon"] == "dns"
+
+
+async def test_main_column_is_full_width(user):
+    await user.open("/")
+
+    results_section = hidden_element(user, "results-section")
+    assert "w-full" in results_section.parent_slot.parent.classes
+    assert not [e for e in user.client.elements.values() if "w-2/3" in e.classes]
