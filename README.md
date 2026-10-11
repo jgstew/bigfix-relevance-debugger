@@ -120,16 +120,18 @@ a specific target, select only that one.
 3. Clear the **Inventory** picker (every host in it is selected by default),
    then tick **Container**, keep image `debian:11` and Arch `auto`, set qna
    version to `11.0.7.61`, and click **Evaluate**. `auto` runs every arch the
-   image publishes, so two rows appear, x86_64 and arm64, each with its qna
-   version, platform/arch and elapsed time. If the
-   library had to step back to an older qna build for that image, the row
-   says so ("fell back from ..."). The first run shows download and
-   image-prep progress in the activity log.
+   image publishes, so the results table gets two rows, x86_64 and arm64,
+   each with its answer count, answers, platform/arch, qna version and
+   elapsed time. If the library had to step back to an older qna build for
+   that image, the qna column says so ("fell back from ..."). Click a row's
+   chevron to see every answer, the answer types and the raw qna output. The
+   first run shows download and image-prep progress in the activity log.
 4. Type a typo, e.g. `name of operating sytem`. The text gets a wavy
    underline and a lint finding appears with suggestions.
 5. Type `names of files whose (size of it > 1000) of folder "/etc"` (or pick
    it from **Examples**) and click **Breakdown**. With several targets
-   selected, it picks the best fit itself and says why. Per-level counts appear.
+   selected, it picks the best fit itself and says why. Per-level counts appear
+   above any results, so the breakdown is in view whichever you ran last.
    The `whose` level shows filtered vs unfiltered counts, e.g. `7 of 43`.
    Hover a row to highlight that level in the editor.
 6. Change the folder to one that doesn't exist (`"/nope"`) and break it down
@@ -137,13 +139,32 @@ a specific target, select only that one.
    error ("Singular expression refers to nonexistent object") is shown
    inline.
 7. Optional: put the inventory hosts back, add a second image
-   (`debian:11, ubuntu:24.04`) or both arches, then **Evaluate** to watch
-   results stream in completion order.
+   (`debian:11, ubuntu:24.04`) or both arches, evaluate
+   `names of files of folder "/etc"`, and watch the table re-sort as results
+   stream in. Type `lsb-release` in the filter box: only the hosts with that
+   answer stay, opened to show all their answers.
    **Cancel** stops a run and cleans up its containers. **Export JSON**
-   saves the results.
+   saves every result, including any the filter hides. **Clear** empties the
+   results and the breakdown (not the activity log).
 
 **Before the demo:** run step 3 once so the qna download and image prep are
 already cached, and have Docker running.
+
+### Reading the results
+
+The results table has one row per result, best first: hosts with the most
+answers at the top, then hosts that answered nothing, then errors (in red).
+A host listing several qna versions in the inventory gets one row per
+version, kept together and told apart by the qna column. The line above the
+table counts them, e.g. `5 results: 3 with answers, 1 empty, 1 error`.
+Columns sort on click.
+
+The **filter box** searches the answers and error messages, ignoring case
+(not host names, platforms or qna versions, so `11` doesn't match every
+`debian:11` row). Hosts with no matching result are hidden. A host that does
+match keeps *all* its rows, opened to show every answer, so you see each
+matching computer's whole answer set. Clearing the filter restores the rows
+and what you had opened.
 
 ### Reading the breakdown
 

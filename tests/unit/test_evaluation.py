@@ -16,6 +16,7 @@ from bigfix_remote_client_relevance import ClientRelevanceResult, ResolvedQna, T
 from bigfix_relevance_debugger import evaluation
 from bigfix_relevance_debugger.analysis import summarize
 from bigfix_relevance_debugger.evaluation import (
+    PREVIEW_CHARS,
     EvalOptions,
     LevelResult,
     ProbeView,
@@ -23,14 +24,20 @@ from bigfix_relevance_debugger.evaluation import (
     TargetForm,
     TargetFormError,
     analyzer_platform,
+    answers_preview,
     breakdown_qna_note,
     build_targets,
     choose_breakdown_target,
     load_inventory_targets,
+    order_results,
     resolve_container_arches,
+    results_row_details,
+    results_summary,
+    results_table_row,
     run_breakdown,
     stream_results,
     total_work,
+    visible_results,
 )
 
 WHOSE_EXAMPLE = 'names of files whose (size of it > 1000) of folder "/etc"'
@@ -488,7 +495,6 @@ def test_result_row_ok():
     assert row.status == "ok"
     assert row.ok is True
     assert row.host == "container:debian:11@arm64"
-    assert row.answers_text == "Linux Debian 11; x"
     assert row.answer_types_text == "string"
     assert row.qna_version_text == "11.0.7.61"
     assert row.platform_text == "debian/arm64"
@@ -526,7 +532,6 @@ def test_result_row_error():
     assert row.status == "transport"
     assert row.ok is False
     assert row.error == "Permission denied (publickey)"
-    assert row.answers_text == ""
 
 
 def test_result_row_no_answers_is_ok_but_says_so():
@@ -535,7 +540,7 @@ def test_result_row_no_answers_is_ok_but_says_so():
     )
 
     assert row.ok is True
-    assert row.answers_text == "(no answers)"
+    assert results_row_details(row)["answers"] == "(no answers)"
 
 
 # --- run_breakdown ----------------------------------------------------------------
@@ -927,29 +932,254 @@ def test_breakdown_version_pin_is_named(monkeypatch):
     assert breakdown_qna_note(Target(kind="ssh", name="m")) is None
 
 
-def test_result_row_headline_never_reads_none():
-    row = ResultRow.from_result(
-        ClientRelevanceResult(host="h", transport="ssh", client_relevance="x", error_kind="qna")
-    )
-
-    assert row.headline == "h: qna"
-
-
-def test_result_row_headline_ok_and_error():
-    ok = ResultRow.from_result(
-        ClientRelevanceResult(host="h", transport="ssh", client_relevance="x", answers=["y"])
-    )
-    bad = ResultRow.from_result(
-        ClientRelevanceResult(
-            host="h", transport="ssh", client_relevance="x", error="boom", error_kind="transport"
-        )
-    )
-
-    assert ok.headline == "h: y"
-    assert bad.headline == "h: boom"
-
-
 def test_arch_picker_and_arch_lookup_share_one_list():
     from bigfix_relevance_debugger.upstream.remote_client_relevance import SUPPORTED_ARCHS
 
     assert evaluation.ARCHES is SUPPORTED_ARCHS
+
+
+# --- results view (issue 4) ---------------------------------------------------------
+
+
+def row(host, answers=(), *, error=None, error_kind=None, qna_version=None, transport="ssh"):
+    if error is not None and error_kind is None:
+        error_kind = "transport"
+    return ResultRow.from_result(
+        ClientRelevanceResult(
+            host=host,
+            transport=transport,
+            client_relevance="x",
+            answers=list(answers),
+            error=error,
+            error_kind=error_kind,
+            qna_version=qna_version,
+        )
+    )
+
+
+def hosts(rows, order):
+    return [rows[i].host for i in order]
+
+
+def test_order_puts_most_answers_first_then_empty_then_errors():
+    rows = [row("empty"), row("err", error="boom"), row("three", "abc"), row("one", "a")]
+
+    assert hosts(rows, order_results(rows)) == ["three", "one", "empty", "err"]
+
+
+def test_order_breaks_ties_by_host_name_ignoring_case_then_arrival():
+    rows = [row("b", "x"), row("A", "y"), row("c", "z")]
+
+    assert hosts(rows, order_results(rows)) == ["A", "b", "c"]
+
+
+def test_order_keeps_a_hosts_results_together_ranked_by_its_best():
+    # One host listing two qna versions yields two results with the same host.
+    rows = [
+        row("multi", qna_version="a"),
+        row("x", "1"),
+        row("multi", "12", qna_version="b"),
+    ]
+
+    order = order_results(rows)
+
+    assert hosts(rows, order) == ["multi", "multi", "x"]
+    assert [rows[i].qna_version_text for i in order[:2]] == ["a", "b"]  # arrival order
+
+
+def test_order_of_a_prefix_never_reorders_rows_within_a_host():
+    rows = [row("h", qna_version="a"), row("g", "1"), row("h", "12", qna_version="b")]
+
+    for n in range(1, len(rows) + 1):
+        within_h = [i for i in order_results(rows[:n]) if rows[i].host == "h"]
+        assert within_h == sorted(within_h)
+
+
+def test_match_is_a_case_insensitive_substring_of_an_answer():
+    r = row("h", ["Linux Debian 11", "other"])
+
+    assert r.matches("debian")
+    assert r.matches("  DEBIAN ")
+    assert not r.matches("ubuntu")
+
+
+def test_match_includes_the_error_message():
+    assert row("h", error="Permission denied (publickey)").matches("permission")
+
+
+def test_blank_query_matches_everything():
+    assert row("h").matches("")
+    assert row("h", error="boom").matches("   ")
+
+
+def test_match_ignores_host_platform_and_qna_version():
+    # Otherwise "11" would match every row of a debian:11 / qna 11.x run.
+    r = row("container:debian:11", ["Linux"], qna_version="11.0.7.61")
+
+    assert not r.matches("11")
+
+
+def test_filter_hides_hosts_without_a_matching_result():
+    rows = [row("deb", ["Linux Debian 11"]), row("rh", ["Linux Red Hat 9"])]
+
+    assert hosts(rows, visible_results(rows, "debian")) == ["deb"]
+
+
+def test_filter_keeps_every_result_of_a_matching_host():
+    rows = [
+        row("multi", ["Linux Debian 12"], qna_version="a"),
+        row("multi", qna_version="b"),
+        row("rh", ["Linux Red Hat 9"]),
+    ]
+
+    assert visible_results(rows, "debian") == [0, 1]
+
+
+def test_filter_returns_display_order():
+    rows = [row("one", ["debian"]), row("three", ["debian", "b", "c"]), row("no", ["x"])]
+
+    assert visible_results(rows, "debian") == [i for i in order_results(rows) if i != 2]
+    assert visible_results(rows, "") == order_results(rows)
+
+
+def test_table_row_cells_are_scalars():
+    # NiceGUI: list cells can crash the browser.
+    r = ResultRow.from_result(
+        ClientRelevanceResult(
+            host="h",
+            transport="container",
+            client_relevance="x",
+            answers=["a", "b"],
+            answer_types=["string", "string"],
+            qna_version="11.0.7.61",
+            platform="debian",
+            arch="arm64",
+            elapsed_ms=12,
+            raw_qna_output="Q: x\nA: a\nA: b\n",
+        )
+    )
+
+    cells = results_table_row(7, r)
+    details = results_row_details(r)
+
+    assert cells["id"] == 7
+    for values in (cells.values(), details.values()):
+        assert all(isinstance(v, str | int | bool | type(None)) for v in values)
+    assert cells["count"] == 2
+    assert cells["host"] == "h"
+    assert cells["platform"] == "debian/arm64"
+    assert cells["qna"] == "11.0.7.61"
+    assert details == {
+        "answers": "a\nb",
+        "types": "string",
+        "error": None,
+        "raw": "Q: x\nA: a\nA: b\n",
+    }
+
+
+def test_collapsed_row_cells_leave_out_the_details():
+    # Every streamed result resends the whole table; only open rows carry the bulk.
+    cells = results_table_row(0, row("h", ["a" * 1000]))
+
+    assert not set(cells) & {"answers", "types", "error", "raw"}
+
+
+def test_details_show_an_empty_string_answer_as_quotes():
+    # relevance like "" answers one empty string: that is an answer, not none.
+    assert results_row_details(row("h", [""]))["answers"] == '""'
+    assert results_row_details(row("h", ["a", ""]))["answers"] == 'a\n""'
+    assert results_row_details(row("h"))["answers"] == "(no answers)"
+
+
+def test_preview_shows_an_empty_string_answer_as_quotes():
+    assert answers_preview(row("h", [""])) == '""'
+
+
+def test_ssh_and_fastquery_entries_for_one_address_are_separate_hosts():
+    # An inventory can list both for one address; render.display_host tells them apart.
+    rows = [
+        row("192.168.4.115", ["via ssh"], transport="ssh"),
+        row("192.168.4.115", ["via fastquery"], transport="fastquery"),
+    ]
+
+    assert [r.display_host for r in rows] == ["ssh:192.168.4.115", "fastquery:192.168.4.115"]
+    assert visible_results(rows, "via ssh") == [0]
+    assert results_table_row(1, rows[1])["host"] == "fastquery:192.168.4.115"
+
+
+def test_container_display_host_is_the_host():
+    assert row("container:debian:11@arm64", transport="container").display_host == (
+        "container:debian:11@arm64"
+    )
+
+
+def test_match_includes_the_status_of_an_error_without_a_message():
+    # The preview shows the status then, so the filter has to find it too.
+    timed_out = row("h", error_kind="timeout")
+
+    assert answers_preview(timed_out) == "timeout"
+    assert timed_out.matches("timeout")
+    assert not row("h", ["a"]).matches("ok")  # an ok row's status isn't shown
+
+
+def test_preview_fits_whole_answers_then_says_how_many_more():
+    answers = [f"answer-{i:03d}" for i in range(30)]  # 10 chars each
+
+    preview = answers_preview(row("h", answers), limit=120)
+
+    assert preview == "; ".join(answers[:10]) + " (+20 more)"
+
+
+def test_default_preview_fits_a_line_of_the_results_column():
+    # Checked in a real run: 120 characters wrapped to three lines at 1400 px.
+    assert PREVIEW_CHARS <= 60
+
+
+def test_preview_cuts_a_single_long_answer_with_an_ellipsis():
+    preview = answers_preview(row("h", ["x" * 500, "y"]), limit=20)
+
+    assert preview == "x" * 19 + "… (+1 more)"
+
+
+def test_preview_shows_everything_when_it_fits():
+    assert answers_preview(row("h", ["a", "b"])) == "a; b"
+
+
+def test_preview_cuts_a_long_error_too():
+    preview = answers_preview(row("h", error="e" * 500), limit=20)
+
+    assert preview == "e" * 19 + "…"
+
+
+def test_preview_for_empty_and_error_rows_never_reads_none():
+    assert answers_preview(row("h")) == "(no answers)"
+    assert answers_preview(row("h", error="boom")) == "boom"
+    no_message = ResultRow.from_result(
+        ClientRelevanceResult(host="h", transport="ssh", client_relevance="x", error_kind="qna")
+    )
+    assert answers_preview(no_message) == "qna"
+
+
+def test_summary_counts_answered_empty_and_errors():
+    rows = [row("a", ["1"]), row("b"), row("c", error="boom")]
+
+    assert results_summary(rows, 3, "") == "3 results: 1 with answers, 1 empty, 1 error"
+
+
+def test_summary_pluralises():
+    rows = [row("a", error="x"), row("b", error="y")]
+
+    assert results_summary(rows, 2, "") == "2 results: 0 with answers, 0 empty, 2 errors"
+    assert results_summary(rows[:1], 1, "") == "1 result: 0 with answers, 0 empty, 1 error"
+
+
+def test_summary_when_filtered_says_showing_n_of_m_and_the_query():
+    rows = [row("a", ["debian"]), row("b"), row("c", error="boom")]
+
+    assert results_summary(rows, 1, " debian ") == (
+        'Showing 1 of 3 results: hosts with an answer or error containing "debian"'
+    )
+
+
+def test_summary_of_nothing_is_empty():
+    assert results_summary([], 0, "") == ""

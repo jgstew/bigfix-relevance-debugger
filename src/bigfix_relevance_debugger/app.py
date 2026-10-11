@@ -28,12 +28,14 @@ from bigfix_remote_client_relevance import (
     results_to_dicts,
 )
 from nicegui import ui
+from nicegui.events import GenericEventArguments, ValueChangeEventArguments
 
 from bigfix_relevance_debugger import __version__
 from bigfix_relevance_debugger.analysis import AnalysisView, editor_decorations, summarize
 from bigfix_relevance_debugger.evaluation import (
     ARCHES,
     AUTO_ARCH,
+    Cells,
     EvalOptions,
     InventoryLoad,
     LevelResult,
@@ -44,9 +46,13 @@ from bigfix_relevance_debugger.evaluation import (
     choose_breakdown_target,
     load_inventory_targets,
     resolve_container_arches,
+    results_row_details,
+    results_summary,
+    results_table_row,
     run_breakdown,
     stream_results,
     total_work,
+    visible_results,
 )
 from bigfix_relevance_debugger.log_bridge import attach, detach
 from bigfix_relevance_debugger.upstream.remote_client_relevance import find_or_discover_inventory
@@ -55,6 +61,8 @@ logger = logging.getLogger(__name__)
 
 TITLE = "BigFix Relevance Debugger"
 DEBOUNCE_S = 0.3
+FILTER_DEBOUNCE_S = 0.2
+"""Each filter change resends the results table, so wait for typing to pause."""
 
 EXAMPLES = {
     "name of operating system": "name of operating system",
@@ -105,6 +113,61 @@ _OUTCOME_HINTS = {
 }
 
 
+# Results table: one row per result; the rows come from results_table_row(),
+# already in display order. Columns sort on click, but the default is ours.
+_RESULT_COLUMNS = [
+    {"name": "status", "label": "", "field": "status"},
+    {"name": "host", "label": "Target", "field": "host", "align": "left", "sortable": True},
+    {"name": "count", "label": "#", "field": "count", "align": "right", "sortable": True},
+    {"name": "preview", "label": "Answers", "field": "preview", "align": "left"},
+    {"name": "platform", "label": "Platform", "field": "platform", "align": "left"},
+    # A host listing several qna versions has one row per version; this tells them apart.
+    {"name": "qna", "label": "qna", "field": "qna", "align": "left"},
+    {
+        "name": "elapsed_ms",
+        "label": "ms",
+        "field": "elapsed_ms",
+        "align": "right",
+        "sortable": True,
+    },
+]
+
+_RESULTS_HEADER_SLOT = r"""
+<q-tr :props="props">
+  <q-th auto-width />
+  <q-th v-for="col in props.cols" :key="col.name" :props="props">{{ col.label }}</q-th>
+</q-tr>
+"""
+
+# Answers come from the endpoint: interpolate ({{ }}), never v-html.
+_RESULTS_BODY_SLOT = r"""
+<q-tr :props="props" :class="props.row.ok ? '' : 'text-negative'">
+  <q-td auto-width>
+    <q-btn size="sm" flat round dense
+           :icon="props.expand ? 'expand_less' : 'expand_more'"
+           @click="props.expand = !props.expand" />
+  </q-td>
+  <q-td v-for="col in props.cols" :key="col.name" :props="props">
+    <q-icon v-if="col.name === 'status'"
+            :name="props.row.ok ? 'check_circle' : 'error'"
+            :color="props.row.ok ? 'positive' : 'negative'" />
+    <span v-else-if="col.name === 'preview'" class="bfrd-mono">{{ col.value }}</span>
+    <span v-else>{{ col.value }}</span>
+  </q-td>
+</q-tr>
+<q-tr v-show="props.expand" :props="props">
+  <q-td colspan="100%">
+    <div class="bfrd-mono" style="white-space: pre-wrap">{{ props.row.answers }}</div>
+    <div class="text-caption opacity-70">
+      {{ props.row.status }} · types: {{ props.row.types || '-' }} · qna {{ props.row.qna || '?' }}
+    </div>
+    <div v-if="props.row.error" class="text-negative" style="white-space: pre-wrap">{{ props.row.error }}</div>
+    <pre v-if="props.row.raw" class="text-xs q-ma-none" style="white-space: pre-wrap">{{ props.row.raw }}</pre>
+  </q-td>
+</q-tr>
+"""
+
+
 class Debouncer:
     """Run ``callback`` once, ``delay`` seconds after the last ``trigger()``."""
 
@@ -140,6 +203,19 @@ class _PageState:
     view: AnalysisView = dataclasses.field(default_factory=lambda: summarize(""))
     task: asyncio.Task[None] | None = None
     results: list[ClientRelevanceResult] = dataclasses.field(default_factory=list)
+    rows: list[ResultRow] = dataclasses.field(default_factory=list)
+    """``results`` preformatted, kept in step so a new arrival converts only itself."""
+    expanded: set[int] = dataclasses.field(default_factory=set)
+    """Keys (indexes into ``rows``) of the results-table rows that are open."""
+    table_rows: list[Cells] = dataclasses.field(default_factory=list)
+    """``results_table_row`` of each of ``rows``, built once when it arrives."""
+    filter_text: str = ""
+    """The filter the table shows; the input's value lands here after the debounce."""
+    filter_seen: set[int] = dataclasses.field(default_factory=set)
+    """Keys already shown under the current filter. Only rows new to it auto-open,
+    so a match the user collapsed stays collapsed while results stream in."""
+    expanded_before_filter: set[int] | None = None
+    """What the user had open before a search auto-opened the matches; restored after."""
     breakdown_text: str | None = None
     """The expression the breakdown on screen was run on."""
 
@@ -184,14 +260,44 @@ async def root() -> None:
                 breakdown_button = ui.button("Breakdown", icon="account_tree").mark("breakdown")
                 cancel_button = ui.button("Cancel", icon="stop", color="negative").mark("cancel")
                 cancel_button.disable()
-                export_button = ui.button("Export JSON", icon="download").props("flat")
+                export_button = (
+                    ui.button("Export JSON", icon="download").props("flat").mark("export")
+                )
                 export_button.disable()
+                clear_button = (
+                    ui.button("Clear", icon="clear_all")
+                    .props("flat")
+                    .mark("clear")
+                    .tooltip("Clear the results and the breakdown")
+                )
+                clear_button.disable()
                 breakdown_reason = ui.label().classes("text-caption opacity-70")
 
             progress = ui.linear_progress(0, show_value=False).classes("w-full")
             progress_label = ui.label().classes("text-caption")
-            results_box = ui.column().classes("w-full gap-1")
-            breakdown_box = ui.column().classes("w-full gap-0")
+            # The breakdown goes above the results so it's in view whichever
+            # ran last; a long result table would push it off-screen otherwise.
+            breakdown_box = ui.column().classes("w-full gap-0").mark("breakdown-section")
+            with ui.column().classes("w-full gap-1").mark("results-section") as results_section:
+                results_filter = (
+                    ui.input(placeholder="Filter by answer or error text")
+                    .props("clearable dense")
+                    .classes("w-full")
+                    .mark("results-filter")
+                )
+                results_summary_label = ui.label().classes("text-caption").mark("results-summary")
+                results_table = (
+                    ui.table(rows=[], columns=_RESULT_COLUMNS, row_key="id")
+                    .props("dense flat wrap-cells")
+                    .classes("w-full")
+                    .mark("results")
+                )
+                results_table.add_slot("header", _RESULTS_HEADER_SLOT)
+                results_table.add_slot("body", _RESULTS_BODY_SLOT)
+                # Controlled expansion: once `expanded` is set, QTable only emits
+                # update:expanded, so Python owns which rows are open.
+                results_table.props["expanded"] = []
+            results_section.set_visibility(False)
 
         # --- right: targets, options, log -----------------------------------
         with ui.column().classes("w-1/3 gap-2"):
@@ -344,8 +450,13 @@ async def root() -> None:
         breakdown_button.set_enabled(not running and state.view.can_breakdown)
         cancel_button.set_enabled(running)
         export_button.set_enabled(not running and bool(state.results))
+        clear_button.set_enabled(not running and (bool(state.results) or has_breakdown()))
         reason = state.view.breakdown_disabled_reason
         breakdown_reason.set_text(reason if reason and state.view.text.strip() else "")
+
+    def has_breakdown() -> bool:
+        # Its children, not breakdown_text: that is None while the spinner shows.
+        return bool(breakdown_box.default_slot.children)
 
     def breakdown_is_stale() -> bool:
         return state.breakdown_text is not None and state.breakdown_text != state.view.text
@@ -441,18 +552,79 @@ async def root() -> None:
             total = total_work(targets, opts)
             done = 0
             state.results = []
-            results_box.clear()
+            state.rows = []
+            state.table_rows = []
+            state.expanded = set()
+            state.filter_seen = set()
+            if state.expanded_before_filter is not None:
+                state.expanded_before_filter = set()  # old keys mean nothing now
+            render_results()
             progress.set_value(0)
             progress_label.set_text(f"0 / {total}")
             async for result in stream_results(text, targets, opts):
                 state.results.append(result)
+                row = ResultRow.from_result(result)
+                state.table_rows.append(results_table_row(len(state.rows), row))
+                state.rows.append(row)
                 done += 1
                 progress.set_value(done / total if total else 1)
                 progress_label.set_text(f"{done} / {total}")
-                with results_box:
-                    _result_row(ResultRow.from_result(result))
+                render_results()
 
         start(job)
+
+    def render_results() -> None:
+        """Re-sort and resend the results table, once per streamed result.
+
+        NiceGUI resends the whole ``rows`` prop, so collapsed rows are the
+        prebuilt summary cells; only open rows add their answers and raw output.
+        """
+        query = state.filter_text
+        order = visible_results(state.rows, query)
+        if query.strip():
+            # A search opens matching hosts the first time they show (including
+            # ones streaming in), then leaves them to the user.
+            state.expanded |= set(order) - state.filter_seen
+            state.filter_seen |= set(order)
+        results_table.rows = [
+            {**state.table_rows[i], **results_row_details(state.rows[i])}
+            if i in state.expanded
+            else state.table_rows[i]
+            for i in order
+        ]
+        results_table.props["expanded"] = sorted(state.expanded)
+        results_table.update()
+        results_summary_label.set_text(results_summary(state.rows, len(order), query))
+        results_section.set_visibility(bool(state.rows))
+
+    def on_expanded(e: GenericEventArguments) -> None:
+        state.expanded = {int(key) for key in e.args or []}
+        render_results()  # a newly opened row needs its details
+
+    results_table.on("update:expanded", on_expanded)
+
+    pending_filter = ""
+
+    def apply_filter() -> None:
+        state.filter_text = pending_filter
+        state.filter_seen = set()
+        if state.filter_text.strip():
+            if state.expanded_before_filter is None:
+                state.expanded_before_filter = state.expanded
+            state.expanded = set()  # render_results opens the matches
+        elif state.expanded_before_filter is not None:
+            state.expanded = state.expanded_before_filter
+            state.expanded_before_filter = None
+        render_results()
+
+    filter_debouncer = Debouncer(FILTER_DEBOUNCE_S, apply_filter)
+
+    def on_filter_input(e: ValueChangeEventArguments) -> None:
+        nonlocal pending_filter
+        pending_filter = e.value or ""  # a cleared Quasar input sends None
+        filter_debouncer.trigger()
+
+    results_filter.on_value_change(on_filter_input)
 
     def breakdown() -> None:
         view = current_view()
@@ -495,6 +667,28 @@ async def root() -> None:
         if state.task is not None:
             state.task.cancel()
 
+    def clear_all() -> None:
+        """Clear results, breakdown, progress and search; the activity log stays."""
+        if state.running:
+            return
+        state.results = []
+        state.rows = []
+        state.expanded = set()
+        state.expanded_before_filter = None
+        state.breakdown_text = None
+        results_filter.set_value("")
+        filter_debouncer.cancel()  # cleared now, not after the debounce
+        state.table_rows = []
+        state.filter_text = ""
+        state.filter_seen = set()
+        render_results()
+        breakdown_box.clear()
+        update_stale()
+        set_highlight(None)
+        progress.set_value(0)
+        progress_label.set_text("")
+        update_buttons()
+
     def export() -> None:
         payload = json.dumps(results_to_dicts(state.results), indent=2)
         ui.download.content(payload, "relevance-results.json", "application/json")
@@ -503,6 +697,7 @@ async def root() -> None:
     breakdown_button.on_click(breakdown)
     cancel_button.on_click(cancel)
     export_button.on_click(export)
+    clear_button.on_click(clear_all)
 
     # --- activity log -------------------------------------------------------------
 
@@ -511,6 +706,7 @@ async def root() -> None:
     # same client, and its log should keep flowing.
     client.on_delete(lambda: detach(handler))
     client.on_delete(debouncer.cancel)
+    client.on_delete(filter_debouncer.cancel)
     client.on_delete(cancel)
 
     # --- inventory -------------------------------------------------------------------
@@ -580,36 +776,6 @@ def _discover_inventory_once() -> Path | None:
 
 def _target_option(target: Target) -> str:
     return f"{target.label} ({target.kind})"
-
-
-def _result_row(row: ResultRow) -> None:
-    icon, colour = ("check_circle", "positive") if row.ok else ("error", "negative")
-    caption_bits = [row.qna_version_text, row.platform_text]
-    if row.elapsed_ms is not None:
-        caption_bits.append(f"{row.elapsed_ms} ms")
-    with (
-        ui.expansion(
-            row.headline,
-            caption=" | ".join(b for b in caption_bits if b) or None,
-            icon=icon,
-        )
-        .classes("w-full border rounded")
-        .props(f"header-class=text-{colour} dense")
-    ):
-        with ui.grid(columns="auto 1fr").classes("gap-x-4 gap-y-1 text-sm"):
-            ui.label("Status")
-            ui.label(row.status)
-            ui.label("Answers")
-            with ui.column().classes("gap-0 bfrd-mono"):
-                for answer in row.answers or ("(none)",):
-                    ui.label(answer)
-            ui.label("Types")
-            ui.label(row.answer_types_text or "-")
-            if row.error:
-                ui.label("Error")
-                ui.label(row.error).classes("text-negative")
-        if row.raw_qna_output:
-            ui.code(row.raw_qna_output).classes("w-full text-xs")
 
 
 def _breakdown_table(

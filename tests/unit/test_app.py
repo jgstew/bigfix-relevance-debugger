@@ -8,6 +8,7 @@ Docker, qna or SSH.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 from collections.abc import AsyncIterator
@@ -15,6 +16,7 @@ from collections.abc import AsyncIterator
 import pytest
 from bigfix_remote_client_relevance import ClientRelevanceResult, InventoryError, Target
 from nicegui import ui
+from nicegui.testing.user_download import UserDownload
 from nicegui.testing.user_simulation import user_simulation
 
 from bigfix_relevance_debugger import app as app_module
@@ -307,8 +309,15 @@ async def test_evaluate_streams_result_rows(user, monkeypatch):
 
     user.find(marker="evaluate").click()
 
-    await user.should_see("Linux Debian 11")
     await user.should_see("1 / 1")
+    # Table cells are props, not child elements, so read the rows.
+    [table] = user.find(marker="results").elements
+    [row] = table.rows
+    assert row["host"] == "local"
+    assert row["preview"] == "Linux Debian 11"
+    assert row["elapsed_ms"] == 42
+    user.find(marker="results").trigger("update:expanded", [row["id"]])
+    assert table.rows[0]["answers"] == "Linux Debian 11"
     assert [t.kind for t in seen["targets"]] == ["local"]
 
 
@@ -962,3 +971,478 @@ async def test_closing_the_tab_after_a_double_click_cleans_up_the_one_run(user, 
 
     assert started == [1]
     assert cleaned == [1]
+
+
+# --- results area (issue 4) ----------------------------------------------------------------
+
+
+def one_result_stream(answers=("Linux Debian 11",)):
+    async def stream(text, targets, opts, **upstream):
+        yield ClientRelevanceResult(
+            host="local", transport="local", client_relevance=text, answers=list(answers)
+        )
+
+    return stream
+
+
+def counting_breakdown():
+    async def fake_breakdown(view, target, opts, **upstream):
+        return [
+            LevelResult(level, ProbeView(level.probe, "count", 1, 1, 0), None, False)
+            for level in view.levels
+        ]
+
+    return fake_breakdown
+
+
+async def evaluate_and_break_down(user, monkeypatch, *, breakdown_first: bool) -> None:
+    monkeypatch.setattr(app_module, "stream_results", one_result_stream())
+    monkeypatch.setattr(app_module, "run_breakdown", counting_breakdown())
+    await user.open("/")
+    await set_text(user, WHOSE)
+    user.find(marker="target-local").click()
+
+    async def run_evaluate():
+        user.find(marker="evaluate").click()
+        await user.should_see("1 / 1")
+        await asyncio.sleep(0.1)
+
+    async def run_breakdown_():
+        user.find(marker="breakdown").click()
+        await user.should_see(marker="breakdown-level")
+        await asyncio.sleep(0.1)
+
+    for step in (
+        (run_breakdown_, run_evaluate) if breakdown_first else (run_evaluate, run_breakdown_)
+    ):
+        await step()
+
+
+def section_order(user, *markers):
+    elements = [button(user, m) for m in markers]
+    siblings = elements[0].parent_slot.children
+    return [siblings.index(e) for e in elements]
+
+
+async def test_breakdown_renders_above_results(user, monkeypatch):
+    await evaluate_and_break_down(user, monkeypatch, breakdown_first=False)
+
+    breakdown_at, results_at = section_order(user, "breakdown-section", "results-section")
+    assert breakdown_at < results_at
+
+
+async def test_evaluate_after_breakdown_keeps_the_breakdown(user, monkeypatch):
+    await evaluate_and_break_down(user, monkeypatch, breakdown_first=True)
+
+    await user.should_see(marker="breakdown-level")
+
+
+async def test_breakdown_after_evaluate_keeps_the_results(user, monkeypatch):
+    await evaluate_and_break_down(user, monkeypatch, breakdown_first=False)
+
+    assert result_hosts(user) == ["local"]
+
+
+def result_hosts(user) -> list[str]:
+    [table] = user.find(marker="results").elements
+    return [row["host"] for row in table.rows]
+
+
+def result(host, answers=(), **kwargs):
+    # container: its display host is the host as given (ssh would read "ssh:<host>").
+    return ClientRelevanceResult(
+        host=host, transport="container", client_relevance="x", answers=list(answers), **kwargs
+    )
+
+
+def stream_of(*results, gate: asyncio.Event | None = None, after: int = 0):
+    """Yield ``results``; with ``gate``, pause after the first ``after`` until it's set."""
+
+    async def stream(text, targets, opts, **upstream):
+        for i, r in enumerate(results):
+            if gate is not None and i == after:
+                await gate.wait()
+            yield r
+
+    stream.count = len(results)  # type: ignore[attr-defined]
+    return stream
+
+
+async def evaluate_with(user, monkeypatch, stream) -> None:
+    monkeypatch.setattr(app_module, "stream_results", stream)
+    # One Local target, but the fake yields several results: keep "N / M" honest.
+    monkeypatch.setattr(app_module, "total_work", lambda targets, opts: stream.count)
+    await user.open("/")
+    await set_text(user, "name of operating system")
+    user.find(marker="target-local").click()
+    user.find(marker="evaluate").click()
+
+
+def results_table(user):
+    [table] = user.find(marker="results").elements
+    return table
+
+
+MIXED = (
+    result("empty"),
+    result("err", error="boom", error_kind="transport"),
+    result("three", ["a", "b", "c"]),
+)
+
+
+async def test_results_are_one_table_sorted_by_answer_count(user, monkeypatch):
+    await evaluate_with(user, monkeypatch, stream_of(*MIXED))
+    await user.should_see("3 / 3")
+
+    assert result_hosts(user) == ["three", "empty", "err"]
+    assert [r["ok"] for r in results_table(user).rows] == [True, True, False]
+
+
+async def test_results_resort_as_they_stream(user, monkeypatch):
+    gate = asyncio.Event()
+    await evaluate_with(
+        user,
+        monkeypatch,
+        stream_of(result("one", ["a"]), result("two", ["a", "b"]), gate=gate, after=1),
+    )
+    await user.should_see("1 / 2")
+    assert result_hosts(user) == ["one"]
+
+    gate.set()
+    await user.should_see("2 / 2")
+
+    assert result_hosts(user) == ["two", "one"]
+
+
+async def test_expanded_rows_stay_expanded_when_more_results_arrive(user, monkeypatch):
+    gate = asyncio.Event()
+    await evaluate_with(
+        user,
+        monkeypatch,
+        stream_of(result("one", ["a"]), result("two", ["a", "b"]), gate=gate, after=1),
+    )
+    await user.should_see("1 / 2")
+    [first] = results_table(user).rows
+
+    user.find(marker="results").trigger("update:expanded", [first["id"]])
+    gate.set()
+    await user.should_see("2 / 2")
+
+    assert results_table(user).props["expanded"] == [first["id"]]
+
+
+async def test_summary_line_counts_results(user, monkeypatch):
+    await evaluate_with(user, monkeypatch, stream_of(*MIXED))
+
+    await user.should_see("3 results: 1 with answers, 1 empty, 1 error")
+
+
+async def test_results_section_hidden_before_any_run(user):
+    await user.open("/")
+
+    await user.should_not_see(marker="results")
+    await user.should_not_see(marker="results-summary")
+
+
+async def test_answer_text_is_not_rendered_as_html(user, monkeypatch):
+    # The body slot must interpolate ({{ }}), never v-html: answers come from the endpoint.
+    await evaluate_with(user, monkeypatch, stream_of(result("h", ["<b>x</b>"])))
+    await user.should_see("1 / 1")
+
+    slots = "".join(str(s.template) for s in results_table(user).slots.values() if s.template)
+    assert "v-html" not in slots
+    assert results_table(user).rows[0]["preview"] == "<b>x</b>"
+
+
+# --- search (issue 4) ----------------------------------------------------------------------
+
+# A host that lists two qna versions yields two results with the same host.
+FLEET = (
+    result("deb", ["Linux Debian 11"], qna_version="a"),
+    result("rh", ["Linux Red Hat 9"], qna_version="a"),
+    result("multi", ["Linux Debian 12"], qna_version="a"),
+    result("multi", [], qna_version="b"),
+    result("down", error="Permission denied (publickey)", error_kind="transport"),
+)
+
+
+async def evaluated_fleet(user, monkeypatch):
+    await evaluate_with(user, monkeypatch, stream_of(*FLEET))
+    await user.should_see(f"{len(FLEET)} / {len(FLEET)}")
+    await asyncio.sleep(0.1)
+
+
+async def search(user, text):
+    user.find(marker="results-filter").clear().type(text)
+    await asyncio.sleep(app_module.FILTER_DEBOUNCE_S + 0.1)
+
+
+async def clear_search(user):
+    user.find(marker="results-filter").clear()
+    await asyncio.sleep(app_module.FILTER_DEBOUNCE_S + 0.1)
+
+
+async def test_search_hides_hosts_without_a_matching_result(user, monkeypatch):
+    await evaluated_fleet(user, monkeypatch)
+
+    await search(user, "debian")
+
+    assert result_hosts(user) == ["deb", "multi", "multi"]
+
+
+async def test_search_shows_every_result_of_a_matching_host(user, monkeypatch):
+    await evaluated_fleet(user, monkeypatch)
+
+    await search(user, "DEBIAN 12")
+
+    rows = results_table(user).rows
+    assert [(r["host"], r["qna"]) for r in rows] == [("multi", "a"), ("multi", "b")]
+
+
+async def test_search_expands_matching_hosts(user, monkeypatch):
+    await evaluated_fleet(user, monkeypatch)
+
+    await search(user, "debian")
+
+    table = results_table(user)
+    assert table.props["expanded"] == sorted(r["id"] for r in table.rows)
+
+
+async def test_clearing_search_restores_all_rows_and_what_was_expanded(user, monkeypatch):
+    await evaluated_fleet(user, monkeypatch)
+    rh = next(r["id"] for r in results_table(user).rows if r["host"] == "rh")
+    user.find(marker="results").trigger("update:expanded", [rh])
+
+    await search(user, "debian")
+    await clear_search(user)
+
+    assert len(results_table(user).rows) == len(FLEET)
+    assert results_table(user).props["expanded"] == [rh]
+
+
+async def test_search_matches_error_text(user, monkeypatch):
+    await evaluated_fleet(user, monkeypatch)
+
+    await search(user, "publickey")
+
+    assert result_hosts(user) == ["down"]
+
+
+async def test_search_summary_says_showing_n_of_m(user, monkeypatch):
+    await evaluated_fleet(user, monkeypatch)
+
+    await search(user, "debian")
+
+    await user.should_see(
+        'Showing 3 of 5 results: hosts with an answer or error containing "debian"'
+    )
+
+
+async def test_search_with_no_matches_empties_the_table_and_says_so(user, monkeypatch):
+    await evaluated_fleet(user, monkeypatch)
+
+    await search(user, "solaris")
+
+    assert results_table(user).rows == []
+    await user.should_see("Showing 0 of 5 results")
+
+
+async def test_search_persists_across_evaluate(user, monkeypatch):
+    await evaluated_fleet(user, monkeypatch)
+    await search(user, "red hat")
+
+    user.find(marker="evaluate").click()
+    await asyncio.sleep(0.3)
+
+    assert result_hosts(user) == ["rh"]
+    assert button(user, "results-filter").value == "red hat"
+
+
+async def test_new_matches_streaming_in_are_expanded(user, monkeypatch):
+    gate = asyncio.Event()
+    await evaluate_with(
+        user,
+        monkeypatch,
+        stream_of(result("a", ["debian"]), result("b", ["debian too"]), gate=gate, after=1),
+    )
+    await user.should_see("1 / 2")
+    await search(user, "debian")
+
+    gate.set()
+    await user.should_see("2 / 2")
+
+    table = results_table(user)
+    assert table.props["expanded"] == sorted(r["id"] for r in table.rows)
+    assert len(table.rows) == 2
+
+
+async def test_export_includes_results_hidden_by_the_search(user, monkeypatch):
+    exported: list[str] = []
+    # The simulated user's download treats a str payload as a URL; capture it instead.
+    monkeypatch.setattr(
+        UserDownload, "content", lambda self, payload, *a, **k: exported.append(payload)
+    )
+    await evaluated_fleet(user, monkeypatch)
+    await search(user, "debian")
+
+    user.find(marker="export").click()
+
+    [payload] = exported
+    assert len(json.loads(payload)) == len(FLEET)
+
+
+# --- clear (issue 4) -----------------------------------------------------------------------
+
+
+def hidden_element(user, marker):
+    [element] = [e for e in user.client.elements.values() if marker in e._markers]
+    return element
+
+
+async def test_clear_is_disabled_until_there_is_something_to_clear(user):
+    await user.open("/")
+
+    assert not button(user, "clear").enabled
+
+
+async def test_clear_removes_results_breakdown_progress_and_search(user, monkeypatch):
+    await evaluate_and_break_down(user, monkeypatch, breakdown_first=False)
+    await search(user, "debian")
+    assert button(user, "clear").enabled
+
+    user.find(marker="clear").click()
+
+    await user.should_not_see(marker="results")
+    await user.should_not_see(marker="breakdown-level")
+    await user.should_not_see("1 / 1")
+    # The results section is hidden now, and user.find only sees what's visible.
+    assert hidden_element(user, "results-filter").value == ""
+    assert hidden_element(user, "results").rows == []
+    assert hidden_element(user, "results").props["expanded"] == []
+    assert not button(user, "export").enabled
+    assert not button(user, "clear").enabled
+
+
+async def test_clear_after_breakdown_only_is_enabled_and_clears_it(user, monkeypatch):
+    await breakdown_table(user, monkeypatch, WHOSE)
+    await asyncio.sleep(0.1)
+    assert button(user, "clear").enabled
+
+    user.find(marker="clear").click()
+
+    await user.should_not_see(marker="breakdown-level")
+
+
+async def test_clear_is_disabled_while_running(user, monkeypatch):
+    gate = asyncio.Event()
+    await evaluate_with(
+        user, monkeypatch, stream_of(result("a", ["1"]), result("b"), gate=gate, after=1)
+    )
+    await user.should_see("1 / 2")
+
+    assert not button(user, "clear").enabled
+
+    user.find(marker="cancel").click()
+    await asyncio.sleep(0.2)
+
+    assert button(user, "clear").enabled
+
+
+async def test_clear_keeps_the_activity_log(user, monkeypatch):
+    gate = asyncio.Event()
+    await evaluate_with(
+        user, monkeypatch, stream_of(result("a", ["1"]), result("b"), gate=gate, after=1)
+    )
+    await user.should_see("1 / 2")
+    user.find(marker="cancel").click()
+    await user.should_see("cancelled")
+
+    user.find(marker="clear").click()
+
+    await user.should_see("cancelled")
+
+
+async def test_breakdown_after_clear_is_not_stale(user, monkeypatch):
+    await breakdown_table(user, monkeypatch, WHOSE)
+    await asyncio.sleep(0.1)
+    user.find(marker="clear").click()
+
+    user.find(marker="breakdown").click()
+    await user.should_see(marker="breakdown-level")
+
+    await user.should_not_see(marker="breakdown-stale")
+
+
+async def test_results_table_shows_the_qna_version_so_a_hosts_rows_differ(user, monkeypatch):
+    # A host listing two qna versions gives two rows with the same Target.
+    await evaluated_fleet(user, monkeypatch)
+
+    table = results_table(user)
+    assert "qna" in [c["name"] for c in table.columns]
+    multi = [r["qna"] for r in table.rows if r["host"] == "multi"]
+    assert multi == ["a", "b"]
+
+
+# --- PR #5 review ---------------------------------------------------------------------------
+
+
+async def test_rows_the_user_collapses_stay_collapsed_while_filtered_results_stream_in(
+    user, monkeypatch
+):
+    gate = asyncio.Event()
+    await evaluate_with(
+        user,
+        monkeypatch,
+        stream_of(result("a", ["debian"]), result("b", ["debian too"]), gate=gate, after=1),
+    )
+    await user.should_see("1 / 2")
+    await search(user, "debian")
+    [a] = results_table(user).rows
+    assert results_table(user).props["expanded"] == [a["id"]]
+
+    user.find(marker="results").trigger("update:expanded", [])  # the user collapses it
+    gate.set()
+    await user.should_see("2 / 2")
+
+    table = results_table(user)
+    b = next(r["id"] for r in table.rows if r["host"] == "b")
+    assert table.props["expanded"] == [b]  # the new match opens; "a" stays shut
+
+
+async def test_each_result_is_converted_to_a_table_row_once(user, monkeypatch):
+    calls: list[int] = []
+    real = app_module.results_table_row
+
+    def counting(key, row):
+        calls.append(key)
+        return real(key, row)
+
+    monkeypatch.setattr(app_module, "results_table_row", counting)
+    await evaluated_fleet(user, monkeypatch)
+    await search(user, "debian")
+    await clear_search(user)
+
+    assert sorted(calls) == list(range(len(FLEET)))
+
+
+async def test_only_expanded_rows_carry_their_details(user, monkeypatch):
+    await evaluated_fleet(user, monkeypatch)
+    table = results_table(user)
+    assert all("raw" not in r and "answers" not in r for r in table.rows)
+
+    deb = next(r["id"] for r in table.rows if r["host"] == "deb")
+    user.find(marker="results").trigger("update:expanded", [deb])
+
+    [opened] = [r for r in table.rows if "answers" in r]
+    assert opened["id"] == deb
+    assert opened["answers"] == "Linux Debian 11"
+
+
+async def test_the_filter_waits_for_typing_to_pause(user, monkeypatch):
+    await evaluated_fleet(user, monkeypatch)
+
+    user.find(marker="results-filter").type("debian")
+    assert len(results_table(user).rows) == len(FLEET)  # not yet
+
+    await asyncio.sleep(app_module.FILTER_DEBOUNCE_S + 0.1)
+    assert result_hosts(user) == ["deb", "multi", "multi"]

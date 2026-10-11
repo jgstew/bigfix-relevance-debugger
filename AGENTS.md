@@ -61,7 +61,14 @@ uv run pyright src tests
 - **Page tests** use `nicegui.testing.user_simulation(root=app.root)` and
   monkeypatch the names `app.py` imports (`stream_results`, `run_breakdown`,
   `find_inventory_path`, ...). Table cells aren't child elements, so read
-  `table.rows` instead of using `should_see`.
+  `table.rows` instead of using `should_see`. `user.find` only sees visible
+  elements; a hidden one (e.g. the results section after Clear) has to be
+  looked up in `user.client.elements`. The simulated user's
+  `ui.download.content` treats a `str` as a URL, so patch `UserDownload`.
+- **The results table's row expansion is owned by Python** (its `expanded`
+  prop plus `update:expanded`), so tests can read `table.props["expanded"]`.
+  Sorting and filtering (`order_results`, `visible_results`) are pure
+  functions in `evaluation.py`.
 - **The inventory is shared** with the `bigfix-remote-client-relevance` CLI:
   by default it uses that library's `find_inventory_path()` search
   (`~/.bigfix/remote_clients.toml` etc.), and first-run auto-discovery when
