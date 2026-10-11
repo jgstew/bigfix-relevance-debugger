@@ -1,0 +1,16 @@
+# Keeps the SHA-pinned actions in .github/workflows/ current; Dependabot
+# updates the trailing `# vX.Y.Z` comment along with the SHA.
+#
+# The 7-day cooldown is the point, not a courtesy: a release published minutes
+# ago is the likeliest to be a compromised one.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"

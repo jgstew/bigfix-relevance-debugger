@@ -1,0 +1,123 @@
+---
+name: pre-commit
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+  # so .github/workflows/tag_and_release.yaml can gate a release on this exact
+  # job rather than polling for other checks to go green
+  workflow_call:
+    inputs:
+      all-files:
+        description: run every hook on the whole tree instead of the pushed diff
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # github.workflow keeps a workflow_call from tag_and_release.yaml out of the
+  # group a push to main starts for this workflow on its own
+  group: pre-commit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    # no-commit-to-branch guards a developer's local `git commit`; it has
+    # nothing to check on a runner, and on a push to main it would fail the
+    # run of every merged PR. This repo doesn't use that hook today; the SKIP
+    # keeps CI working if it's added. SKIP is read by pre-commit itself, so it
+    # applies to both steps below.
+    #
+    # GH_TOKEN puts zizmor in online mode (offline is the default without it),
+    # so it can fetch the referenced actions for the audits that need them.
+    # The runner's own GITHUB_TOKEN is enough for a public repo; it's
+    # read-only per the `permissions:` block above and never touches git
+    # credentials (actions/checkout sets persist-credentials: false).
+    env:
+      SKIP: no-commit-to-branch
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # required to grab the history of the PR for pre-commit
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      # single source of truth for the uv version: the `rev` of the
+      # astral-sh/uv-pre-commit repo in .pre-commit-config.yaml, which
+      # `pre-commit autoupdate` already keeps current. Read with awk rather
+      # than a yaml parser so it needs nothing installed first. `rev` is
+      # SHA-pinned with the version in a trailing `# X.Y.Z` comment, so the
+      # version comes from that comment; fall back to the bare `rev` value for
+      # a tag-pinned rev with no comment. Same step in every workflow here.
+      - name: read uv version from .pre-commit-config.yaml
+        run: |
+          UV_VERSION="$(awk '
+            /^[[:space:]]*-[[:space:]]*repo:.*astral-sh\/uv-pre-commit[[:space:]]*$/ { found = 1; next }
+            found && $1 == "rev:" {
+              if (match($0, /#[ \t]*(frozen:[ \t]*)?[vV]?[0-9]+(\.[0-9]+)*/)) {
+                ver = substr($0, RSTART, RLENGTH)
+                sub(/^#[ \t]*(frozen:[ \t]*)?[vV]?/, "", ver)
+              } else {
+                ver = $2
+                gsub(/["'\'']/, "", ver)
+                sub(/^[vV]/, "", ver)
+              }
+              print ver
+              exit
+            }
+          ' .pre-commit-config.yaml)"
+          if [ -z "$UV_VERSION" ]; then
+            echo "::error::could not read the astral-sh/uv-pre-commit version from .pre-commit-config.yaml"
+            exit 1
+          fi
+          echo "UV_VERSION=$UV_VERSION" >> "$GITHUB_ENV"
+          echo "uv version: $UV_VERSION"
+
+      # the local pyright and pytest hooks are `language: system` and run
+      # `uv run`, so uv has to be on PATH or both fail
+      - name: install uv (needed by the local pre-commit hooks)
+        run: python -m pip install "uv==${UV_VERSION}"
+
+      # A PR or a push: the hooks on the changed files, including the
+      # manual-stage ones (pytest and the workflow linters).
+      # In a called workflow github.event_name is the caller's event, so a
+      # release started by a push would land here too; the all-files input is
+      # what sends it to the next step instead.
+      - name: pre-commit on the diff
+        if: >-
+          !inputs.all-files
+          && (github.event_name == 'pull_request' || github.event_name == 'push')
+        uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
+        with:
+          extra_args: >-
+            --color=always
+            --from-ref ${{ github.event.pull_request.base.sha || github.event.before }}
+            --to-ref ${{ github.event.pull_request.head.sha || github.sha }}
+            --hook-stage manual
+
+      # manual dispatch, and tag_and_release.yaml: every hook against the full
+      # tree, not just a diff range
+      - name: pre-commit on all files
+        if: inputs.all-files || github.event_name == 'workflow_dispatch'
+        uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
+        with:
+          extra_args: --color=always --all-files --hook-stage manual
+
+      # pre-commit/action restores the previous cache on a config change and
+      # saves it back under the new key, so every hook rev bump would leave its
+      # old environment in the cache forever. gc deletes the environments no
+      # live config references. Last on purpose: the cache is saved in the
+      # action's post step, after this.
+      - name: prune unused hook environments before the cache is saved
+        run: pre-commit gc

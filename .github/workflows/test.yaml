@@ -1,0 +1,226 @@
+---
+name: test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+  # so .github/workflows/tag_and_release.yaml can gate a release on these
+  # exact jobs rather than polling for other checks to go green
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  # github.workflow keeps a workflow_call from tag_and_release.yaml out of the
+  # group a push to main starts for this workflow on its own
+  group: test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # the oldest version requires-python allows, and the newest in the
+        # classifiers; keep both in step with pyproject.toml
+        python: ["3.11", "3.13"]
+    env:
+      # overrides .python-version for every uv command below
+      UV_PYTHON: ${{ matrix.python }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python }}
+
+      # single source of truth for the uv version: the `rev` of the
+      # astral-sh/uv-pre-commit repo in .pre-commit-config.yaml, which
+      # `pre-commit autoupdate` already keeps current. Read with awk rather
+      # than a yaml parser so it needs nothing installed first. `rev` is
+      # SHA-pinned with the version in a trailing `# X.Y.Z` comment, so the
+      # version comes from that comment; fall back to the bare `rev` value for
+      # a tag-pinned rev with no comment. Same step in every workflow here.
+      - name: read uv version from .pre-commit-config.yaml
+        run: |
+          UV_VERSION="$(awk '
+            /^[[:space:]]*-[[:space:]]*repo:.*astral-sh\/uv-pre-commit[[:space:]]*$/ { found = 1; next }
+            found && $1 == "rev:" {
+              if (match($0, /#[ \t]*(frozen:[ \t]*)?[vV]?[0-9]+(\.[0-9]+)*/)) {
+                ver = substr($0, RSTART, RLENGTH)
+                sub(/^#[ \t]*(frozen:[ \t]*)?[vV]?/, "", ver)
+              } else {
+                ver = $2
+                gsub(/["'\'']/, "", ver)
+                sub(/^[vV]/, "", ver)
+              }
+              print ver
+              exit
+            }
+          ' .pre-commit-config.yaml)"
+          if [ -z "$UV_VERSION" ]; then
+            echo "::error::could not read the astral-sh/uv-pre-commit version from .pre-commit-config.yaml"
+            exit 1
+          fi
+          echo "UV_VERSION=$UV_VERSION" >> "$GITHUB_ENV"
+          echo "uv version: $UV_VERSION"
+
+      - name: install uv
+        run: python -m pip install "uv==${UV_VERSION}"
+
+      - name: uv sync --locked
+        run: uv sync --locked
+
+      # flags live in [tool.pytest.ini_options] in pyproject.toml, not here
+      - name: pytest
+        run: uv run --frozen pytest
+
+      - name: ruff check
+        run: uv run --frozen ruff check src tests
+
+      - name: ruff format --check
+        run: uv run --frozen ruff format --check src tests
+
+      - name: pyright
+        run: uv run --frozen pyright src tests
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      # same awk-from-.pre-commit-config.yaml source of truth as the test job
+      - name: read uv version from .pre-commit-config.yaml
+        run: |
+          UV_VERSION="$(awk '
+            /^[[:space:]]*-[[:space:]]*repo:.*astral-sh\/uv-pre-commit[[:space:]]*$/ { found = 1; next }
+            found && $1 == "rev:" {
+              if (match($0, /#[ \t]*(frozen:[ \t]*)?[vV]?[0-9]+(\.[0-9]+)*/)) {
+                ver = substr($0, RSTART, RLENGTH)
+                sub(/^#[ \t]*(frozen:[ \t]*)?[vV]?/, "", ver)
+              } else {
+                ver = $2
+                gsub(/["'\'']/, "", ver)
+                sub(/^[vV]/, "", ver)
+              }
+              print ver
+              exit
+            }
+          ' .pre-commit-config.yaml)"
+          if [ -z "$UV_VERSION" ]; then
+            echo "::error::could not read the astral-sh/uv-pre-commit version from .pre-commit-config.yaml"
+            exit 1
+          fi
+          echo "UV_VERSION=$UV_VERSION" >> "$GITHUB_ENV"
+          echo "uv version: $UV_VERSION"
+
+      - name: install uv
+        run: python -m pip install "uv==${UV_VERSION}"
+
+      - name: uv build (wheel + sdist)
+        run: uv build
+
+      # cheap, and makes a test run's hashes comparable to the released ones
+      - name: sha256 of the built artifacts
+        run: sha256sum dist/*
+
+      # the smoke job tests these exact bytes on every OS, rather than each
+      # runner building its own
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-dist
+          path: dist/
+          if-no-files-found: error
+
+  # Runs the built wheel the way users will: `uvx` installs it and its
+  # dependencies from PyPI into a throwaway environment. --version and --help
+  # import the whole app (NiceGUI, pywebview and the three BigFix libraries),
+  # so a dependency with no wheel for a platform fails here, e.g. pythonnet,
+  # which pywebview needs on Windows. Neither flag opens a window.
+  smoke:
+    name: wheel smoke test (${{ matrix.os }})
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        # Git Bash on Windows, so the dist/*.whl glob and the script below
+        # work the same on all three
+        shell: bash
+    env:
+      UV_PYTHON: "3.13"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      # same awk-from-.pre-commit-config.yaml source of truth as the test job
+      - name: read uv version from .pre-commit-config.yaml
+        run: |
+          UV_VERSION="$(awk '
+            /^[[:space:]]*-[[:space:]]*repo:.*astral-sh\/uv-pre-commit[[:space:]]*$/ { found = 1; next }
+            found && $1 == "rev:" {
+              if (match($0, /#[ \t]*(frozen:[ \t]*)?[vV]?[0-9]+(\.[0-9]+)*/)) {
+                ver = substr($0, RSTART, RLENGTH)
+                sub(/^#[ \t]*(frozen:[ \t]*)?[vV]?/, "", ver)
+              } else {
+                ver = $2
+                gsub(/["'\'']/, "", ver)
+                sub(/^[vV]/, "", ver)
+              }
+              print ver
+              exit
+            }
+          ' .pre-commit-config.yaml)"
+          if [ -z "$UV_VERSION" ]; then
+            echo "::error::could not read the astral-sh/uv-pre-commit version from .pre-commit-config.yaml"
+            exit 1
+          fi
+          echo "UV_VERSION=$UV_VERSION" >> "$GITHUB_ENV"
+          echo "uv version: $UV_VERSION"
+
+      - name: install uv
+        run: python -m pip install "uv==${UV_VERSION}"
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: test-dist
+          path: dist
+
+      # --version must print the version in pyproject.toml: __version__ comes
+      # from the installed metadata, so this also proves the wheel's metadata
+      # is what a release would tag.
+      - name: uvx --from <wheel> bigfix-relevance-debugger --version and --help
+        run: |
+          expected="$(python -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          wheel="$(ls dist/*.whl)"
+          # tr: Python on Windows ends the line with \r\n, and $() keeps the \r
+          got="$(uvx --isolated --from "$wheel" bigfix-relevance-debugger --version | tr -d '\r')"
+          echo "$got"
+          if [ "$got" != "bigfix-relevance-debugger ${expected}" ]; then
+            echo "::error::expected 'bigfix-relevance-debugger ${expected}', got '${got}'"
+            exit 1
+          fi
+          uvx --isolated --from "$wheel" bigfix-relevance-debugger --help
