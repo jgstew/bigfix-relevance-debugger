@@ -17,6 +17,7 @@ on:
       - ".github/workflows/tag_and_release.yaml"
       - ".github/workflows/test.yaml"
       - ".github/workflows/pre-commit.yaml"
+      - ".github/actions/**"
   # a re-run path for when a release run failed after the version was already
   # merged, and for the first release; the tag check below still makes it a
   # no-op if the tag exists
@@ -143,38 +144,11 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      # setup-python, then the uv version pinned in .pre-commit-config.yaml;
+      # the same action test.yaml and pre-commit.yaml use
+      - uses: ./.github/actions/install-uv # zizmor: ignore[self-repository]
         with:
           python-version: "3.13"
-
-      # same awk-from-.pre-commit-config.yaml source of truth as test.yaml
-      # and pre-commit.yaml
-      - name: read uv version from .pre-commit-config.yaml
-        run: |
-          UV_VERSION="$(awk '
-            /^[[:space:]]*-[[:space:]]*repo:.*astral-sh\/uv-pre-commit[[:space:]]*$/ { found = 1; next }
-            found && $1 == "rev:" {
-              if (match($0, /#[ \t]*(frozen:[ \t]*)?[vV]?[0-9]+(\.[0-9]+)*/)) {
-                ver = substr($0, RSTART, RLENGTH)
-                sub(/^#[ \t]*(frozen:[ \t]*)?[vV]?/, "", ver)
-              } else {
-                ver = $2
-                gsub(/["'\'']/, "", ver)
-                sub(/^[vV]/, "", ver)
-              }
-              print ver
-              exit
-            }
-          ' .pre-commit-config.yaml)"
-          if [ -z "$UV_VERSION" ]; then
-            echo "::error::could not read the astral-sh/uv-pre-commit version from .pre-commit-config.yaml"
-            exit 1
-          fi
-          echo "UV_VERSION=$UV_VERSION" >> "$GITHUB_ENV"
-          echo "uv version: $UV_VERSION"
-
-      - name: install uv
-        run: python -m pip install "uv==${UV_VERSION}"
 
       - name: uv build (wheel + sdist)
         run: uv build
