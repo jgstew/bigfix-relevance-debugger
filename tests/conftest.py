@@ -36,6 +36,22 @@ def _no_real_auto_discovery(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_container_engine(monkeypatch):
+    """Fail loudly instead of asking a real docker/podman, and through it a registry.
+
+    The page looks up the ``auto`` arch in the background whenever Container
+    is ticked, so a page test that forgot to fake the lookup would otherwise
+    reach whatever engine the developer has running.
+    """
+    from bigfix_relevance_debugger import evaluation
+
+    def refuse():
+        raise AssertionError("a test reached a real container engine lookup")
+
+    monkeypatch.setattr(evaluation, "default_image_source", refuse)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_besapi_connection(monkeypatch):
     """Fail loudly instead of connecting to a real BigFix root server.
 

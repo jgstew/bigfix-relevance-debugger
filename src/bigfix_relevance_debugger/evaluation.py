@@ -247,18 +247,19 @@ def choose_breakdown_target(analysis: AnalysisView, targets: Sequence[Target]) -
 async def resolve_container_arches(
     form: TargetForm,
     *,
-    images_factory: Callable[[], ImageSource | None] = default_image_source,
+    images_factory: Callable[[], ImageSource | None] | None = None,
 ) -> dict[str, list[str]]:
     """Look up the ``auto`` arch for each container image; {} when not needed.
 
     Asks the container engine (and through it the registry) in a worker
-    thread, since both block.
+    thread, since both block. The default engine is looked up at call time,
+    so the tests can refuse it.
     """
     if not form.container or AUTO_ARCH not in form.container_arches:
         return {}
 
     def lookup() -> dict[str, list[str]]:
-        images = images_factory()
+        images = (images_factory or default_image_source)()
         return {image: published_arches(image, images) for image in _images(form)}
 
     return await asyncio.to_thread(lookup)

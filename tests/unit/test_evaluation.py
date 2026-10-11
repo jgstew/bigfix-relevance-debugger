@@ -7,6 +7,7 @@ injected fake transport and resolver, so no Docker, qna or SSH is needed.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import threading
 import time
 from pathlib import Path
@@ -226,6 +227,17 @@ async def test_resolve_container_arches_skips_the_registry_when_not_needed():
         )
         == {}
     )
+
+
+async def test_resolve_container_arches_default_engine_is_looked_up_at_call_time(monkeypatch):
+    # Checked first, so the run before the fix fails here and never asks a real engine.
+    assert inspect.signature(resolve_container_arches).parameters["images_factory"].default is None
+    asked = []
+    monkeypatch.setattr(evaluation, "default_image_source", lambda: asked.append(1))
+
+    await resolve_container_arches(TargetForm(container=True))
+
+    assert asked == [1]
 
 
 async def test_resolve_container_arches_without_an_engine_is_this_machine(monkeypatch):
