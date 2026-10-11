@@ -68,10 +68,20 @@ uv run pyright src tests
   elements; a hidden one (e.g. the results section after Clear) has to be
   looked up in `user.client.elements`. The simulated user's
   `ui.download.content` treats a `str` as a URL, so patch `UserDownload`.
+- **The side panel is a `ui.right_drawer`, closed by default.** A closed
+  drawer is not hidden to the simulated user: `user.find` still finds what's
+  inside, so assert `drawer.value` for open/closed. Because the panel's
+  target count shows form problems (e.g. "Pick at least one target."),
+  `should_see` of such a message passes before any click; check
+  `user.notify` for warnings instead (the `notified` helper).
+- **The header's target count is `evaluation.preview_targets`**, which builds
+  the targets with `build_targets` and shares `waits_for_inventory` with
+  `collect()`, so it can't drift from what Evaluate runs. Keep it that way.
 - **The results table's row expansion is owned by Python** (its `expanded`
   prop plus `update:expanded`), so tests can read `table.props["expanded"]`.
   Sorting and filtering (`order_results`, `visible_results`) are pure
-  functions in `evaluation.py`.
+  functions in `evaluation.py`, and so is the answer summary (`AnswerTally`,
+  one `add` per streamed result) and its pick (`ResultRow.has_key`).
 - **The inventory is shared** with the `bigfix-remote-client-relevance` CLI:
   by default it uses that library's `find_inventory_path()` search
   (`~/.bigfix/remote_clients.toml` etc.), and first-run auto-discovery when
@@ -91,6 +101,10 @@ uv run pyright src tests
   makes besapi's connection fail loudly and resets the shared connector.
 - **Tests must never run real discovery.** It writes
   `~/.bigfix/remote_clients.toml`; `tests/conftest.py` makes it fail loudly.
+- **Tests must never ask a real container engine.** The page looks up an
+  `auto` arch in the background when Container is ticked;
+  `tests/conftest.py` makes `evaluation.default_image_source` fail loudly, so
+  page tests fake `app.resolve_container_arches`.
 - **Smart defaults, no required clicks.** Infer the best option (inventory
   all selected, auto arch, the best breakdown target) and say why; selecting
   less is the override. Don't add dialogs that ask.

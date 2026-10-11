@@ -7,6 +7,7 @@ injected fake transport and resolver, so no Docker, qna or SSH is needed.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import threading
 import time
 from pathlib import Path
@@ -18,15 +19,19 @@ from bigfix_remote_client_relevance import ClientRelevanceResult, ResolvedQna, T
 from bigfix_relevance_debugger import evaluation
 from bigfix_relevance_debugger.analysis import summarize
 from bigfix_relevance_debugger.evaluation import (
+    NO_ANSWERS,
     PREVIEW_CHARS,
     SESSION_CONNECT_TIMEOUT_S,
     SESSION_HOST_UNKNOWN,
+    TALLY_LIMIT,
+    AnswerTally,
     EvalOptions,
     LevelResult,
     NoTargetsError,
     ProbeView,
     ResultRow,
     SessionConnector,
+    TallyRow,
     TargetForm,
     TargetFormError,
     analyzer_platform,
@@ -35,8 +40,12 @@ from bigfix_relevance_debugger.evaluation import (
     build_targets,
     choose_breakdown_target,
     evaluate_session,
+    inventory_table_row,
     load_inventory_targets,
     order_results,
+    pick_label,
+    pick_phrase,
+    preview_targets,
     resolve_container_arches,
     results_row_details,
     results_summary,
@@ -45,8 +54,10 @@ from bigfix_relevance_debugger.evaluation import (
     session_result_to_dict,
     session_row_wanted,
     stream_results,
+    tally_table_row,
     total_work,
     visible_results,
+    waits_for_inventory,
 )
 
 WHOSE_EXAMPLE = 'names of files whose (size of it > 1000) of folder "/etc"'
@@ -226,6 +237,41 @@ async def test_resolve_container_arches_skips_the_registry_when_not_needed():
         )
         == {}
     )
+
+
+async def test_resolve_container_arches_asks_only_for_images_it_doesnt_know():
+    images = FakeImages({"ubuntu:24.04": {"arm64"}})
+
+    resolved = await resolve_container_arches(
+        TargetForm(container=True, container_images="debian:11, ubuntu:24.04"),
+        images_factory=lambda: images,
+        known={"debian:11": ["x86_64", "arm64"], "other:1": ["arm64"]},
+    )
+
+    assert images.asked == ["ubuntu:24.04"]
+    assert resolved == {"debian:11": ["x86_64", "arm64"], "ubuntu:24.04": ["arm64"]}
+
+
+async def test_resolve_container_arches_all_known_asks_no_engine():
+    def explode():
+        raise AssertionError("no engine lookup expected")
+
+    resolved = await resolve_container_arches(
+        TargetForm(container=True), images_factory=explode, known={"debian:11": ["arm64"]}
+    )
+
+    assert resolved == {"debian:11": ["arm64"]}
+
+
+async def test_resolve_container_arches_default_engine_is_looked_up_at_call_time(monkeypatch):
+    # Checked first, so the run before the fix fails here and never asks a real engine.
+    assert inspect.signature(resolve_container_arches).parameters["images_factory"].default is None
+    asked = []
+    monkeypatch.setattr(evaluation, "default_image_source", lambda: asked.append(1))
+
+    await resolve_container_arches(TargetForm(container=True))
+
+    assert asked == [1]
 
 
 async def test_resolve_container_arches_without_an_engine_is_this_machine(monkeypatch):
@@ -1497,3 +1543,434 @@ def test_session_result_dict_for_export():
     assert d["evaluation_time"] == "0.47ms"
     assert d["error"] is None
     assert d["error_kind"] is None
+
+
+# --- answer summary (issue 8) ----------------------------------------------------------
+
+
+def tallied(*rows):
+    tally = AnswerTally()
+    for r in rows:
+        tally.add(r)
+    return tally
+
+
+def counts(tally, limit=TALLY_LIMIT):
+    shown, _ = tally.rows(limit)
+    return [(r.label, r.systems) for r in shown]
+
+
+def server_row(answers=("x",)):
+    return ResultRow.from_session(
+        evaluation.SessionEvaluation("q", "bigfix.example.com", answers=tuple(answers))
+    )
+
+
+def test_tally_counts_distinct_systems_per_answer():
+    tally = tallied(row("a", ["Linux"]), row("b", ["Linux"]), row("c", ["Win"]))
+
+    assert counts(tally) == [("Linux", 2), ("Win", 1)]
+    assert tally.systems == 3
+
+
+def test_tally_counts_a_host_once_across_its_qna_versions():
+    tally = tallied(row("multi", ["x"], qna_version="a"), row("multi", ["x"], qna_version="b"))
+
+    assert counts(tally) == [("x", 1)]
+    assert tally.systems == 1
+
+
+def test_tally_counts_a_repeated_answer_once_per_host():
+    assert counts(tallied(row("h", ["x", "x"]))) == [("x", 1)]
+
+
+def test_tally_host_whose_versions_disagree_counts_under_each():
+    tally = tallied(row("multi", ["x"], qna_version="a"), row("multi", [], qna_version="b"))
+
+    assert counts(tally) == [("x", 1), (NO_ANSWERS, 1)]
+
+
+def test_tally_counts_systems_by_display_host():
+    # An inventory can list one address as both ssh and fastquery: two systems.
+    tally = tallied(row("10.0.0.5", ["x"]), row("10.0.0.5", ["x"], transport="fastquery"))
+
+    assert counts(tally) == [("x", 2)]
+    assert tally.systems == 2
+
+
+def test_tally_orders_by_systems_then_answer_then_arrival():
+    tally = tallied(
+        row("1", ["B"]), row("2", ["a"]), row("3", ["top"]), row("4", ["top"]), row("5", ["c"])
+    )
+
+    assert counts(tally) == [("top", 2), ("a", 1), ("B", 1), ("c", 1)]
+
+
+def test_tally_puts_no_answers_then_errors_last():
+    tally = tallied(
+        row("err1", error="boom", error_kind="transport"),
+        *(row(f"empty{i}") for i in range(5)),
+        row("one", ["x"]),
+    )
+
+    assert counts(tally) == [("x", 1), (NO_ANSWERS, 5), ("error: transport", 1)]
+
+
+def test_tally_groups_errors_by_kind():
+    tally = tallied(
+        row("a", error="Permission denied", error_kind="transport"),
+        row("b", error="No route to host", error_kind="transport"),
+        row("c", error="qna crashed", error_kind="qna"),
+    )
+
+    assert counts(tally) == [("error: transport", 2), ("error: qna", 1)]
+
+
+def test_tally_limit_hides_the_rarest_answers_and_counts_them():
+    common = [f"common{i:02}" for i in range(50)]
+    rare = [f"rare{i}" for i in range(10)]
+    tally = tallied(row("a", common + rare), row("b", common), row("c"))
+
+    shown, hidden = tally.rows(TALLY_LIMIT)
+
+    assert hidden == 10
+    assert [r.label for r in shown] == [*common, NO_ANSWERS]
+
+
+def test_tally_shows_an_empty_string_answer_as_quotes():
+    assert counts(tallied(row("a", [""]))) == [('""', 1)]
+
+
+def test_tally_ignores_session_rows():
+    tally = tallied(server_row(), row("a", ["x"]))
+
+    assert counts(tally) == [("x", 1)]
+    assert tally.systems == 1
+
+
+def test_tally_table_row_cells_are_scalars():
+    tally = tallied(row("a", ["x"]), row("b", error="boom"))
+    shown, _ = tally.rows()
+    assert len(shown) == 2
+
+    for r in shown:
+        cells = tally_table_row(r, tally.systems, pick=None)
+        assert all(isinstance(v, str | int | float | bool | type(None)) for v in cells.values())
+
+
+def test_tally_table_row_share_and_percent():
+    tally = tallied(row("a", ["x"]), row("b", ["y"]), row("c", ["y"]))
+    [y, x] = tally.rows()[0]
+
+    cells = tally_table_row(x, tally.systems, pick=None)
+
+    assert cells["share"] == pytest.approx(1 / 3)
+    assert cells["percent"] == 33
+    assert cells["systems"] == 1
+    assert cells["kind"] == "answer"
+    assert tally_table_row(y, tally.systems, pick=None)["percent"] == 67
+
+
+def test_tally_table_row_marks_the_pick():
+    tally = tallied(row("a", ["x"]), row("b", ["y"]))
+    [x, y] = tally.rows()[0]
+
+    assert tally_table_row(x, 2, pick=x.key)["picked"] is True
+    assert tally_table_row(y, 2, pick=x.key)["picked"] is False
+
+
+def test_has_key_answer_is_exact_and_case_sensitive():
+    debian = row("a", ["Linux Debian 11"])
+
+    assert debian.has_key(TallyRow("answer", "Linux Debian 11", 1).key)
+    assert not debian.has_key(TallyRow("answer", "linux debian 11", 1).key)
+    assert not debian.has_key(TallyRow("answer", "Linux", 1).key)
+
+
+def test_has_key_for_no_answers_and_error_kind():
+    empty = TallyRow("empty", "", 1).key
+    transport = TallyRow("error", "transport", 1).key
+
+    assert row("a").has_key(empty)
+    assert not row("a", ["x"]).has_key(empty)
+    assert not row("a", error="boom").has_key(empty)
+    assert row("a", error="boom", error_kind="transport").has_key(transport)
+    assert not row("a", error="boom", error_kind="qna").has_key(transport)
+
+
+def test_pick_key_round_trips_answers_containing_colons():
+    key = TallyRow("answer", "a:b:c", 1).key
+
+    assert row("h", ["a:b:c"]).has_key(key)
+    assert pick_phrase(key) == 'answering "a:b:c"'
+
+
+def test_pick_labels_match_the_summary_rows():
+    for r in (TallyRow("answer", "a:b", 1), TallyRow("empty", "", 1), TallyRow("error", "qna", 1)):
+        assert pick_label(r.key) == r.label
+
+
+def test_pick_phrases():
+    assert pick_phrase(TallyRow("answer", "", 1).key) == 'answering """"'
+    assert pick_phrase(TallyRow("empty", "", 1).key) == "with no answers"
+    assert pick_phrase(TallyRow("error", "transport", 1).key) == "with an error (transport)"
+    assert pick_phrase(TallyRow("error", "auth", 1).key) == "with an error (auth)"
+
+
+def test_an_error_without_a_kind_reads_as_plain_error():
+    # ResultRow.status falls back to "error" with no error_kind. The library's
+    # failed results always have one, but the wording mustn't read "error error".
+    unknown = TallyRow("error", "error", 1)
+
+    assert unknown.label == "error"
+    assert pick_phrase(unknown.key) == "with an error"
+
+
+PICK_FLEET = [
+    row("deb", ["Linux Debian 11"], qna_version="a"),
+    row("rh", ["Linux Red Hat 9"], qna_version="a"),
+    row("multi", ["Linux Debian 11"], qna_version="a"),
+    row("multi", [], qna_version="b"),
+    row("down", error="Permission denied", error_kind="transport"),
+    row("plural", ["Linux Debian 11", "extra"]),
+]
+
+
+def test_visible_results_with_pick_keeps_every_result_of_a_matching_host():
+    key = TallyRow("empty", "", 1).key
+
+    assert hosts(PICK_FLEET, visible_results(PICK_FLEET, "", key)) == ["multi", "multi"]
+
+
+def test_visible_results_pick_and_query_combine():
+    key = TallyRow("answer", "Linux Debian 11", 1).key
+
+    assert set(hosts(PICK_FLEET, visible_results(PICK_FLEET, "", key))) == {
+        "deb",
+        "multi",
+        "plural",
+    }
+    assert hosts(PICK_FLEET, visible_results(PICK_FLEET, "extra", key)) == ["plural"]
+
+
+def test_visible_results_without_pick_is_unchanged():
+    for query in ("", "debian", "denied", "nothing"):
+        assert visible_results(PICK_FLEET, query, None) == visible_results(PICK_FLEET, query)
+
+
+def test_pick_shows_exactly_the_tallied_systems():
+    rows = [*PICK_FLEET, row("other", error="crash", error_kind="qna"), row("e2")]
+    tally = tallied(*rows)
+    tallies, _ = tally.rows()
+    assert len(tallies) == 6  # 3 answers, no answers, 2 error kinds
+
+    for r in tallies:
+        shown = {rows[i].display_host for i in visible_results(rows, "", r.key)}
+        assert len(shown) == r.systems, r.label
+
+
+def test_session_rows_never_match_a_pick():
+    rows = [server_row(["x"]), row("a", ["x"])]
+
+    assert hosts(rows, visible_results(rows, "", TallyRow("answer", "x", 1).key)) == ["a"]
+
+
+def test_summary_with_pick_says_which_answer():
+    debian = TallyRow("answer", "Linux Debian 11", 1).key
+
+    assert (
+        results_summary(PICK_FLEET, 4, "", debian)
+        == 'Showing 4 of 6 results: hosts answering "Linux Debian 11"'
+    )
+    assert results_summary(PICK_FLEET, 2, "", TallyRow("empty", "", 1).key).endswith(
+        "hosts with no answers"
+    )
+    assert results_summary(PICK_FLEET, 1, "", TallyRow("error", "transport", 1).key).endswith(
+        "hosts with an error (transport)"
+    )
+
+
+def test_summary_with_pick_and_query():
+    debian = TallyRow("answer", "Linux Debian 11", 1).key
+
+    assert results_summary(PICK_FLEET, 1, " extra ", debian) == (
+        'Showing 1 of 6 results: hosts answering "Linux Debian 11" '
+        'and an answer or error containing "extra"'
+    )
+
+
+def test_summary_query_only_is_unchanged():
+    assert results_summary(PICK_FLEET, 3, "debian") == (
+        'Showing 3 of 6 results: hosts with an answer or error containing "debian"'
+    )
+
+
+# --- target preview (issue 8) ------------------------------------------------------------
+
+
+def test_inventory_table_row():
+    deb = Target(kind="container", name="deb", image="debian:11", qna_version=["1.0", "2.0"])
+
+    assert inventory_table_row(0, deb) == {
+        "id": 0,
+        "label": "container:debian:11@x86_64",
+        "kind": "container",
+        "platform": "debian",
+        "about": "container · debian",
+        "qna": "1.0, 2.0",
+    }
+    assert inventory_table_row(1, Target(kind="ssh", name="box"))["platform"] == "?"
+    assert inventory_table_row(1, Target(kind="ssh", name="box"))["qna"] == ""
+    assert inventory_table_row(2, Target(kind="ssh", name="b", qna_version="1.0"))["qna"] == "1.0"
+
+
+INV = [Target(kind="ssh", name=f"lab-{c}") for c in "abc"]
+
+
+def preview(form, inventory=INV, image_arches=None, **kwargs):
+    kwargs = {"qna_spec": None, "inventory_pending": False} | kwargs
+    return preview_targets(form, inventory, image_arches or {}, **kwargs)
+
+
+def test_preview_counts_inventory_selection_and_explicit_targets():
+    p = preview(TargetForm(local=True, inventory_selected=[0, 2]))
+
+    assert p.systems == 3
+    assert p.exact
+    assert p.problem is None
+    assert p.text == "3 systems"
+    assert "2 inventory" in p.detail
+    assert "1 local" in p.detail
+
+
+def test_preview_with_nothing_selected_reports_the_form_problem():
+    p = preview(TargetForm())
+
+    assert p.systems == 0
+    assert p.problem == "Pick at least one target."
+    assert p.text == "0 systems"
+    assert p.problem in p.detail
+
+
+def test_preview_container_without_image_is_the_build_targets_message():
+    p = preview(TargetForm(container=True, container_images=" "))
+
+    with pytest.raises(TargetFormError) as raised:
+        build_targets(TargetForm(container=True, container_images=" "))
+    assert p.problem == str(raised.value)
+
+
+def test_preview_auto_arch_unknown_is_a_lower_bound(monkeypatch):
+    monkeypatch.setattr(evaluation, "host_arch", lambda: "arm64")
+
+    p = preview(TargetForm(container=True, inventory_selected=[]))
+
+    assert p.systems == 1
+    assert not p.exact
+    assert p.text == "≥ 1 system"
+    assert p.unresolved_images == ("debian:11",)
+    assert "debian:11" in p.detail
+
+
+def test_preview_auto_arch_known_is_exact():
+    p = preview(TargetForm(container=True), image_arches={"debian:11": ["x86_64", "arm64"]})
+
+    assert p.systems == 2
+    assert p.exact
+    assert p.unresolved_images == ()
+    assert p.text == "2 systems"
+    assert "2 container" in p.detail
+
+
+def test_preview_explicit_arches_need_no_lookup():
+    p = preview(TargetForm(container=True, container_arches=["arm64"]))
+
+    assert p.text == "1 system"
+    assert p.exact
+    assert p.unresolved_images == ()
+
+
+def test_preview_waits_for_inventory_like_evaluate():
+    pending = preview(TargetForm(), inventory=[], inventory_pending=True)
+
+    assert pending.systems is None
+    assert pending.problem is None
+    assert pending.text == "finding inventory …"
+
+    explicit = preview(TargetForm(local=True), inventory=[], inventory_pending=True)
+    assert explicit.systems == 1
+    assert explicit.exact
+
+
+def test_waits_for_inventory():
+    assert waits_for_inventory(TargetForm(inventory_selected=[0]), pending=False)
+    assert waits_for_inventory(TargetForm(), pending=True)
+    assert not waits_for_inventory(TargetForm(local=True), pending=True)
+    assert not waits_for_inventory(TargetForm(), pending=False)
+
+
+def test_preview_counts_runs_when_hosts_list_several_qna_versions():
+    inv = [Target(kind="ssh", name="multi", qna_version=["a", "b"]), Target(kind="ssh", name="x")]
+
+    p = preview(TargetForm(inventory_selected=[0, 1]), inventory=inv)
+
+    assert p.systems == 2
+    assert p.runs == 3
+    assert "3 runs" in p.detail
+
+
+def test_preview_says_nothing_about_runs_when_they_equal_systems():
+    detail = preview(TargetForm(inventory_selected=[0, 1])).detail
+
+    assert detail == "2 inventory"
+
+
+@pytest.mark.parametrize(
+    ("form", "arches"),
+    [
+        (TargetForm(local=True), {}),
+        (TargetForm(ssh=True, ssh_host="box"), {}),
+        (TargetForm(container=True, container_arches=["x86_64", "arm64"]), {}),
+        (TargetForm(container=True, container_images="a:1, b:2"), {"a:1": ["x86_64", "arm64"]}),
+        (TargetForm(inventory_selected=[1]), {}),
+        (TargetForm(local=True, inventory_selected=None), {}),
+        (TargetForm(local=True, ssh=True, ssh_host="b", inventory_selected=[0, 1, 2, 7]), {}),
+    ],
+)
+def test_preview_matches_build_targets(form, arches):
+    # The count must never drift from what Evaluate runs.
+    assert preview(form, image_arches=arches).systems == len(build_targets(form, INV, arches))
+
+
+def test_preview_text_singular_and_plural():
+    assert preview(TargetForm(local=True, inventory_selected=[])).text == "1 system"
+    assert preview(TargetForm(inventory_selected=[0, 1])).text == "2 systems"
+
+
+def test_preview_session_only_needs_no_targets():
+    p = preview(TargetForm(), client=False, session=True)
+
+    assert p.problem is None
+    assert p.text == "BigFix server"
+    assert "session" in p.detail
+
+
+def test_preview_both_adds_the_server():
+    assert (
+        preview(TargetForm(inventory_selected=[0, 1]), session=True).text
+        == "2 systems + BigFix server"
+    )
+
+
+def test_preview_both_without_client_targets_runs_session_only():
+    p = preview(TargetForm(), session=True)
+
+    assert p.problem is None
+    assert p.text == "BigFix server"
+
+
+def test_preview_both_with_a_bad_target_is_still_a_problem():
+    p = preview(TargetForm(ssh=True), session=True)
+
+    assert p.problem is not None
+    assert "SSH" in p.problem

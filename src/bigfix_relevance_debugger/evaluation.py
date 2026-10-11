@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
 import logging
 import threading
 import time
@@ -247,21 +248,28 @@ def choose_breakdown_target(analysis: AnalysisView, targets: Sequence[Target]) -
 async def resolve_container_arches(
     form: TargetForm,
     *,
-    images_factory: Callable[[], ImageSource | None] = default_image_source,
+    images_factory: Callable[[], ImageSource | None] | None = None,
+    known: Mapping[str, Sequence[str]] | None = None,
 ) -> dict[str, list[str]]:
     """Look up the ``auto`` arch for each container image; {} when not needed.
 
     Asks the container engine (and through it the registry) in a worker
-    thread, since both block.
+    thread, since both block, and only about images missing from ``known``
+    (arches found earlier; an image's published arches rarely change). The
+    default engine is looked up at call time, so the tests can refuse it.
     """
     if not form.container or AUTO_ARCH not in form.container_arches:
         return {}
+    known = known or {}
+    wanted = _images(form)
+    missing = [image for image in wanted if image not in known]
 
     def lookup() -> dict[str, list[str]]:
-        images = images_factory()
-        return {image: published_arches(image, images) for image in _images(form)}
+        images = (images_factory or default_image_source)()
+        return {image: published_arches(image, images) for image in missing}
 
-    return await asyncio.to_thread(lookup)
+    found = await asyncio.to_thread(lookup) if missing else {}
+    return {image: list(known[image]) if image in known else found[image] for image in wanted}
 
 
 @dataclass(frozen=True)
@@ -282,6 +290,135 @@ def load_inventory_targets(path: Path | None) -> InventoryLoad:
     except Exception as exc:  # noqa: BLE001 - the picker must not take the page down
         logger.debug("inventory load failed: %r", exc)
         return InventoryLoad(path=path, targets=[], error=f"{type(exc).__name__}: {exc}")
+
+
+def inventory_table_row(key: int, target: Target) -> Cells:
+    """One row of the inventory picker: enough to tell hosts apart before ticking them."""
+    version = target.qna_version
+    platform = target_platform(target) or "?"
+    return {
+        "id": key,
+        "label": target.label,
+        "kind": target.kind,
+        "platform": platform,
+        "about": f"{target.kind} · {platform}",
+        "qna": version if isinstance(version, str) else ", ".join(version or ()),
+    }
+
+
+# --- target preview -------------------------------------------------------------------
+
+SESSION_TARGET = "BigFix server"
+"""How the target count names the root server session relevance runs on."""
+
+
+def waits_for_inventory(form: TargetForm, *, pending: bool) -> bool:
+    """Whether Evaluate waits for the inventory load before building targets.
+
+    It does when hosts are selected, or while discovery is still going and
+    nothing else is ticked (its hosts will be the default). A first-run
+    Local/Container/SSH evaluation starts at once.
+    """
+    explicit = form.local or form.container or form.ssh
+    return bool(form.inventory_selected) or (pending and not explicit)
+
+
+@dataclass(frozen=True)
+class TargetPreview:
+    """What Evaluate would run on right now, for the target count."""
+
+    systems: int | None
+    """Client targets; None while Evaluate would wait for inventory discovery."""
+    exact: bool = True
+    """False while an ``auto``-arch image hasn't been looked up: it counts as one."""
+    runs: int = 0
+    """Results the run yields: a host listing several qna versions runs once per version."""
+    sources: tuple[tuple[str, int], ...] = ()
+    """Where the systems come from, e.g. ``(("inventory", 10), ("local", 1))``."""
+    problem: str | None = None
+    """Why nothing would run (the ``TargetFormError`` message)."""
+    unresolved_images: tuple[str, ...] = ()
+    session: bool = False
+    """Session relevance runs on the root server too (or only, with no systems)."""
+
+    @property
+    def text(self) -> str:
+        """Short, for the header: ``"12 systems"``, ``"≥ 2 systems"``, ``"BigFix server"``."""
+        if self.systems is None:
+            text = "finding inventory …"
+        elif self.session and self.systems == 0:
+            return SESSION_TARGET
+        else:
+            bound = "" if self.exact else "≥ "
+            text = f"{bound}{_plural(self.systems, 'system')}"
+        return f"{text} + {SESSION_TARGET}" if self.session else text
+
+    @property
+    def detail(self) -> str:
+        """Long, for the tooltip and the side panel: where they come from and caveats."""
+        parts = []
+        if self.problem:
+            parts.append(self.problem)
+        if self.systems is None:
+            parts.append("waiting for inventory auto-discovery")
+        if self.sources:
+            parts.append(" · ".join(f"{n} {name}" for name, n in self.sources))
+        if self.systems and self.runs != self.systems:
+            parts.append(f"{self.runs} runs: some hosts list several qna versions")
+        if self.unresolved_images:
+            parts.append(f"arches of {', '.join(self.unresolved_images)} not looked up yet")
+        if self.session:
+            parts.append(f"session relevance on the {SESSION_TARGET}")
+        return "; ".join(parts)
+
+
+def preview_targets(
+    form: TargetForm,
+    inventory: Sequence[Target],
+    image_arches: Mapping[str, Sequence[str]],
+    *,
+    qna_spec: str | None,
+    inventory_pending: bool,
+    client: bool = True,
+    session: bool = False,
+) -> TargetPreview:
+    """What Evaluate would target right now, by its own rules.
+
+    Builds the targets with ``build_targets``, so the count can't drift from
+    the run. ``client=False`` (session relevance only) needs no targets; with
+    ``session``, having none selected isn't a problem either (the run goes
+    ahead as session only), but a selected target with a bad field still is.
+    """
+    if not client:
+        return TargetPreview(systems=0, session=session)
+    if inventory_pending and waits_for_inventory(form, pending=True):
+        return TargetPreview(systems=None, session=session)
+    try:
+        targets = build_targets(form, inventory, image_arches)
+    except NoTargetsError as exc:
+        if session:
+            return TargetPreview(systems=0, session=True)
+        return TargetPreview(systems=0, problem=str(exc))
+    except TargetFormError as exc:
+        return TargetPreview(systems=0, problem=str(exc), session=session)
+
+    unresolved: tuple[str, ...] = ()
+    if form.container and AUTO_ARCH in form.container_arches:
+        unresolved = tuple(i for i in _images(form) if i not in image_arches)
+    # build_targets puts the inventory hosts last.
+    from_inventory = sum(1 for i in form.inventory_selected or [] if 0 <= i < len(inventory))
+    explicit = targets[: len(targets) - from_inventory]
+    sources = [("inventory", from_inventory)] + [
+        (kind, sum(1 for t in explicit if t.kind == kind)) for kind in ("local", "container", "ssh")
+    ]
+    return TargetPreview(
+        systems=len(targets),
+        exact=not unresolved,
+        runs=count_work(targets, qna_spec),
+        sources=tuple((name, n) for name, n in sources if n),
+        unresolved_images=unresolved,
+        session=session,
+    )
 
 
 # --- options -----------------------------------------------------------------------
@@ -636,6 +773,27 @@ class ResultRow:
         error = self.error or ("" if self.ok else self.status)
         return any(needle in text.casefold() for text in (*self.answers, error))
 
+    @functools.cached_property
+    def tally_keys(self) -> tuple[str, ...]:
+        """The answer-summary rows this result counts under, in answer order.
+
+        Cached: a pick tests every row on every render. (A frozen dataclass
+        still has a ``__dict__``, which is where ``cached_property`` stores it.)
+        """
+        return tuple(_row_keys(self))
+
+    @functools.cached_property
+    def _tally_key_set(self) -> frozenset[str]:
+        return frozenset(self.tally_keys)
+
+    def has_key(self, key: str) -> bool:
+        """Whether this result is counted under the answer-summary row ``key``.
+
+        Exact, unlike ``matches``: a pick shows exactly the systems its row
+        counted. Session results are never counted, so never match.
+        """
+        return self.dialect != "session" and key in self._tally_key_set
+
 
 # --- results view ---------------------------------------------------------------------
 
@@ -671,13 +829,17 @@ def order_results(rows: Sequence[ResultRow]) -> list[int]:
     return [i for _, indexes in sorted(groups.items(), key=host_key) for i in indexes]
 
 
-def visible_results(rows: Sequence[ResultRow], query: str) -> list[int]:
+def visible_results(rows: Sequence[ResultRow], query: str, pick: str | None = None) -> list[int]:
     """``order_results``, keeping only hosts with at least one matching result.
 
     A matching host keeps *all* its results, so a search shows each
-    computer's whole answer set rather than just the matching rows.
+    computer's whole answer set rather than just the matching rows. ``pick``
+    is an answer-summary row key; with it, a host also needs a result counted
+    under that row (see ``ResultRow.has_key``).
     """
     groups = {row.group for row in rows if row.matches(query)}
+    if pick is not None:
+        groups &= {row.group for row in rows if row.has_key(pick)}
     return [i for i in order_results(rows) if rows[i].group in groups]
 
 
@@ -716,7 +878,7 @@ def answers_preview(row: ResultRow, limit: int = PREVIEW_CHARS) -> str:
     return f"{text} (+{hidden} more)" if hidden else text
 
 
-Cells = dict[str, str | int | bool | None]
+Cells = dict[str, str | int | float | bool | None]
 """A results-table row. Scalars only: NiceGUI warns list cells can crash the browser."""
 
 
@@ -753,16 +915,19 @@ def _plural(n: int, word: str) -> str:
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
-def results_summary(rows: Sequence[ResultRow], shown: int, query: str) -> str:
-    """The line above the results table; says so when a search hides some of them."""
+def results_summary(
+    rows: Sequence[ResultRow], shown: int, query: str, pick: str | None = None
+) -> str:
+    """The line above the results table; says so when a search or a pick hides some."""
     if not rows:
         return ""
     needle = query.strip()
+    showing = f"Showing {shown} of {_plural(len(rows), 'result')}"
+    if pick is not None:
+        also = f' and an answer or error containing "{needle}"' if needle else ""
+        return f"{showing}: hosts {pick_phrase(pick)}{also}"
     if needle:
-        return (
-            f"Showing {shown} of {_plural(len(rows), 'result')}: "
-            f'hosts with an answer or error containing "{needle}"'
-        )
+        return f'{showing}: hosts with an answer or error containing "{needle}"'
     answered = sum(1 for r in rows if r.ok and r.answers)
     empty = sum(1 for r in rows if r.ok and not r.answers)
     errors = len(rows) - answered - empty
@@ -770,6 +935,126 @@ def results_summary(rows: Sequence[ResultRow], shown: int, query: str) -> str:
         f"{_plural(len(rows), 'result')}: {answered} with answers, {empty} empty, "
         f"{_plural(errors, 'error')}"
     )
+
+
+# --- answer summary -------------------------------------------------------------------
+
+TALLY_LIMIT = 50
+"""Most answer rows the summary shows; plural relevance on a fleet can have thousands."""
+
+ANSWER, EMPTY, ERROR = "answer", "empty", "error"
+_TALLY_KINDS = (ANSWER, EMPTY, ERROR)
+
+
+@dataclass(frozen=True)
+class TallyRow:
+    """One row of the answer summary: how many systems gave this answer."""
+
+    kind: str
+    """``"answer"``, ``"empty"`` (ok, no answers) or ``"error"``."""
+    value: str
+    """The answer; ``""`` for empty; the error kind (``ResultRow.status``) for errors."""
+    systems: int
+
+    @property
+    def key(self) -> str:
+        """Identifies the row in the table and as the results pick."""
+        return f"{self.kind}:{self.value}"
+
+    @property
+    def label(self) -> str:
+        if self.kind == EMPTY:
+            return NO_ANSWERS
+        if self.kind == ERROR:
+            # ResultRow.status is "error" itself when the result had no kind.
+            return "error" if self.value == ERROR else f"error: {self.value}"
+        return _shown(self.value)
+
+
+def _split_key(key: str) -> tuple[str, str]:
+    # The kind never contains ":", so an answer that does survives the split.
+    kind, _, value = key.partition(":")
+    return kind, value
+
+
+def pick_label(key: str) -> str:
+    """The summary-row label of a pick, e.g. for the chip saying what's picked."""
+    kind, value = _split_key(key)
+    return TallyRow(kind, value, 0).label
+
+
+def pick_phrase(key: str) -> str:
+    """How the results summary describes the hosts a pick keeps."""
+    kind, value = _split_key(key)
+    if kind == EMPTY:
+        return "with no answers"
+    if kind == ERROR:
+        return "with an error" if value == ERROR else f"with an error ({value})"
+    return f'answering "{_shown(value)}"'
+
+
+def _row_keys(row: ResultRow) -> list[str]:
+    if not row.ok:
+        return [TallyRow(ERROR, row.status, 0).key]
+    if not row.answers:
+        return [TallyRow(EMPTY, "", 0).key]
+    return [TallyRow(ANSWER, a, 0).key for a in dict.fromkeys(row.answers)]
+
+
+class AnswerTally:
+    """Distinct systems per answer, built as results stream in: one ``add`` per result.
+
+    A system is a ``display_host``, so a host listing several qna versions
+    counts once per answer, and one whose versions disagree counts under each.
+    Session results are left out: they come from one server, not a fleet.
+    """
+
+    def __init__(self) -> None:
+        # key -> display hosts, in arrival order (the last tie-break).
+        self._hosts: dict[str, dict[str, None]] = {}
+        self._systems: dict[str, None] = {}
+
+    def add(self, row: ResultRow) -> None:
+        if row.dialect == "session":
+            return
+        self._systems[row.display_host] = None
+        for key in row.tally_keys:
+            self._hosts.setdefault(key, {})[row.display_host] = None
+
+    @property
+    def systems(self) -> int:
+        return len(self._systems)
+
+    def rows(self, limit: int = TALLY_LIMIT) -> tuple[list[TallyRow], int]:
+        """(rows in display order, distinct answers left out by ``limit``).
+
+        Answers by systems, highest first, then text ignoring case, then
+        arrival; then no answers; then errors by kind. Empty and error rows
+        are never cut and always go last: they aren't answers.
+        """
+        arrival = {key: i for i, key in enumerate(self._hosts)}
+        by_kind: dict[str, list[TallyRow]] = {kind: [] for kind in _TALLY_KINDS}
+        for key, hosts in self._hosts.items():
+            kind, value = _split_key(key)
+            by_kind[kind].append(TallyRow(kind, value, len(hosts)))
+        for kind_rows in by_kind.values():
+            kind_rows.sort(key=lambda r: (-r.systems, r.value.casefold(), arrival[r.key]))
+        answers = by_kind[ANSWER]
+        return answers[:limit] + by_kind[EMPTY] + by_kind[ERROR], max(0, len(answers) - limit)
+
+
+def tally_table_row(row: TallyRow, total_systems: int, pick: str | None) -> Cells:
+    """The cells of one answer-summary row; ``share`` is of the systems in the run."""
+    share = row.systems / total_systems if total_systems else 0.0
+    return {
+        "key": row.key,
+        "kind": row.kind,
+        "label": row.label,
+        "systems": row.systems,
+        "share": share,
+        "percent": round(share * 100),
+        "picked": row.key == pick,
+    }
 
 
 # --- breakdown ------------------------------------------------------------------------

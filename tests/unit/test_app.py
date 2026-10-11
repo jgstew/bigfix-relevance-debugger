@@ -20,8 +20,10 @@ from nicegui.testing.user_download import UserDownload
 from nicegui.testing.user_simulation import user_simulation
 
 from bigfix_relevance_debugger import app as app_module
+from bigfix_relevance_debugger import evaluation
 from bigfix_relevance_debugger.app import Debouncer, build_parser, main
 from bigfix_relevance_debugger.evaluation import (
+    AnswerTally,
     InventoryLoad,
     LevelResult,
     ProbeView,
@@ -241,6 +243,19 @@ async def set_text(user, text: str) -> None:
     await asyncio.sleep(0.4)
 
 
+async def notified(user, text: str, timeout: float = 2.0) -> None:
+    """Wait for a notification containing ``text``.
+
+    Not should_see: the side panel's target count shows form problems too, so
+    that would pass before the click had done anything.
+    """
+    for _ in range(int(timeout / 0.05)):
+        if user.notify.contains(text):
+            return
+        await asyncio.sleep(0.05)
+    assert user.notify.contains(text), user.notify.messages
+
+
 async def test_page_renders(user):
     await user.open("/")
 
@@ -286,7 +301,7 @@ async def test_evaluate_without_targets_warns(user):
 
     user.find(marker="evaluate").click()
 
-    await user.should_see("Pick at least one target")
+    await notified(user, "Pick at least one target")
 
 
 async def test_evaluate_streams_result_rows(user, monkeypatch):
@@ -396,9 +411,11 @@ async def test_default_inventory_is_the_librarys_bigfix_remote_clients_toml(monk
 
     async with user_simulation(root=app_module.root) as user:
         await user.open("/")
-        [select] = user.find(marker="inventory").elements
-        assert list(select.options.values()) == ["shared-lab (ssh)"]
-        assert str(home / ".bigfix" / "remote_clients.toml") in select.props["label"]
+        await user.should_see(marker="inventory")
+        [row] = inventory_table(user).rows
+        assert (row["label"], row["kind"]) == ("shared-lab", "ssh")
+        title = hidden_element(user, "inventory-title").text
+        assert str(home / ".bigfix" / "remote_clients.toml") in title
 
 
 def test_inventory_flag_sets_path(captured_run, monkeypatch, tmp_path):
@@ -466,6 +483,23 @@ async def test_breakdown_shows_probe_error_message_inline(user, monkeypatch):
 def button(user, marker):
     [element] = user.find(marker=marker).elements
     return element
+
+
+def inventory_table(user):
+    return hidden_element(user, "inventory")
+
+
+def selected_ids(user) -> list[int]:
+    return sorted(r["id"] for r in inventory_table(user).selected)
+
+
+async def deselect(user, *ids: int) -> None:
+    """What unticking hosts in the inventory table sends."""
+    rows = [r for r in inventory_table(user).rows if r["id"] in ids]
+    user.find(marker="inventory").trigger(
+        "selection", {"rows": rows, "added": False, "keys": list(ids)}
+    )
+    await asyncio.sleep(0.05)
 
 
 async def test_buttons_reset_after_a_run_finishes(user, monkeypatch):
@@ -537,8 +571,8 @@ async def inventory_user(monkeypatch, tmp_path):
 async def test_inventory_targets_are_all_selected_by_default(inventory_user):
     await inventory_user.open("/")
 
-    [select] = inventory_user.find(marker="inventory").elements
-    assert select.value == [0, 1]
+    await inventory_user.should_see(marker="inventory")
+    assert selected_ids(inventory_user) == [0, 1]
 
 
 async def test_evaluate_defaults_to_every_inventory_target(inventory_user, monkeypatch):
@@ -607,11 +641,16 @@ async def test_breakdown_picks_the_target_matching_the_expressions_platform(monk
     assert seen["target"] is windows
 
 
-async def test_inventory_picker_is_clearable(inventory_user):
+async def test_inventory_can_select_none(inventory_user):
     await inventory_user.open("/")
+    await inventory_user.should_see(marker="inventory")
 
-    [select] = inventory_user.find(marker="inventory").elements
-    assert select.props.get("clearable") is True
+    await deselect(inventory_user, 0, 1)
+
+    assert selected_ids(inventory_user) == []
+    await count_reads(inventory_user, "0 systems")
+    inventory_user.find(marker="evaluate").click()
+    await notified(inventory_user, "Pick at least one target")
 
 
 async def test_container_auto_arch_evaluates_every_published_arch(user, monkeypatch):
@@ -663,8 +702,7 @@ async def test_no_inventory_runs_discovery_and_selects_what_it_found(monkeypatch
     async with user_simulation(root=app_module.root) as user:
         await user.open("/")
         await user.should_see(marker="inventory")
-        [select] = user.find(marker="inventory").elements
-        assert select.value == [0, 1]
+        assert selected_ids(user) == [0, 1]
 
 
 async def test_discovery_progress_shows_while_it_runs(monkeypatch):
@@ -1569,7 +1607,7 @@ async def test_both_with_a_bad_target_field_warns_and_runs_nothing(user, monkeyp
 
     user.find(marker="evaluate").click()
 
-    await user.should_see("SSH target needs a host")
+    await notified(user, "SSH target needs a host")
     await asyncio.sleep(0.1)
     assert streamed == []
     assert calls == []
@@ -1694,3 +1732,785 @@ async def test_clear_removes_session_results_too(user, monkeypatch):
     assert hidden_element(user, "results").rows == []
     [export] = user.find(marker="export").elements
     assert not export.enabled
+
+
+# --- answer summary (issue 8) ---------------------------------------------------------------
+
+# Two systems agree, one differs, one answers nothing, one fails.
+SUMMARY_FLEET = (
+    result("deb", ["Linux Debian 11"]),
+    result("deb2", ["Linux Debian 11"]),
+    result("rh", ["Linux Red Hat 9"]),
+    result("empty"),
+    result("down", error="Permission denied (publickey)", error_kind="transport"),
+)
+
+
+def answers_table(user):
+    # Looked up among all elements: the summary is hidden for fewer than 2 systems.
+    return hidden_element(user, "answers")
+
+
+def answer_rows(user) -> list[tuple[str, int]]:
+    return [(r["label"], r["systems"]) for r in answers_table(user).rows]
+
+
+async def evaluated_summary_fleet(user, monkeypatch, *results):
+    results = results or SUMMARY_FLEET
+    await evaluate_with(user, monkeypatch, stream_of(*results))
+    await user.should_see(f"{len(results)} / {len(results)}")
+    await asyncio.sleep(0.1)
+
+
+async def test_sections_go_breakdown_then_answers_then_results(user, monkeypatch):
+    monkeypatch.setattr(app_module, "run_breakdown", counting_breakdown())
+    await evaluated_summary_fleet(user, monkeypatch)
+    user.find(marker="breakdown").click()
+    await user.should_see(marker="breakdown-level")
+
+    breakdown_at, answers_at, results_at = section_order(
+        user, "breakdown-section", "answers-section", "results-section"
+    )
+    assert breakdown_at < answers_at < results_at
+
+
+async def test_answer_summary_counts_systems_per_answer_highest_first(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch)
+
+    await user.should_see(marker="answers")
+    assert answer_rows(user) == [
+        ("Linux Debian 11", 2),
+        ("Linux Red Hat 9", 1),
+        ("(no answers)", 1),
+        ("error: transport", 1),
+    ]
+    assert [r["percent"] for r in answers_table(user).rows] == [40, 20, 20, 20]
+
+
+async def test_answer_summary_title_counts_systems(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch)
+
+    [title] = user.find(marker="answers-title").elements
+    assert "5 systems" in title.text
+
+
+async def test_answer_summary_hidden_for_a_single_system(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, result("solo", ["a", "b", "c"]))
+
+    await user.should_see(marker="results")
+    await user.should_not_see(marker="answers-section")
+    assert not hidden_element(user, "answers-section").visible
+
+
+async def test_answer_summary_hidden_before_any_run(user):
+    await user.open("/")
+
+    await user.should_not_see(marker="answers-section")
+    assert not hidden_element(user, "answers-section").visible
+
+
+async def test_answer_summary_updates_as_results_stream(user, monkeypatch):
+    gate = asyncio.Event()
+    stream = stream_of(
+        result("a", ["x"]), result("b", ["x"]), result("c", ["x"]), gate=gate, after=2
+    )
+    await evaluate_with(user, monkeypatch, stream)
+    await user.should_see("2 / 3")
+    assert answer_rows(user) == [("x", 2)]
+
+    gate.set()
+
+    await user.should_see("3 / 3")
+    assert answer_rows(user) == [("x", 3)]
+
+
+async def test_answer_summary_ignores_the_filter(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch)
+    before = answer_rows(user)
+
+    await search(user, "debian")
+
+    assert result_hosts(user) == ["deb", "deb2"]
+    assert answer_rows(user) == before
+
+
+async def test_answer_summary_says_how_many_more(user, monkeypatch):
+    many = [f"file{i:02}" for i in range(60)]
+    await evaluated_summary_fleet(user, monkeypatch, result("a", many), result("b", many[:5]))
+
+    assert len(answer_rows(user)) == app_module.TALLY_LIMIT
+    [more] = user.find(marker="answers-more").elements
+    assert more.text.startswith("+10 more distinct answers")
+
+
+async def test_answer_summary_more_caption_hidden_when_everything_fits(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch)
+
+    await user.should_not_see(marker="answers-more")
+    assert not hidden_element(user, "answers-more").visible
+
+
+async def test_answer_summary_is_not_rendered_as_html(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, result("a", ["<b>x</b>"]), result("b"))
+
+    slots = "".join(str(s.template) for s in answers_table(user).slots.values() if s.template)
+    assert "v-html" not in slots
+    assert answer_rows(user)[0] == ("<b>x</b>", 1)
+
+
+async def test_clear_removes_the_answer_summary(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch)
+
+    user.find(marker="clear").click()
+
+    await user.should_not_see(marker="answers-section")
+    assert answers_table(user).rows == []
+
+
+async def test_answer_summary_ignores_session_results(user, monkeypatch):
+    monkeypatch.setattr(app_module, "evaluate_session", fake_session([]))
+    monkeypatch.setattr(
+        app_module, "stream_results", stream_of(result("a", ["x"]), result("b", ["y"]))
+    )
+    monkeypatch.setattr(app_module, "total_work", lambda targets, opts: 2)
+    await user.open("/")
+    await set_text(user, "now")
+    user.find(marker="target-local").click()
+
+    user.find(marker="evaluate").click()
+
+    await user.should_see("3 / 3")
+    assert answer_rows(user) == [("x", 1), ("y", 1)]
+    [title] = user.find(marker="answers-title").elements
+    assert "2 systems" in title.text
+
+
+async def test_each_result_is_tallied_once(user, monkeypatch):
+    calls: list[str] = []
+    real = AnswerTally.add
+
+    def counting(self, row):
+        calls.append(row.host)
+        real(self, row)
+
+    monkeypatch.setattr(AnswerTally, "add", counting)
+    await evaluated_summary_fleet(user, monkeypatch)
+    await search(user, "debian")
+    await clear_search(user)
+
+    assert sorted(calls) == sorted(r.host for r in SUMMARY_FLEET)
+
+
+# --- drill-down from the answer summary (issue 8) --------------------------------------------
+
+# "multi" lists two qna versions: one answers like deb, the other answers nothing.
+PICK_FLEET = (
+    result("deb", ["Linux Debian 11"], qna_version="a"),
+    result("rh", ["Linux Red Hat 9"], qna_version="a"),
+    result("multi", ["Linux Debian 11"], qna_version="a"),
+    result("multi", [], qna_version="b"),
+    result("down", error="Permission denied (publickey)", error_kind="transport"),
+)
+
+
+async def pick(user, label):
+    [row] = [r for r in answers_table(user).rows if r["label"] == label]
+    user.find(marker="answers").trigger("pick", row["key"])
+    await asyncio.sleep(0.1)
+
+
+def pick_chip(user):
+    return hidden_element(user, "results-pick")
+
+
+def summary_text(user) -> str:
+    [label] = user.find(marker="results-summary").elements
+    return label.text
+
+
+async def test_clicking_an_answer_shows_only_systems_with_it(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+
+    await pick(user, "Linux Debian 11")
+
+    # multi keeps both its rows, the one without the answer too.
+    assert result_hosts(user) == ["deb", "multi", "multi"]
+    await user.should_see(marker="results-pick")
+    assert "Linux Debian 11" in pick_chip(user).text
+
+
+async def test_picked_summary_row_is_marked(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+
+    await pick(user, "Linux Debian 11")
+
+    assert [r["label"] for r in answers_table(user).rows if r["picked"]] == ["Linux Debian 11"]
+
+
+async def test_clicking_the_picked_answer_again_removes_the_pick(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+    await pick(user, "Linux Debian 11")
+    await user.should_see(marker="results-pick")
+
+    await pick(user, "Linux Debian 11")
+
+    assert sorted(set(result_hosts(user))) == ["deb", "down", "multi", "rh"]
+    await user.should_not_see(marker="results-pick")
+    assert not any(r["picked"] for r in answers_table(user).rows)
+
+
+async def test_removing_the_pick_chip_shows_everything(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+    await pick(user, "Linux Debian 11")
+
+    pick_chip(user).set_value(False)  # what its ✕ does
+    await asyncio.sleep(0.1)
+
+    assert len(result_hosts(user)) == len(PICK_FLEET)
+    await user.should_not_see(marker="results-pick")
+
+
+async def test_a_new_pick_after_removing_the_chip_shows_the_chip_again(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+    await pick(user, "Linux Debian 11")
+    pick_chip(user).set_value(False)
+    await asyncio.sleep(0.1)
+
+    await pick(user, "Linux Red Hat 9")
+
+    await user.should_see(marker="results-pick")
+    assert result_hosts(user) == ["rh"]
+
+
+async def test_pick_no_answers_and_error_rows(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+
+    await pick(user, "(no answers)")
+    assert result_hosts(user) == ["multi", "multi"]
+
+    await pick(user, "error: transport")
+    assert result_hosts(user) == ["down"]
+
+
+async def test_pick_and_filter_combine(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+    await pick(user, "(no answers)")
+
+    await search(user, "debian")
+    assert result_hosts(user) == ["multi", "multi"]
+
+    await search(user, "red hat")
+    assert result_hosts(user) == []
+
+
+async def test_pick_summary_line(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+
+    await pick(user, "Linux Debian 11")
+
+    assert summary_text(user) == 'Showing 3 of 5 results: hosts answering "Linux Debian 11"'
+
+
+async def test_pick_does_not_auto_expand(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+
+    await pick(user, "Linux Debian 11")
+
+    assert result_hosts(user) == ["deb", "multi", "multi"]
+    assert results_table(user).props["expanded"] == []
+
+
+async def test_pick_keeps_what_the_user_expanded(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+    [rh] = [r for r in results_table(user).rows if r["host"] == "rh"]
+    user.find(marker="results").trigger("update:expanded", [rh["id"]])
+
+    await pick(user, "Linux Debian 11")
+    assert "rh" not in result_hosts(user)
+    await pick(user, "Linux Debian 11")
+
+    assert results_table(user).props["expanded"] == [rh["id"]]
+
+
+async def rerun(user, monkeypatch, *results):
+    monkeypatch.setattr(app_module, "stream_results", stream_of(*results))
+    monkeypatch.setattr(app_module, "total_work", lambda targets, opts: len(results))
+    user.find(marker="evaluate").click()
+    await user.should_see(f"{len(results)} / {len(results)}")
+    await asyncio.sleep(0.1)
+
+
+async def test_pick_survives_evaluate(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+    await pick(user, "Linux Debian 11")
+
+    await rerun(user, monkeypatch, *PICK_FLEET)
+
+    assert result_hosts(user) == ["deb", "multi", "multi"]
+    await user.should_see(marker="results-pick")
+
+
+async def test_pick_with_no_matching_host_after_a_rerun_says_so(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+    await pick(user, "Linux Debian 11")
+
+    await rerun(user, monkeypatch, result("a", ["Windows 11"]), result("b", ["Windows 11"]))
+
+    assert result_hosts(user) == []
+    assert summary_text(user).startswith("Showing 0 of 2 results")
+    await user.should_see(marker="results-pick")
+
+
+async def test_clear_removes_the_pick(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+    await pick(user, "Linux Debian 11")
+    assert pick_chip(user).visible
+
+    user.find(marker="clear").click()
+    await rerun(user, monkeypatch, *PICK_FLEET)
+
+    assert len(result_hosts(user)) == len(PICK_FLEET)
+    await user.should_not_see(marker="results-pick")
+
+
+async def test_export_ignores_the_pick(user, monkeypatch):
+    exported: list[str] = []
+    monkeypatch.setattr(
+        UserDownload, "content", lambda self, payload, *a, **k: exported.append(payload)
+    )
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+    await pick(user, "error: transport")
+    assert result_hosts(user) == ["down"]
+
+    user.find(marker="export").click()
+
+    [payload] = exported
+    assert len(json.loads(payload)) == len(PICK_FLEET)
+
+
+# --- side panel and target count (issue 8) ------------------------------------------------
+
+
+def side_panel(user):
+    return hidden_element(user, "side-panel")
+
+
+def toggle(user):
+    return hidden_element(user, "targets-toggle")
+
+
+async def count_reads(user, text: str, timeout: float = 2.0) -> None:
+    """Wait for the header count to read ``text`` (inventory loads in the background).
+
+    Read from the button, not with should_see, which also matches tooltip text.
+    """
+    for _ in range(int(timeout / 0.05)):
+        if toggle(user).text == text:
+            return
+        await asyncio.sleep(0.05)
+    assert toggle(user).text == text
+
+
+async def test_side_panel_is_collapsed_by_default(inventory_user):
+    await inventory_user.open("/")
+    await count_reads(inventory_user, "2 systems")
+
+    assert side_panel(inventory_user).value is False
+
+
+async def test_toggle_opens_and_closes_the_side_panel(inventory_user):
+    await inventory_user.open("/")
+    await count_reads(inventory_user, "2 systems")
+
+    inventory_user.find(marker="targets-toggle").click()
+    assert side_panel(inventory_user).value is True
+
+    inventory_user.find(marker="targets-toggle").click()
+    assert side_panel(inventory_user).value is False
+
+
+async def test_header_shows_how_many_systems_will_be_targeted(inventory_user):
+    await inventory_user.open("/")
+
+    await count_reads(inventory_user, "2 systems")
+    assert toggle(inventory_user).props["icon"] == "dns"
+    assert "2 inventory" in hidden_element(inventory_user, "targets-tooltip").text
+
+
+async def test_open_panel_shows_the_same_count(inventory_user):
+    await inventory_user.open("/")
+    await count_reads(inventory_user, "2 systems")
+
+    text = hidden_element(inventory_user, "target-count").text
+    assert "2 systems" in text
+    assert "2 inventory" in text
+
+
+async def test_target_count_updates_when_a_target_is_ticked(inventory_user):
+    await inventory_user.open("/")
+    await count_reads(inventory_user, "2 systems")
+
+    inventory_user.find(marker="target-local").click()
+
+    await count_reads(inventory_user, "3 systems")
+
+
+def fake_arches(calls: list[str] | None = None, *, fail: bool = False):
+    """A resolve_container_arches that, like the real one, asks only about unknown images."""
+
+    async def resolve(form, *, known=None, **kwargs):
+        if fail:
+            raise RuntimeError("engine went away")
+        known = known or {}
+        images = [i.strip() for i in form.container_images.split(",") if i.strip()]
+        if calls is not None:
+            calls.extend(i for i in images if i not in known)
+        return {image: list(known.get(image, ["x86_64", "arm64"])) for image in images}
+
+    return resolve
+
+
+async def after_arch_lookup() -> None:
+    await asyncio.sleep(app_module.ARCH_LOOKUP_DEBOUNCE_S + 0.2)
+
+
+async def test_target_count_with_auto_arch_is_looked_up_in_the_background(user, monkeypatch):
+    monkeypatch.setattr(app_module, "resolve_container_arches", fake_arches())
+    await user.open("/")
+    await count_reads(user, "0 systems")
+
+    user.find(marker="target-container").click()
+
+    await count_reads(user, "≥ 1 system")
+    await after_arch_lookup()
+    await count_reads(user, "2 systems")
+
+
+async def test_arch_lookup_runs_once_per_image(user, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(app_module, "resolve_container_arches", fake_arches(calls))
+    await user.open("/")
+    user.find(marker="target-container").click()
+    await after_arch_lookup()
+
+    user.find(marker="target-local").click()
+    user.find(marker="target-local").click()
+    await after_arch_lookup()
+    assert calls == ["debian:11"]
+
+    button(user, "container-images").set_value("ubuntu:24.04")
+    await after_arch_lookup()
+
+    assert calls == ["debian:11", "ubuntu:24.04"]
+    await count_reads(user, "2 systems")
+
+
+async def test_arch_lookup_failure_keeps_the_lower_bound(user, monkeypatch):
+    monkeypatch.setattr(app_module, "resolve_container_arches", fake_arches(fail=True))
+    await user.open("/")
+
+    user.find(marker="target-container").click()
+    await after_arch_lookup()
+
+    await count_reads(user, "≥ 1 system")
+
+
+async def test_evaluate_fills_the_arch_cache(user, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(app_module, "resolve_container_arches", fake_arches(calls))
+    monkeypatch.setattr(app_module, "stream_results", stream_of(result("a"), result("b")))
+    await user.open("/")
+    await set_text(user, "name of operating system")
+    user.find(marker="target-container").click()
+
+    user.find(marker="evaluate").click()  # before the background lookup's debounce
+    await user.should_see("2 / 2")
+    await after_arch_lookup()
+
+    assert calls == ["debian:11"]
+    await count_reads(user, "2 systems")
+
+
+async def test_target_count_while_discovering_says_so(monkeypatch, tmp_path):
+    release = threading.Event()
+    written = tmp_path / "remote_clients.toml"
+
+    def slow_discovery():
+        release.wait(5)
+        return written
+
+    monkeypatch.setattr(app_module, "_inventory_path", None)
+    monkeypatch.setattr(app_module, "find_inventory_path", lambda: None)
+    monkeypatch.setattr(app_module, "find_or_discover_inventory", slow_discovery)
+    monkeypatch.setattr(
+        app_module,
+        "load_inventory_targets",
+        lambda path: InventoryLoad(path=path, targets=list(TWO_HOSTS), error=None),
+    )
+
+    async with user_simulation(root=app_module.root) as user:
+        await user.open("/")
+        try:
+            await count_reads(user, "finding inventory …")
+        finally:
+            release.set()
+        await count_reads(user, "2 systems")
+        assert side_panel(user).value is False
+
+
+async def test_panel_opens_itself_when_there_is_nothing_to_target(user):
+    await user.open("/")
+
+    await count_reads(user, "0 systems")
+    assert side_panel(user).value is True
+    assert toggle(user).props["icon"] == "warning"
+    assert "Pick at least one target." in hidden_element(user, "target-count").text
+
+
+async def test_panel_opens_itself_after_an_inventory_error(no_inventory, monkeypatch, tmp_path):
+    bad = tmp_path / "remote_clients.toml"
+    bad.write_text("= nope", encoding="utf-8")
+    monkeypatch.setattr(app_module, "find_inventory_path", lambda: bad)
+
+    async with user_simulation(root=app_module.root) as user:
+        await user.open("/")
+        await user.should_see(marker="inventory-error")
+        await count_reads(user, "0 systems")
+        assert side_panel(user).value is True
+
+
+async def test_evaluate_with_no_targets_opens_the_panel(user):
+    await user.open("/")
+    await count_reads(user, "0 systems")
+    user.find(marker="targets-toggle").click()
+    assert side_panel(user).value is False
+
+    user.find(marker="evaluate").click()
+
+    await notified(user, "Pick at least one target")
+    assert side_panel(user).value is True
+
+
+async def test_session_only_count_says_bigfix_server(user):
+    await user.open("/")
+
+    await set_text(user, "number of bes computers")
+
+    await count_reads(user, "BigFix server")
+    assert toggle(user).props["icon"] == "dns"
+
+
+async def test_main_column_is_full_width(user):
+    await user.open("/")
+
+    results_section = hidden_element(user, "results-section")
+    assert "w-full" in results_section.parent_slot.parent.classes
+    assert not [e for e in user.client.elements.values() if "w-2/3" in e.classes]
+
+
+# --- inventory table (issue 8) --------------------------------------------------------------
+
+
+async def inventory_page(monkeypatch, tmp_path, targets):
+    monkeypatch.setattr(app_module, "_inventory_path", tmp_path / "remote_clients.toml")
+    monkeypatch.setattr(
+        app_module,
+        "load_inventory_targets",
+        lambda path: InventoryLoad(path=path, targets=list(targets), error=None),
+    )
+
+
+async def test_inventory_table_shows_kind_platform_and_qna(monkeypatch, tmp_path):
+    await inventory_page(
+        monkeypatch,
+        tmp_path,
+        [
+            Target(kind="container", name="deb", image="debian:11", qna_version=["1.0", "2.0"]),
+            Target(kind="ssh", name="lab-box"),
+        ],
+    )
+
+    async with user_simulation(root=app_module.root) as user:
+        await user.open("/")
+        await user.should_see(marker="inventory")
+
+        deb, box = inventory_table(user).rows
+        assert (deb["kind"], deb["platform"], deb["qna"]) == ("container", "debian", "1.0, 2.0")
+        assert (box["label"], box["platform"], box["qna"]) == ("lab-box", "?", "")
+
+
+async def test_deselected_inventory_host_is_not_evaluated(inventory_user, monkeypatch):
+    seen: dict = {}
+
+    async def fake_stream(text, targets, opts, **upstream):
+        seen["targets"] = targets
+        yield ClientRelevanceResult(host="lab-a", transport="ssh", client_relevance=text)
+
+    monkeypatch.setattr(app_module, "stream_results", fake_stream)
+    await inventory_user.open("/")
+    await inventory_user.should_see(marker="inventory")
+    await set_text(inventory_user, "name of operating system")
+
+    await deselect(inventory_user, 1)
+    inventory_user.find(marker="evaluate").click()
+
+    await inventory_user.should_see("1 / 1")
+    assert seen["targets"] == [TWO_HOSTS[0]]
+
+
+async def test_inventory_selection_updates_the_count_and_caption(inventory_user):
+    await inventory_user.open("/")
+    await inventory_user.should_see(marker="inventory")
+    assert hidden_element(inventory_user, "inventory-count").text == "2 of 2 selected"
+
+    await deselect(inventory_user, 1)
+
+    assert hidden_element(inventory_user, "inventory-count").text == "1 of 2 selected"
+    await count_reads(inventory_user, "1 system")
+
+
+async def test_inventory_filter_only_with_many_hosts(inventory_user):
+    await inventory_user.open("/")
+    await inventory_user.should_see(marker="inventory")
+
+    assert not [
+        e for e in inventory_user.client.elements.values() if "inventory-filter" in e._markers
+    ]
+
+
+async def test_inventory_filter_with_many_hosts_filters_the_table(monkeypatch, tmp_path):
+    hosts = [Target(kind="ssh", name=f"lab-{i}") for i in range(9)]
+    await inventory_page(monkeypatch, tmp_path, hosts)
+
+    async with user_simulation(root=app_module.root) as user:
+        await user.open("/")
+        await user.should_see(marker="inventory-filter")
+
+        user.find(marker="inventory-filter").type("lab-3")
+        await asyncio.sleep(0.05)
+
+        assert inventory_table(user).props["filter"] == "lab-3"
+
+
+# --- PR #12 review ----------------------------------------------------------------------------
+
+
+class RecordingImages:
+    """A container engine for the real resolve_container_arches: records what it's asked."""
+
+    def __init__(self, published: dict[str, set[str]]) -> None:
+        self.published = published
+        self.asked: list[str] = []
+
+    def local_tags(self):
+        return []
+
+    def platforms(self, image):
+        self.asked.append(image)
+        return self.published.get(image)
+
+
+def fake_engine(monkeypatch) -> RecordingImages:
+    images = RecordingImages({"debian:11": {"x86_64", "arm64"}, "ubuntu:24.04": {"arm64"}})
+    monkeypatch.setattr(evaluation, "default_image_source", lambda: images)
+    return images
+
+
+async def test_refreshes_do_not_restart_an_arch_lookup_in_flight(user, monkeypatch):
+    gate = asyncio.Event()
+    calls: list[str] = []
+
+    async def slow_registry(form, **kwargs):
+        calls.append(form.container_images)
+        await gate.wait()
+        return {"debian:11": ["x86_64", "arm64"]}
+
+    monkeypatch.setattr(app_module, "resolve_container_arches", slow_registry)
+    await user.open("/")
+    user.find(marker="target-container").click()
+    await after_arch_lookup()
+    assert calls == ["debian:11"]  # started, waiting on the registry
+
+    # Typing and ticking refresh the count; none of that may restart the lookup.
+    for _ in range(3):
+        user.find(marker="target-local").click()
+        await asyncio.sleep(0.1)
+    await set_text(user, "name of operating system")
+    await after_arch_lookup()
+    gate.set()
+    await asyncio.sleep(0.1)
+
+    assert calls == ["debian:11"]
+    await count_reads(user, "3 systems")
+
+
+async def test_arch_lookup_asks_only_for_added_images(user, monkeypatch):
+    images = fake_engine(monkeypatch)
+    await user.open("/")
+    user.find(marker="target-container").click()
+    await after_arch_lookup()
+    await count_reads(user, "2 systems")
+
+    button(user, "container-images").set_value("debian:11, ubuntu:24.04")
+    await after_arch_lookup()
+
+    assert images.asked == ["debian:11", "ubuntu:24.04"]
+    await count_reads(user, "3 systems")
+
+
+async def test_evaluate_reuses_the_arches_the_count_looked_up(user, monkeypatch):
+    images = fake_engine(monkeypatch)
+    monkeypatch.setattr(app_module, "stream_results", stream_of(result("a"), result("b")))
+    await user.open("/")
+    await set_text(user, "name of operating system")
+    user.find(marker="target-container").click()
+    await after_arch_lookup()
+    await count_reads(user, "2 systems")
+
+    user.find(marker="evaluate").click()
+    await user.should_see("2 / 2")
+
+    assert images.asked == ["debian:11"]
+
+
+async def test_arch_lookup_failure_is_shown_and_not_retried_on_every_change(user, monkeypatch):
+    calls: list[int] = []
+
+    async def broken(form, **kwargs):
+        calls.append(1)
+        raise RuntimeError("engine went away")
+
+    monkeypatch.setattr(app_module, "resolve_container_arches", broken)
+    await user.open("/")
+    user.find(marker="target-container").click()
+    await after_arch_lookup()
+
+    user.find(marker="target-local").click()
+    user.find(marker="target-local").click()
+    await after_arch_lookup()
+
+    assert calls == [1]
+    await user.should_see("engine went away")  # in the activity log
+    await count_reads(user, "≥ 1 system")
+
+
+async def test_answer_summary_is_rebuilt_only_when_it_changes(user, monkeypatch):
+    calls: list[int] = []
+    real = AnswerTally.rows
+
+    def counting(self, limit=app_module.TALLY_LIMIT):
+        calls.append(1)
+        return real(self, limit)
+
+    monkeypatch.setattr(AnswerTally, "rows", counting)
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+    calls.clear()
+
+    await search(user, "debian")
+    await clear_search(user)
+    [row] = [r for r in results_table(user).rows if r["host"] == "rh"]
+    user.find(marker="results").trigger("update:expanded", [row["id"]])
+    assert calls == []
+
+    await pick(user, "Linux Debian 11")  # the picked row's highlight changes
+    assert len(calls) == 1
