@@ -86,7 +86,7 @@ FILTER_DEBOUNCE_S = 0.2
 """Each filter change resends the results table, so wait for typing to pause."""
 ARCH_LOOKUP_DEBOUNCE_S = 0.5
 """The target count looks up an ``auto`` arch once typing in the image field pauses."""
-SIDE_PANEL_WIDTH = 420
+SIDE_PANEL_WIDTH = 460
 INVENTORY_FILTER_MIN = 9
 """Hosts it takes for the inventory table to get a filter box."""
 
@@ -119,6 +119,8 @@ body.body--dark { background: #121212; }
 .bfrd-warning { text-decoration: wavy underline orange; }
 .bfrd-level { background: rgba(255, 213, 79, .55); border-radius: 2px; }
 .bfrd-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+/* Translucent, so the picked answer reads in light and dark mode alike. */
+.bfrd-picked { background: rgba(25, 118, 210, .22); font-weight: bold; }
 """
 
 _OUTCOME_COLOURS = {
@@ -212,7 +214,7 @@ _ANSWER_COLUMNS = [
 # Answers come from the endpoint: interpolate ({{ }}), never v-html.
 _ANSWERS_BODY_SLOT = r"""
 <q-tr :props="props" class="cursor-pointer"
-      :class="[props.row.picked ? 'bg-blue-1 text-bold' : '',
+      :class="[props.row.picked ? 'bfrd-picked' : '',
                props.row.kind === 'error' ? 'text-negative' : '',
                props.row.kind === 'empty' ? 'opacity-70' : '']"
       @click="() => $parent.$emit('pick', props.row.key)">
@@ -228,10 +230,10 @@ _ANSWERS_BODY_SLOT = r"""
 </q-tr>
 """
 
+# Three columns fit the side panel; kind and platform share one.
 _INVENTORY_COLUMNS = [
     {"name": "label", "label": "Target", "field": "label", "align": "left", "sortable": True},
-    {"name": "kind", "label": "Kind", "field": "kind", "align": "left", "sortable": True},
-    {"name": "platform", "label": "Platform", "field": "platform", "align": "left"},
+    {"name": "about", "label": "Kind · platform", "field": "about", "align": "left"},
     {"name": "qna", "label": "qna", "field": "qna", "align": "left"},
 ]
 
@@ -1027,7 +1029,8 @@ async def root() -> None:
         )
         table = (
             ui.table(rows=rows, columns=_INVENTORY_COLUMNS, row_key="id", selection="multiple")
-            .props("dense flat")
+            # The panel is narrow: wrap long targets. inventory-count says what's selected.
+            .props("dense flat wrap-cells hide-bottom")
             .classes("w-full")
             .mark("inventory")
         )

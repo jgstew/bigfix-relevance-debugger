@@ -288,11 +288,13 @@ def load_inventory_targets(path: Path | None) -> InventoryLoad:
 def inventory_table_row(key: int, target: Target) -> Cells:
     """One row of the inventory picker: enough to tell hosts apart before ticking them."""
     version = target.qna_version
+    platform = target_platform(target) or "?"
     return {
         "id": key,
         "label": target.label,
         "kind": target.kind,
-        "platform": target_platform(target) or "?",
+        "platform": platform,
+        "about": f"{target.kind} · {platform}",
         "qna": version if isinstance(version, str) else ", ".join(version or ()),
     }
 

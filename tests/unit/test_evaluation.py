@@ -1782,6 +1782,7 @@ def test_inventory_table_row():
         "label": "container:debian:11@x86_64",
         "kind": "container",
         "platform": "debian",
+        "about": "container · debian",
         "qna": "1.0, 2.0",
     }
     assert inventory_table_row(1, Target(kind="ssh", name="box"))["platform"] == "?"
