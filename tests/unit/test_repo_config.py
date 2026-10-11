@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 import re
 import tomllib
 from pathlib import Path
@@ -29,3 +30,45 @@ def test_pre_commit_ruff_matches_the_locked_ruff():
     # ruff-pre-commit hook; both gate a release, so a formatting difference
     # between two ruff versions would fail one of them whatever the code says.
     assert pre_commit_rev_version("astral-sh/ruff-pre-commit") == locked_version("ruff")
+
+
+# jgstew's own libraries: this app is developed alongside them and often
+# needs a release the day it ships, so they skip the cooldown.
+JGSTEW_PACKAGES = {"besapi", "bigfix-relevance-analyzer", "bigfix-remote-client-relevance"}
+
+
+def uv_settings() -> dict:
+    return tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["tool"]["uv"]
+
+
+def test_dependencies_have_a_seven_day_cooldown():
+    assert uv_settings()["exclude-newer"] == "7 days"
+
+
+# Temporary exemptions, each until its pinned floor is 7 days old: the
+# cooldown came in after these floors were raised to releases from that week.
+# Remove the entry (here and in pyproject.toml) once its date has passed.
+TEMPORARY = {
+    "nicegui": datetime.date(2026, 10, 14),  # nicegui[native]>=3.18.0, out 2026-10-07
+    "ruff": datetime.date(2026, 10, 16),  # ruff>=0.17.0, out 2026-10-09
+}
+
+
+def test_jgstew_packages_and_only_they_skip_the_cooldown():
+    exempt = uv_settings()["exclude-newer-package"]
+    assert exempt == dict.fromkeys(JGSTEW_PACKAGES | set(TEMPORARY), "0 days")
+
+
+def test_no_temporary_exemption_outlives_its_date():
+    expired = sorted(name for name, until in TEMPORARY.items() if datetime.date.today() > until)
+    assert not expired, (
+        f"cooldown exemptions past their date: {expired}; remove them from "
+        "exclude-newer-package in pyproject.toml and from TEMPORARY here, then `uv lock`"
+    )
+
+
+def test_every_jgstew_package_is_a_dependency():
+    # a library dropped from the dependencies shouldn't keep its exemption
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    names = {re.split(r"[\[<>=!~; ]", d, maxsplit=1)[0] for d in project["dependencies"]}
+    assert names >= JGSTEW_PACKAGES

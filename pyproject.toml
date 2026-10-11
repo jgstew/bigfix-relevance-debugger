@@ -59,6 +59,21 @@ packages = ["src/bigfix_relevance_debugger"]
 
 [tool.uv]
 python-preference = "managed"
+# Delay dependency resolution by 7 days so newly published (possibly broken
+# or compromised) releases aren't picked up immediately. This governs uv.lock
+# (development and CI); `uvx bigfix-relevance-debugger` users resolve fresh
+# within the lower bounds in [project] dependencies.
+exclude-newer = "7 days"
+# jgstew's own libraries are exempt: this app is developed alongside them and
+# often needs a release the day it ships. "0 days" means no delay; unlike a
+# fixed date it never goes stale.
+# nicegui and ruff are exempt only until their floors here are 7 days old
+# (nicegui 3.18.0 on 2026-10-14, ruff 0.17.0 on 2026-10-16); remove them then.
+# tests/unit/test_repo_config.py keeps this list in step and fails once a
+# temporary entry is past its date.
+exclude-newer-package = { besapi = "0 days", bigfix-relevance-analyzer = "0 days", bigfix-remote-client-relevance = "0 days", nicegui = "0 days", ruff = "0 days" }
+# relative `exclude-newer` durations need a recent uv
+required-version = ">=0.12"
 
 # --- Tooling ---------------------------------------------------------------
 
