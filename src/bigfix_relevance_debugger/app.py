@@ -31,7 +31,15 @@ from nicegui import ui
 from nicegui.events import GenericEventArguments, ValueChangeEventArguments
 
 from bigfix_relevance_debugger import __version__
-from bigfix_relevance_debugger.analysis import AnalysisView, editor_decorations, summarize
+from bigfix_relevance_debugger.analysis import (
+    AUTO,
+    CLIENT,
+    DIALECT_MODES,
+    SESSION,
+    AnalysisView,
+    editor_decorations,
+    summarize,
+)
 from bigfix_relevance_debugger.evaluation import (
     ARCHES,
     AUTO_ARCH,
@@ -39,17 +47,22 @@ from bigfix_relevance_debugger.evaluation import (
     EvalOptions,
     InventoryLoad,
     LevelResult,
+    NoTargetsError,
     ResultRow,
+    SessionEvaluation,
     TargetForm,
     breakdown_qna_note,
     build_targets,
     choose_breakdown_target,
+    evaluate_session,
     load_inventory_targets,
     resolve_container_arches,
     results_row_details,
     results_summary,
     results_table_row,
     run_breakdown,
+    session_result_to_dict,
+    session_row_wanted,
     stream_results,
     total_work,
     visible_results,
@@ -72,7 +85,11 @@ EXAMPLES = {
     "same, missing folder": 'names of files whose (size of it > 1000) of folder "/nope"',
     "typo (lint finding)": "name of operating sytem",
     "parse error": "name of (operating system",
+    "session: computers by name": "names of bes computers",
+    "either dialect": "now",
 }
+
+_DIALECT_LABELS = {mode: mode.capitalize() for mode in DIALECT_MODES}
 
 # Set by main() from -v, read by each page for its activity-log handler.
 _log_level = logging.INFO
@@ -152,6 +169,9 @@ _RESULTS_BODY_SLOT = r"""
             :name="props.row.ok ? 'check_circle' : 'error'"
             :color="props.row.ok ? 'positive' : 'negative'" />
     <span v-else-if="col.name === 'preview'" class="bfrd-mono">{{ col.value }}</span>
+    <span v-else-if="col.name === 'host' && props.row.dialect === 'session'">
+      {{ col.value }} <q-badge outline color="primary" label="session" />
+    </span>
     <span v-else>{{ col.value }}</span>
   </q-td>
 </q-tr>
@@ -159,7 +179,7 @@ _RESULTS_BODY_SLOT = r"""
   <q-td colspan="100%">
     <div class="bfrd-mono" style="white-space: pre-wrap">{{ props.row.answers }}</div>
     <div class="text-caption opacity-70">
-      {{ props.row.status }} · types: {{ props.row.types || '-' }} · qna {{ props.row.qna || '?' }}
+      {{ props.row.status }} · types: {{ props.row.types || '-' }} · {{ props.row.detail }}
     </div>
     <div v-if="props.row.error" class="text-negative" style="white-space: pre-wrap">{{ props.row.error }}</div>
     <pre v-if="props.row.raw" class="text-xs q-ma-none" style="white-space: pre-wrap">{{ props.row.raw }}</pre>
@@ -200,11 +220,15 @@ class _PageState:
     qna_version: str = ""
     timeout_s: float = 30.0
     max_parallel: int = 8
+    dialect_mode: str = AUTO
+    """The dialect picker: auto, or the override."""
     view: AnalysisView = dataclasses.field(default_factory=lambda: summarize(""))
     task: asyncio.Task[None] | None = None
     results: list[ClientRelevanceResult] = dataclasses.field(default_factory=list)
+    session_results: list[SessionEvaluation] = dataclasses.field(default_factory=list)
     rows: list[ResultRow] = dataclasses.field(default_factory=list)
-    """``results`` preformatted, kept in step so a new arrival converts only itself."""
+    """``session_results`` and ``results`` preformatted, in arrival order, so a
+    new arrival converts only itself."""
     expanded: set[int] = dataclasses.field(default_factory=set)
     """Keys (indexes into ``rows``) of the results-table rows that are open."""
     table_rows: list[Cells] = dataclasses.field(default_factory=list)
@@ -241,7 +265,7 @@ async def root() -> None:
         # --- left: editor, analysis, results ---------------------------------
         with ui.column().classes("w-2/3 gap-2"):
             with ui.row().classes("w-full items-center"):
-                ui.label("Client relevance").classes("text-subtitle1")
+                ui.label("Relevance").classes("text-subtitle1")
                 ui.space()
                 example = ui.select({v: k for k, v in EXAMPLES.items()}, label="Examples").classes(
                     "w-72"
@@ -254,6 +278,17 @@ async def root() -> None:
             parse_banner = ui.label().classes("text-negative bfrd-mono")
             analysis_row = ui.row().classes("items-center gap-2")
             findings_box = ui.column().classes("w-full gap-1")
+
+            with ui.row().classes("w-full items-center gap-2 no-wrap"):
+                dialect_select = (
+                    ui.select(_DIALECT_LABELS, value=AUTO, label="Dialect")
+                    .bind_value(state, "dialect_mode")
+                    .classes("w-32")
+                    .mark("dialect")
+                )
+                dialect_reason = (
+                    ui.label().classes("text-caption opacity-70").mark("dialect-reason")
+                )
 
             with ui.row().classes("items-center gap-2"):
                 evaluate_button = ui.button("Evaluate", icon="play_arrow").mark("evaluate")
@@ -378,6 +413,9 @@ async def root() -> None:
         )
         parse_banner.set_visibility(pe is not None and bool(view.text.strip()))
 
+        mode = "auto" if view.dialect_mode == AUTO else "override"
+        dialect_reason.set_text(f"{mode}: {view.dialect_reason}")
+
         analysis_row.clear()
         with analysis_row:
             ui.chip(f"dialect: {view.dialect}", icon="translate").props("outline dense")
@@ -427,11 +465,12 @@ async def root() -> None:
         update_buttons()
 
     def reanalyze() -> None:
-        state.view = summarize(code.value or "")
+        state.view = summarize(code.value or "", state.dialect_mode)
         apply_analysis()
 
     debouncer = Debouncer(DEBOUNCE_S, reanalyze)
     code.on_value_change(lambda _: debouncer.trigger())
+    dialect_select.on_value_change(lambda _: reanalyze())
 
     def current_view() -> AnalysisView:
         """The analysis of what the editor shows *now*, not 300 ms ago.
@@ -440,7 +479,8 @@ async def root() -> None:
         buttons act on the same text the user sees.
         """
         debouncer.cancel()
-        if state.view.text != (code.value or ""):
+        view = state.view
+        if view.text != (code.value or "") or view.dialect_mode != state.dialect_mode:
             reanalyze()
         return state.view
 
@@ -449,8 +489,8 @@ async def root() -> None:
         evaluate_button.set_enabled(not running)
         breakdown_button.set_enabled(not running and state.view.can_breakdown)
         cancel_button.set_enabled(running)
-        export_button.set_enabled(not running and bool(state.results))
-        clear_button.set_enabled(not running and (bool(state.results) or has_breakdown()))
+        export_button.set_enabled(not running and bool(state.rows))
+        clear_button.set_enabled(not running and (bool(state.rows) or has_breakdown()))
         reason = state.view.breakdown_disabled_reason
         breakdown_reason.set_text(reason if reason and state.view.text.strip() else "")
 
@@ -479,8 +519,25 @@ async def root() -> None:
 
     # --- running ----------------------------------------------------------------
 
-    async def collect() -> tuple[list[Target], EvalOptions] | None:
+    async def collect(
+        *, client: bool = True, session: bool = False
+    ) -> tuple[list[Target], EvalOptions] | None:
+        """The run's targets and options, or None after saying what's wrong.
+
+        ``client=False`` (session relevance only) needs no targets at all. With
+        ``session`` too, having no client targets selected isn't an error: the
+        run goes ahead as session relevance only, and says so. A selected
+        target with a bad field (an SSH target with no host) still is.
+        """
         try:
+            opts = EvalOptions(
+                qna_version=state.qna_version or "",
+                # None only when the field was cleared; 0 must reach validation.
+                timeout_s=30.0 if state.timeout_s is None else float(state.timeout_s),
+                max_parallel=8 if state.max_parallel is None else int(state.max_parallel),
+            )
+            if not client:
+                return [], opts
             image_arches = await resolve_container_arches(state.form)
             form = state.form
             explicit = form.local or form.container or form.ssh
@@ -494,13 +551,13 @@ async def root() -> None:
                 # Shielded: cancelling a run must not cancel the shared load.
                 await asyncio.shield(inventory_task)
                 progress_label.set_text("")
-            targets = build_targets(state.form, inventory.targets, image_arches)
-            opts = EvalOptions(
-                qna_version=state.qna_version or "",
-                # None only when the field was cleared; 0 must reach validation.
-                timeout_s=30.0 if state.timeout_s is None else float(state.timeout_s),
-                max_parallel=8 if state.max_parallel is None else int(state.max_parallel),
-            )
+            try:
+                targets = build_targets(state.form, inventory.targets, image_arches)
+            except NoTargetsError as exc:
+                if not session:
+                    raise
+                ui.notify(f"{exc} Running session relevance only.", type="info")
+                targets = []
         except ValueError as exc:
             ui.notify(str(exc), type="warning")
             return None
@@ -542,16 +599,20 @@ async def root() -> None:
         update_buttons()
 
     def evaluate() -> None:
-        text = current_view().text
+        view = current_view()
+        text = view.text
+        client = CLIENT in view.run_dialects
+        session = SESSION in view.run_dialects
 
         async def job() -> None:
-            collected = await collect()
+            collected = await collect(client=client, session=session)
             if collected is None:
                 return
             targets, opts = collected
-            total = total_work(targets, opts)
+            total = (total_work(targets, opts) if targets else 0) + int(session)
             done = 0
             state.results = []
+            state.session_results = []
             state.rows = []
             state.table_rows = []
             state.expanded = set()
@@ -561,15 +622,50 @@ async def root() -> None:
             render_results()
             progress.set_value(0)
             progress_label.set_text(f"0 / {total}")
-            async for result in stream_results(text, targets, opts):
-                state.results.append(result)
-                row = ResultRow.from_result(result)
-                state.table_rows.append(results_table_row(len(state.rows), row))
-                state.rows.append(row)
+
+            def tick() -> None:
+                nonlocal done
                 done += 1
                 progress.set_value(done / total if total else 1)
                 progress_label.set_text(f"{done} / {total}")
+
+            def arrived(row: ResultRow) -> None:
+                state.table_rows.append(results_table_row(len(state.rows), row))
+                state.rows.append(row)
+                tick()
                 render_results()
+
+            # With no client targets the session row is all there is to show.
+            session_optional = view.session_optional and bool(targets)
+
+            async def run_session() -> None:
+                ev = await evaluate_session(text, opts)
+                if not session_row_wanted(ev, optional=session_optional):
+                    activity.push(
+                        "session relevance skipped: no BigFix server is configured. "
+                        "Pick Session or Both in the Dialect picker to see where it looked."
+                    )
+                    tick()
+                    return
+                state.session_results.append(ev)
+                outcome = (
+                    f"{len(ev.answers)} answer(s)" if ev.ok else f"{ev.error_kind}: {ev.error}"
+                )
+                activity.push(f"session relevance on {ev.host}: {outcome}")
+                arrived(ResultRow.from_session(ev))
+
+            # The root server answers alongside qna, so a slow one holds up nothing.
+            session_task = asyncio.create_task(run_session()) if session else None
+            try:
+                if targets:
+                    async for result in stream_results(text, targets, opts):
+                        state.results.append(result)
+                        arrived(ResultRow.from_result(result))
+                if session_task is not None:
+                    await session_task
+            finally:
+                if session_task is not None and not session_task.done():
+                    session_task.cancel()
 
         start(job)
 
@@ -672,6 +768,7 @@ async def root() -> None:
         if state.running:
             return
         state.results = []
+        state.session_results = []
         state.rows = []
         state.expanded = set()
         state.expanded_before_filter = None
@@ -690,7 +787,9 @@ async def root() -> None:
         update_buttons()
 
     def export() -> None:
-        payload = json.dumps(results_to_dicts(state.results), indent=2)
+        # Session results first, as in the table; client entries keep the library's schema.
+        entries = [session_result_to_dict(ev) for ev in state.session_results]
+        payload = json.dumps(entries + results_to_dicts(state.results), indent=2)
         ui.download.content(payload, "relevance-results.json", "application/json")
 
     evaluate_button.on_click(evaluate)

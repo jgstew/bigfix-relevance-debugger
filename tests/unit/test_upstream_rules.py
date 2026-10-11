@@ -13,6 +13,7 @@ UPSTREAM = Path(__file__).parents[2] / "src" / "bigfix_relevance_debugger" / "up
 ALLOWED = {
     "remote_client_relevance.py": "bigfix_remote_client_relevance",
     "relevance_analyzer.py": "bigfix_relevance_analyzer",
+    "besapi.py": "besapi",
 }
 
 

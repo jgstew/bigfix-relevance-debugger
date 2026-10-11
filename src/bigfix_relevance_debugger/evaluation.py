@@ -1,4 +1,4 @@
-"""Evaluation glue: target form -> Targets, streamed results, per-level breakdown.
+"""Evaluation glue: target form -> Targets, streamed results, session relevance, breakdown.
 
 Async, but free of NiceGUI so it can be tested without a browser. Every
 upstream keyword (``transport_factory``, ``resolver``, ``compat_memory``, ...)
@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import threading
+import time
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
 from contextlib import aclosing
 from dataclasses import dataclass, field
@@ -31,6 +33,7 @@ from bigfix_remote_client_relevance.discovery import ImageSource, default_image_
 from bigfix_remote_client_relevance.render import display_host
 
 from bigfix_relevance_debugger.analysis import AnalysisView, LevelView
+from bigfix_relevance_debugger.upstream.besapi import session_relevance_result
 from bigfix_relevance_debugger.upstream.relevance_analyzer import summarize_count_results
 from bigfix_relevance_debugger.upstream.remote_client_relevance import (
     SUPPORTED_ARCHS,
@@ -52,6 +55,14 @@ AUTO_ARCH = "auto"
 
 class TargetFormError(ValueError):
     """The target picker describes nothing runnable; the message is user-facing."""
+
+
+class NoTargetsError(TargetFormError):
+    """Nothing is selected at all, as opposed to a selected target with a bad field.
+
+    A run that has session relevance to do goes ahead without client targets
+    on this one; a bad field is still a mistake to fix.
+    """
 
 
 @dataclass
@@ -143,7 +154,7 @@ def build_targets(
     targets.extend(inventory[i] for i in selected if 0 <= i < len(inventory))
 
     if not targets:
-        raise TargetFormError("Pick at least one target.")
+        raise NoTargetsError("Pick at least one target.")
     return targets
 
 
@@ -191,7 +202,7 @@ def choose_breakdown_target(analysis: AnalysisView, targets: Sequence[Target]) -
     selection order. Selecting a single target is how a user overrides this.
     """
     if not targets:
-        raise TargetFormError("Pick at least one target.")
+        raise NoTargetsError("Pick at least one target.")
     if len(targets) == 1:
         return BreakdownChoice(targets[0], "the only selected target")
 
@@ -342,6 +353,192 @@ async def stream_results(
             yield result
 
 
+# --- session relevance ----------------------------------------------------------------
+
+SESSION_CONNECT_TIMEOUT_S = 5.0
+"""Connect timeout for session queries; besapi's default waits 90 s for a dead server."""
+SESSION_HOST_UNKNOWN = "BigFix server"
+"""The session row's host before a connection says which server it is."""
+
+_NO_BESAPI_CONFIG = (
+    "No BigFix server is configured for session relevance. Set BES_ROOT_SERVER, "
+    "BES_USER_NAME and BES_PASSWORD, or add them to a [besapi] section in "
+    "~/.besapi.conf (also read: /etc/besapi.conf, ~/besapi.conf, ./besapi.conf). "
+    "On a root server its own credentials are used."
+)
+
+
+class SessionConfigError(Exception):
+    """besapi found no credentials anywhere it looks."""
+
+
+def _besapi_connection() -> Any:
+    """besapi's plugin connection: root server credentials, then env vars, then config files.
+
+    Looked up on each call (not imported by name) so it can be replaced.
+    """
+    from besapi import plugin_utilities
+
+    return plugin_utilities.get_besapi_connection(None)
+
+
+def _server_host(conn: Any) -> str:
+    root = str(getattr(conn, "rootserver", "") or "")
+    return root.split("://", 1)[-1].rsplit(":", 1)[0] or SESSION_HOST_UNKNOWN
+
+
+class SessionConnector:
+    """One besapi connection, made on first use and reused; blocking, so call from a thread.
+
+    Connecting happens under a lock, so concurrent first runs make one login.
+    Queries run outside it: a slow query, or one a cancelled run left going in
+    its thread, must not hold up the next run or another page. They share the
+    connection's ``requests.Session``, whose connection pool and cookie jar are
+    thread-safe; besapi's ``post`` only stamps ``last_connected``. A failed
+    query drops the connection it used (not a newer one), so the next run
+    connects afresh.
+    """
+
+    def __init__(self, factory: Callable[[], Any] | None = None) -> None:
+        self._factory = factory
+        self._lock = threading.Lock()
+        self._conn: Any = None
+        self.host = SESSION_HOST_UNKNOWN
+
+    def _connect(self) -> Any:
+        conn = (self._factory or _besapi_connection)()
+        if conn is None:
+            raise SessionConfigError(_NO_BESAPI_CONFIG)
+        self.host = _server_host(conn)
+        return conn
+
+    def _connection(self) -> Any:
+        with self._lock:
+            if self._conn is None:
+                self._conn = self._connect()
+            return self._conn
+
+    def _drop(self, conn: Any) -> None:
+        with self._lock:
+            # Another run may already have reconnected; keep that one.
+            if self._conn is conn:
+                self._conn = None
+
+    def query(self, relevance: str, timeout_s: float) -> SessionEvaluation:
+        started = time.monotonic()
+
+        def failed(kind: str, error: str) -> SessionEvaluation:
+            return SessionEvaluation(
+                relevance, self.host, error=error, error_kind=kind, elapsed_ms=_ms(started)
+            )
+
+        try:
+            conn = self._connection()
+        except SessionConfigError as exc:
+            return failed("config", str(exc))
+        except Exception as exc:  # bad credentials, no route, ...
+            logger.debug("besapi connection failed", exc_info=True)
+            return failed("connection", f"{type(exc).__name__}: {exc}")
+        try:
+            result = session_relevance_result(
+                conn, relevance, timeout=(SESSION_CONNECT_TIMEOUT_S, timeout_s)
+            )
+        except Exception as exc:  # network, HTTP, a non-XML answer
+            logger.debug("session query failed", exc_info=True)
+            self._drop(conn)
+            return failed("connection", f"{type(exc).__name__}: {exc}")
+        return SessionEvaluation(
+            relevance,
+            self.host,
+            answers=result.answers,
+            answer_types=result.answer_types,
+            plural=result.plural,
+            evaluation_time=result.evaluation_time,
+            error=result.error,
+            error_kind=None if result.ok else "relevance",
+            elapsed_ms=_ms(started),
+        )
+
+
+def _ms(started: float) -> int:
+    return int((time.monotonic() - started) * 1000)
+
+
+@dataclass(frozen=True)
+class SessionEvaluation:
+    """One session relevance query on the root server, ready to show."""
+
+    session_relevance: str
+    host: str
+    answers: tuple[str, ...] = ()
+    answer_types: tuple[str, ...] = ()
+    plural: bool | None = None
+    evaluation_time: str | None = None
+    """The server's own evaluation time, e.g. ``"0.31ms"``."""
+    error: str | None = None
+    error_kind: str | None = None
+    """``"relevance"`` (the server rejected it), ``"config"`` (no credentials
+    anywhere) or ``"connection"`` (login, network or HTTP failure)."""
+    elapsed_ms: int | None = None
+    """Wall time of the query, including connecting when it had to."""
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+
+_default_connector: SessionConnector | None = None
+
+
+def default_connector() -> SessionConnector:
+    """The process's connector, so every page and run shares one login."""
+    global _default_connector
+    if _default_connector is None:
+        _default_connector = SessionConnector()
+    return _default_connector
+
+
+async def evaluate_session(
+    session_relevance: str,
+    opts: EvalOptions,
+    *,
+    connector: SessionConnector | None = None,
+) -> SessionEvaluation:
+    """Evaluate on the root server through besapi. Failures come back in the result.
+
+    Cancelling stops the wait, not the request: it runs to its timeout in its
+    worker thread.
+    """
+    connector = connector or default_connector()
+    return await asyncio.to_thread(connector.query, session_relevance, opts.timeout_s)
+
+
+def session_row_wanted(ev: SessionEvaluation, *, optional: bool) -> bool:
+    """Whether a session result gets a results row.
+
+    ``optional`` means nobody asked for session relevance (auto added it beside
+    client relevance that has targets). Then "no server configured" isn't an
+    error to show; anything else, a connection failure included, still is.
+    """
+    return not (optional and ev.error_kind == "config")
+
+
+def session_result_to_dict(ev: SessionEvaluation) -> dict[str, Any]:
+    """An export entry; ``"dialect"`` tells it apart from the client results beside it."""
+    return {
+        "dialect": "session",
+        "host": ev.host,
+        "session_relevance": ev.session_relevance,
+        "answers": list(ev.answers),
+        "answer_types": list(ev.answer_types),
+        "plural": ev.plural,
+        "evaluation_time": ev.evaluation_time,
+        "error": ev.error,
+        "error_kind": ev.error_kind,
+        "elapsed_ms": ev.elapsed_ms,
+    }
+
+
 @dataclass(frozen=True)
 class ResultRow:
     """One evaluation result, preformatted for a table row."""
@@ -360,6 +557,33 @@ class ResultRow:
     elapsed_ms: int | None
     error: str | None
     raw_qna_output: str
+    dialect: str = "client"
+    """``"client"`` (qna on a target) or ``"session"`` (the root server)."""
+    detail_text: str = ""
+    """The expanded row's run details: qna version, or the server's evaluation."""
+
+    @classmethod
+    def from_session(cls, ev: SessionEvaluation) -> ResultRow:
+        details = []
+        if ev.evaluation_time:
+            details.append(f"evaluated in {ev.evaluation_time} on the server")
+        if ev.plural is not None:
+            details.append("plural" if ev.plural else "singular")
+        return cls(
+            status="ok" if ev.ok else (ev.error_kind or "error"),
+            ok=ev.ok,
+            host=ev.host,
+            display_host=ev.host,
+            answers=ev.answers,
+            answer_types_text=", ".join(dict.fromkeys(ev.answer_types)),
+            qna_version_text="",
+            platform_text="session",
+            elapsed_ms=ev.elapsed_ms,
+            error=ev.error,
+            raw_qna_output="",
+            dialect="session",
+            detail_text=" · ".join(details) or "session relevance",
+        )
 
     @classmethod
     def from_result(cls, result: ClientRelevanceResult) -> ResultRow:
@@ -379,7 +603,13 @@ class ResultRow:
             elapsed_ms=result.elapsed_ms,
             error=result.error,
             raw_qna_output=result.raw_qna_output or "",
+            detail_text=f"qna {qna_version or '?'}",
         )
+
+    @property
+    def group(self) -> tuple[str, str]:
+        """What results group by: one block per dialect and displayed host."""
+        return self.dialect, self.display_host
 
     @property
     def answer_count(self) -> int:
@@ -419,19 +649,24 @@ the results column in the native window's default size."""
 def order_results(rows: Sequence[ResultRow]) -> list[int]:
     """Indexes into ``rows`` in display order.
 
-    Grouped by ``display_host``, since a host listing several qna versions
-    yields one result per version and they belong together (while an ssh and
-    a fastquery entry for one address stay apart). Hosts are ranked by their
-    best result (see ``ResultRow.rank``), then by name ignoring case, then by
-    first arrival; a host's own results stay in arrival order.
+    Session results come first, then client results. Grouped by
+    ``display_host``, since a host listing several qna versions yields one
+    result per version and they belong together (while an ssh and a fastquery
+    entry for one address stay apart, as do a root server's session result and
+    its own client result). Hosts are ranked by their best result (see
+    ``ResultRow.rank``), then by name ignoring case, then by first arrival; a
+    host's own results stay in arrival order.
     """
-    groups: dict[str, list[int]] = {}
+    groups: dict[tuple[str, str], list[int]] = {}
     for index, row in enumerate(rows):
-        groups.setdefault(row.display_host, []).append(index)
+        groups.setdefault(row.group, []).append(index)
 
-    def host_key(item: tuple[str, list[int]]) -> tuple[tuple[int, int], str, int]:
-        host, indexes = item
-        return min(rows[i].rank for i in indexes), host.casefold(), indexes[0]
+    def host_key(
+        item: tuple[tuple[str, str], list[int]],
+    ) -> tuple[bool, tuple[int, int], str, int]:
+        (dialect, host), indexes = item
+        first = dialect != "session"
+        return first, min(rows[i].rank for i in indexes), host.casefold(), indexes[0]
 
     return [i for _, indexes in sorted(groups.items(), key=host_key) for i in indexes]
 
@@ -442,8 +677,8 @@ def visible_results(rows: Sequence[ResultRow], query: str) -> list[int]:
     A matching host keeps *all* its results, so a search shows each
     computer's whole answer set rather than just the matching rows.
     """
-    hosts = {row.display_host for row in rows if row.matches(query)}
-    return [i for i in order_results(rows) if rows[i].display_host in hosts]
+    groups = {row.group for row in rows if row.matches(query)}
+    return [i for i in order_results(rows) if rows[i].group in groups]
 
 
 def _shown(answer: str) -> str:
@@ -498,6 +733,7 @@ def results_table_row(key: int, row: ResultRow) -> Cells:
         "platform": row.platform_text,
         "qna": row.qna_version_text,
         "elapsed_ms": row.elapsed_ms,
+        "dialect": row.dialect,
     }
 
 
@@ -507,6 +743,7 @@ def results_row_details(row: ResultRow) -> Cells:
     return {
         "answers": "\n".join(_shown(a) for a in row.answers) or NO_ANSWERS,
         "types": row.answer_types_text,
+        "detail": row.detail_text,
         "error": row.error,
         "raw": row.raw_qna_output,
     }

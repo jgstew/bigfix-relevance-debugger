@@ -5,9 +5,11 @@ Guidance for AI coding agents working in this repo. Usage docs are in
 
 ## What this is
 
-A NiceGUI (asyncio) browser app for BigFix client relevance. It does live
-static analysis with `bigfix-relevance-analyzer`, evaluates with real `qna`
-through `bigfix-remote-client-relevance`, and has a per-level breakdown.
+A NiceGUI (asyncio) browser app for BigFix client and session relevance. It
+does live static analysis with `bigfix-relevance-analyzer`, evaluates client
+relevance with real `qna` through `bigfix-remote-client-relevance` and
+session relevance on a root server through `besapi`, and has a per-level
+breakdown (client only).
 Entry point: `bigfix_relevance_debugger.app:main`, run via
 `uvx`/`uv run`.
 
@@ -15,11 +17,12 @@ Entry point: `bigfix_relevance_debugger.app:main`, run via
   - `analysis.py`: analyzer -> frozen view-model dataclasses, plus CodeMirror
     decoration specs. Pure and sync.
   - `evaluation.py`: target form -> `Target`s, inventory loading, streaming,
-    and `run_breakdown`. Async.
+    session relevance (`evaluate_session`) and `run_breakdown`. Async.
   - `log_bridge.py`: library logger -> UI callback, thread-safe.
   - `app.py`: the page and `main()`. UI wiring only.
   - `upstream/`: code meant to be donated to the libraries, one module per
-    library (`remote_client_relevance.py`, `relevance_analyzer.py`). See below.
+    library (`remote_client_relevance.py`, `relevance_analyzer.py`,
+    `besapi.py`). See below.
 - `tests/unit/`: offline. No Docker, qna, SSH or network.
 
 **Keep NiceGUI out of `analysis.py`, `evaluation.py` and `log_bridge.py`** so
@@ -73,6 +76,19 @@ uv run pyright src tests
   by default it uses that library's `find_inventory_path()` search
   (`~/.bigfix/remote_clients.toml` etc.), and first-run auto-discovery when
   there is none. Don't invent a separate config file.
+- **Dialect decides what Evaluate runs.** `analysis.summarize(text, mode)`
+  sets `run_dialects` (session first) from `upstream.relevance_analyzer.dialect_fit`
+  or the picker's override. Session results always sort first.
+- **Session relevance connects with besapi's own lookup**
+  (`plugin_utilities.get_besapi_connection(None)`: root server credentials,
+  `BES_*` env vars, then `besapi.conf` files). Don't add another config file.
+  Avoid `init_plugin` (it parses `sys.argv`, calls `basicConfig(force=True)`
+  and exits) and `session_relevance_array` (it loses tuple answers); parse
+  the `session_relevance_xml` response with `upstream.besapi`. Tests inject a
+  `SessionConnector` with a fake connection (`evaluate_session(...,
+  connector=...)`) or monkeypatch `app.evaluate_session`.
+- **Tests must never connect to a real BigFix server.** `tests/conftest.py`
+  makes besapi's connection fail loudly and resets the shared connector.
 - **Tests must never run real discovery.** It writes
   `~/.bigfix/remote_clients.toml`; `tests/conftest.py` makes it fail loudly.
 - **Smart defaults, no required clicks.** Infer the best option (inventory
@@ -82,3 +98,5 @@ uv run pyright src tests
   log by default and DEBUG with `-v`, matching the library CLI's policy.
 - **Check UI changes in a real run** when Docker is available, e.g. evaluate
   `name of operating system` on `debian:11` / `arm64` / qna `11.0.7.61`.
+  For session relevance, `now` runs both dialects if a root server is
+  configured (read-only queries only).

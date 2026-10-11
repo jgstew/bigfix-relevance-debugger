@@ -25,6 +25,7 @@ from bigfix_relevance_debugger.evaluation import (
     InventoryLoad,
     LevelResult,
     ProbeView,
+    SessionEvaluation,
 )
 
 # --- CLI -------------------------------------------------------------------------
@@ -1446,3 +1447,250 @@ async def test_the_filter_waits_for_typing_to_pause(user, monkeypatch):
 
     await asyncio.sleep(app_module.FILTER_DEBOUNCE_S + 0.1)
     assert result_hosts(user) == ["deb", "multi", "multi"]
+
+
+# --- session relevance (issue 7) ---------------------------------------------------------
+
+SERVER = "bigfix.example.com"
+
+
+def fake_session(calls: list[str], **fields):
+    """An evaluate_session stand-in answering every query the same way."""
+    fields = {"answers": ("35",), "answer_types": ("integer",), "plural": False} | fields
+
+    async def evaluate_session(text, opts, **upstream):
+        calls.append(text)
+        return SessionEvaluation(text, SERVER, elapsed_ms=5, **fields)
+
+    return evaluate_session
+
+
+def dialect_reason(user) -> str:
+    [label] = user.find(marker="dialect-reason").elements
+    return label.text
+
+
+async def test_dialect_picker_defaults_to_auto_and_says_why(user):
+    await user.open("/")
+
+    await set_text(user, "names of bes computers")
+
+    [picker] = user.find(marker="dialect").elements
+    assert picker.value == "auto"
+    assert "bes computers" in dialect_reason(user)
+    await user.should_see("dialect: session")
+
+
+async def test_session_only_evaluate_needs_no_client_targets(user, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(app_module, "evaluate_session", fake_session(calls))
+
+    async def no_stream(*args, **kwargs):
+        raise AssertionError("client relevance must not run")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(app_module, "stream_results", no_stream)
+    await user.open("/")
+    await set_text(user, "number of bes computers")
+
+    user.find(marker="evaluate").click()
+
+    await user.should_see("1 / 1")
+    assert calls == ["number of bes computers"]
+    [row] = results_table(user).rows
+    assert row["host"] == SERVER
+    assert row["dialect"] == "session"
+    assert row["preview"] == "35"
+
+
+async def test_both_dialects_list_the_session_result_first(user, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(app_module, "evaluate_session", fake_session(calls))
+    monkeypatch.setattr(app_module, "stream_results", stream_of(result("local", ["a", "b"])))
+    await user.open("/")
+    await set_text(user, "now")
+    user.find(marker="target-local").click()
+
+    user.find(marker="evaluate").click()
+
+    await user.should_see("2 / 2")
+    assert calls == ["now"]
+    # The client row has more answers, but session results always list first.
+    assert [r["dialect"] for r in results_table(user).rows] == ["session", "client"]
+
+
+async def test_dialect_override_runs_only_what_was_picked(user, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(app_module, "evaluate_session", fake_session(calls))
+    monkeypatch.setattr(app_module, "stream_results", stream_of(result("local", ["a"])))
+    await user.open("/")
+    await set_text(user, "now")
+    user.find(marker="target-local").click()
+    [picker] = user.find(marker="dialect").elements
+
+    picker.set_value("client")
+
+    assert "set to client" in dialect_reason(user)
+    user.find(marker="evaluate").click()
+    await user.should_see("1 / 1")
+    assert calls == []
+    assert [r["dialect"] for r in results_table(user).rows] == ["client"]
+
+
+async def test_both_without_client_targets_still_runs_session_and_says_so(user, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(app_module, "evaluate_session", fake_session(calls))
+    await user.open("/")
+    await set_text(user, "now")
+
+    user.find(marker="evaluate").click()
+
+    await user.should_see("1 / 1")
+    await user.should_see("session relevance only")
+    assert calls == ["now"]
+
+
+async def test_both_with_a_bad_target_field_warns_and_runs_nothing(user, monkeypatch):
+    calls: list[str] = []
+    streamed: list[list[Target]] = []
+    monkeypatch.setattr(app_module, "evaluate_session", fake_session(calls))
+
+    async def fake_stream(text, targets, opts, **upstream):
+        streamed.append(targets)
+        for _ in ():
+            yield
+
+    monkeypatch.setattr(app_module, "stream_results", fake_stream)
+    await user.open("/")
+    await set_text(user, "now")
+    user.find(marker="target-local").click()
+    # Ticked with the host left blank: a mistake to fix, not "no client targets".
+    user.find(marker="target-ssh").click()
+
+    user.find(marker="evaluate").click()
+
+    await user.should_see("SSH target needs a host")
+    await asyncio.sleep(0.1)
+    assert streamed == []
+    assert calls == []
+
+
+async def test_session_error_shows_as_an_error_row(user, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(
+        app_module,
+        "evaluate_session",
+        fake_session(
+            calls, answers=(), error="No BigFix server is configured", error_kind="config"
+        ),
+    )
+    await user.open("/")
+    await set_text(user, "names of bes computers")
+
+    user.find(marker="evaluate").click()
+
+    await user.should_see("1 / 1")
+    [row] = results_table(user).rows
+    assert row["ok"] is False
+    assert row["status"] == "config"
+    assert "No BigFix server" in row["preview"]
+
+
+NO_SERVER = {"answers": (), "error": "No BigFix server is configured", "error_kind": "config"}
+
+
+async def test_no_server_hides_the_session_row_auto_added(user, monkeypatch):
+    # `now` runs both only because it's valid in either; most users have no
+    # root server, and a red row on every such run would be noise.
+    calls: list[str] = []
+    monkeypatch.setattr(app_module, "evaluate_session", fake_session(calls, **NO_SERVER))
+    monkeypatch.setattr(app_module, "stream_results", stream_of(result("local", ["a"])))
+    await user.open("/")
+    await set_text(user, "now")
+    user.find(marker="target-local").click()
+
+    user.find(marker="evaluate").click()
+
+    await user.should_see("2 / 2")
+    await user.should_see("session relevance skipped")
+    assert calls == ["now"]
+    assert [r["dialect"] for r in results_table(user).rows] == ["client"]
+
+
+async def test_no_server_still_shows_when_both_was_picked(user, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(app_module, "evaluate_session", fake_session(calls, **NO_SERVER))
+    monkeypatch.setattr(app_module, "stream_results", stream_of(result("local", ["a"])))
+    await user.open("/")
+    await set_text(user, "now")
+    user.find(marker="target-local").click()
+    [picker] = user.find(marker="dialect").elements
+    picker.set_value("both")
+
+    user.find(marker="evaluate").click()
+
+    await user.should_see("2 / 2")
+    rows = results_table(user).rows
+    assert [(r["dialect"], r["status"]) for r in rows] == [("session", "config"), ("client", "ok")]
+
+
+async def test_no_server_still_shows_when_session_is_all_that_runs(user, monkeypatch):
+    # Auto picked both, but with no client targets the session row is the
+    # whole result, so hiding it would leave nothing to say what happened.
+    calls: list[str] = []
+    monkeypatch.setattr(app_module, "evaluate_session", fake_session(calls, **NO_SERVER))
+    await user.open("/")
+    await set_text(user, "now")
+
+    user.find(marker="evaluate").click()
+
+    await user.should_see("1 / 1")
+    [row] = results_table(user).rows
+    assert row["status"] == "config"
+
+
+async def test_session_only_expression_cannot_break_down(user):
+    await user.open("/")
+
+    await set_text(user, "names of bes computers")
+
+    [button] = user.find(marker="breakdown").elements
+    assert not button.enabled
+    await user.should_see("session relevance can't break down yet")
+
+
+async def test_export_lists_session_results_first(user, monkeypatch):
+    exported: list[str] = []
+    monkeypatch.setattr(
+        UserDownload, "content", lambda self, payload, *a, **k: exported.append(payload)
+    )
+    monkeypatch.setattr(app_module, "evaluate_session", fake_session([]))
+    monkeypatch.setattr(app_module, "stream_results", stream_of(result("local", ["a"])))
+    await user.open("/")
+    await set_text(user, "now")
+    user.find(marker="target-local").click()
+    user.find(marker="evaluate").click()
+    await user.should_see("2 / 2")
+
+    user.find(marker="export").click()
+
+    [payload] = exported
+    entries = json.loads(payload)
+    assert entries[0]["dialect"] == "session"
+    assert entries[0]["host"] == SERVER
+    assert entries[1]["host"] == "local"
+
+
+async def test_clear_removes_session_results_too(user, monkeypatch):
+    monkeypatch.setattr(app_module, "evaluate_session", fake_session([]))
+    await user.open("/")
+    await set_text(user, "number of bes computers")
+    user.find(marker="evaluate").click()
+    await user.should_see("1 / 1")
+
+    user.find(marker="clear").click()
+
+    # Clear hides the results section, so look the table up among all elements.
+    assert hidden_element(user, "results").rows == []
+    [export] = user.find(marker="export").elements
+    assert not export.enabled

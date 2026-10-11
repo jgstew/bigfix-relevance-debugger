@@ -5,14 +5,14 @@ build-backend = "hatchling.build"
 [project]
 name = "bigfix-relevance-debugger"
 version = "0.1.0"
-description = "A browser GUI for BigFix client relevance: live static analysis, remote evaluation with qna, and a per-level breakdown."
+description = "A browser GUI for BigFix client and session relevance: live static analysis, evaluation with qna and besapi, and a per-level breakdown."
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [
     { name = "JGStew", email = "admin@jgstew.com" },
 ]
 requires-python = ">=3.11"
-keywords = ["bigfix", "qna", "client-relevance", "relevance", "debugger", "nicegui"]
+keywords = ["bigfix", "qna", "client-relevance", "session-relevance", "besapi", "relevance", "debugger", "nicegui"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: System Administrators",
@@ -28,6 +28,7 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
+    "besapi>=4.4.3",
     "bigfix-relevance-analyzer>=1.29.1",
     "bigfix-remote-client-relevance>=1.5.2",
     "nicegui[native]>=3.18.0",

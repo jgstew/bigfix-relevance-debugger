@@ -11,7 +11,9 @@ from bigfix_relevance_analyzer import Dialect, analyze_relevance
 
 from bigfix_relevance_debugger.upstream.relevance_analyzer import (
     CountSummary,
+    DialectFit,
     client_platforms,
+    dialect_fit,
     summarize_count_results,
 )
 
@@ -66,3 +68,47 @@ def test_summarize_count_results(rows, expected):
 def test_summarize_count_results_rejects_non_count_rows_like_the_analyzer():
     with pytest.raises(ValueError, match="banana"):
         summarize_count_results(["banana"])
+
+
+# --- dialect_fit ------------------------------------------------------------------
+
+C, S = Dialect.CLIENT, Dialect.SESSION
+
+
+@pytest.mark.parametrize(
+    ("text", "dialects", "basis"),
+    [
+        ('names of files of folder "/etc"', {C}, "resolved"),
+        ("names of bes computers", {S}, "resolved"),
+        # Name-level resolution says "both" (operating system of <bes computer>
+        # is a session property); only the client type check accepts it.
+        ("name of operating system", {C}, "type-check"),
+        ("version of operating system", {C}, "type-check"),
+        ("now", {C, S}, "either"),
+        ('(1, "a")', {C, S}, "either"),
+        ("names of bes computers whose (name of it = computer name)", {C, S}, "mixed"),
+        # A typo type-checks in neither: client, as when a typo breaks the parse...
+        ("nme of operating system", {C}, "unclear"),
+        # ...unless the text itself says which: "bes <word>" is session.
+        ("names of bes computerz", {S}, "classified"),
+        ("names of (bes computers", {S}, "classified"),
+        ("name of (operating system", {C}, "default"),
+    ],
+)
+def test_dialect_fit(text, dialects, basis):
+    fit = dialect_fit(text)
+
+    assert isinstance(fit, DialectFit)
+    assert fit.dialects == frozenset(dialects)
+    assert fit.basis == basis
+
+
+def test_dialect_fit_names_what_each_side_contributes_when_mixed():
+    fit = dialect_fit("names of bes computers whose (name of it = computer name)")
+
+    assert fit.client_only == ("computer name",)
+    assert fit.session_only == ("bes computers",)
+
+
+def test_dialect_fit_names_session_only_references():
+    assert dialect_fit("names of bes computers").session_only == ("bes computers",)
