@@ -31,17 +31,11 @@ jobs:
     # no-commit-to-branch guards a developer's local `git commit`; it has
     # nothing to check on a runner, and on a push to main it would fail the
     # run of every merged PR. This repo doesn't use that hook today; the SKIP
-    # keeps CI working if it's added. SKIP is read by pre-commit itself, so it
-    # applies to both steps below.
-    #
-    # GH_TOKEN puts zizmor in online mode (offline is the default without it),
-    # so it can fetch the referenced actions for the audits that need them.
-    # The runner's own GITHUB_TOKEN is enough for a public repo; it's
-    # read-only per the `permissions:` block above and never touches git
-    # credentials (actions/checkout sets persist-credentials: false).
+    # keeps CI working if it's added. zizmor is skipped here and runs in its
+    # own step at the end, the only one that gets GH_TOKEN. SKIP is read by
+    # pre-commit itself.
     env:
-      SKIP: no-commit-to-branch
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SKIP: no-commit-to-branch,zizmor
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -49,45 +43,14 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      # setup-python, then the uv version pinned in .pre-commit-config.yaml.
+      # `./` rather than zizmor's preferred `$/`, which actionlint v1.7.12
+      # rejects (rhysd/actionlint#711, #732), as in the analyzer.
+      # The local pyright and pytest hooks are `language: system` and run
+      # `uv run`, so uv has to be on PATH or both fail.
+      - uses: ./.github/actions/install-uv # zizmor: ignore[self-repository]
         with:
           python-version: "3.12"
-
-      # single source of truth for the uv version: the `rev` of the
-      # astral-sh/uv-pre-commit repo in .pre-commit-config.yaml, which
-      # `pre-commit autoupdate` already keeps current. Read with awk rather
-      # than a yaml parser so it needs nothing installed first. `rev` is
-      # SHA-pinned with the version in a trailing `# X.Y.Z` comment, so the
-      # version comes from that comment; fall back to the bare `rev` value for
-      # a tag-pinned rev with no comment. Same step in every workflow here.
-      - name: read uv version from .pre-commit-config.yaml
-        run: |
-          UV_VERSION="$(awk '
-            /^[[:space:]]*-[[:space:]]*repo:.*astral-sh\/uv-pre-commit[[:space:]]*$/ { found = 1; next }
-            found && $1 == "rev:" {
-              if (match($0, /#[ \t]*(frozen:[ \t]*)?[vV]?[0-9]+(\.[0-9]+)*/)) {
-                ver = substr($0, RSTART, RLENGTH)
-                sub(/^#[ \t]*(frozen:[ \t]*)?[vV]?/, "", ver)
-              } else {
-                ver = $2
-                gsub(/["'\'']/, "", ver)
-                sub(/^[vV]/, "", ver)
-              }
-              print ver
-              exit
-            }
-          ' .pre-commit-config.yaml)"
-          if [ -z "$UV_VERSION" ]; then
-            echo "::error::could not read the astral-sh/uv-pre-commit version from .pre-commit-config.yaml"
-            exit 1
-          fi
-          echo "UV_VERSION=$UV_VERSION" >> "$GITHUB_ENV"
-          echo "uv version: $UV_VERSION"
-
-      # the local pyright and pytest hooks are `language: system` and run
-      # `uv run`, so uv has to be on PATH or both fail
-      - name: install uv (needed by the local pre-commit hooks)
-        run: python -m pip install "uv==${UV_VERSION}"
 
       # A PR or a push: the hooks on the changed files, including the
       # manual-stage ones (pytest and the workflow linters).
@@ -113,6 +76,32 @@ jobs:
         uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
         with:
           extra_args: --color=always --all-files --hook-stage manual
+
+      # The two steps above cover pull_request, push and workflow_dispatch, and
+      # a workflow_call with all-files. Any other caller event would run no
+      # hooks at all, and pre-commit (installed by pre-commit/action) wouldn't
+      # be on PATH for the steps below; fail here and say why instead.
+      - name: no pre-commit run for this event
+        if: >-
+          !inputs.all-files
+          && !contains(fromJSON('["pull_request", "push", "workflow_dispatch"]'), github.event_name)
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          echo "::error::pre-commit.yaml has no diff range for a '${EVENT_NAME}' event; call it with all-files: true"
+          exit 1
+
+      # zizmor on its own, so GH_TOKEN reaches only it and not every hook
+      # (pytest and pyright run PR code). The token puts zizmor in online mode
+      # (offline is the default without one), so it can fetch the referenced
+      # actions for the audits that need them. The runner's GITHUB_TOKEN is
+      # enough for a public repo and is read-only per `permissions:` above.
+      # The workflow files are few, so this checks all of them every time.
+      - name: zizmor (online)
+        env:
+          SKIP: no-commit-to-branch
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: pre-commit run zizmor --color=always --all-files --hook-stage manual
 
       # pre-commit/action restores the previous cache on a config change and
       # saves it back under the new key, so every hook rev bump would leave its

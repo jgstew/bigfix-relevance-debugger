@@ -294,10 +294,11 @@ answers "why is my relevance false?".
 uv sync
 uv run pytest
 uv run ruff check src tests
+uv run ruff format src tests
 uv run pyright src tests
 ```
 
-CI runs the same on Python 3.11 and 3.13, plus pre-commit and a smoke test
+CI runs the same (with `ruff format --check`) on Python 3.11 and 3.13, plus pre-commit and a smoke test
 of the built wheel through `uvx` on Linux, macOS and Windows.
 
 Unit tests need no Docker, qna, network or BigFix server: evaluation runs
