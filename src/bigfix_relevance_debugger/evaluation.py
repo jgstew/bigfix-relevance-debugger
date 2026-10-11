@@ -57,6 +57,14 @@ class TargetFormError(ValueError):
     """The target picker describes nothing runnable; the message is user-facing."""
 
 
+class NoTargetsError(TargetFormError):
+    """Nothing is selected at all, as opposed to a selected target with a bad field.
+
+    A run that has session relevance to do goes ahead without client targets
+    on this one; a bad field is still a mistake to fix.
+    """
+
+
 @dataclass
 class TargetForm:
     """What the target picker holds. Mutable: the UI binds widgets to it."""
@@ -146,7 +154,7 @@ def build_targets(
     targets.extend(inventory[i] for i in selected if 0 <= i < len(inventory))
 
     if not targets:
-        raise TargetFormError("Pick at least one target.")
+        raise NoTargetsError("Pick at least one target.")
     return targets
 
 
@@ -194,7 +202,7 @@ def choose_breakdown_target(analysis: AnalysisView, targets: Sequence[Target]) -
     selection order. Selecting a single target is how a user overrides this.
     """
     if not targets:
-        raise TargetFormError("Pick at least one target.")
+        raise NoTargetsError("Pick at least one target.")
     if len(targets) == 1:
         return BreakdownChoice(targets[0], "the only selected target")
 
@@ -382,9 +390,13 @@ def _server_host(conn: Any) -> str:
 class SessionConnector:
     """One besapi connection, made on first use and reused; blocking, so call from a thread.
 
-    besapi logs in when it connects and isn't documented as thread-safe, so
-    connecting and querying both happen under one lock. A failed query drops
-    the connection, so the next run connects afresh.
+    Connecting happens under a lock, so concurrent first runs make one login.
+    Queries run outside it: a slow query, or one a cancelled run left going in
+    its thread, must not hold up the next run or another page. They share the
+    connection's ``requests.Session``, whose connection pool and cookie jar are
+    thread-safe; besapi's ``post`` only stamps ``last_connected``. A failed
+    query drops the connection it used (not a newer one), so the next run
+    connects afresh.
     """
 
     def __init__(self, factory: Callable[[], Any] | None = None) -> None:
@@ -400,6 +412,18 @@ class SessionConnector:
         self.host = _server_host(conn)
         return conn
 
+    def _connection(self) -> Any:
+        with self._lock:
+            if self._conn is None:
+                self._conn = self._connect()
+            return self._conn
+
+    def _drop(self, conn: Any) -> None:
+        with self._lock:
+            # Another run may already have reconnected; keep that one.
+            if self._conn is conn:
+                self._conn = None
+
     def query(self, relevance: str, timeout_s: float) -> SessionEvaluation:
         started = time.monotonic()
 
@@ -408,23 +432,21 @@ class SessionConnector:
                 relevance, self.host, error=error, error_kind=kind, elapsed_ms=_ms(started)
             )
 
-        with self._lock:
-            if self._conn is None:
-                try:
-                    self._conn = self._connect()
-                except SessionConfigError as exc:
-                    return failed("config", str(exc))
-                except Exception as exc:  # bad credentials, no route, ...
-                    logger.debug("besapi connection failed", exc_info=True)
-                    return failed("connection", f"{type(exc).__name__}: {exc}")
-            try:
-                result = session_relevance_result(
-                    self._conn, relevance, timeout=(SESSION_CONNECT_TIMEOUT_S, timeout_s)
-                )
-            except Exception as exc:  # network, HTTP, a non-XML answer
-                logger.debug("session query failed", exc_info=True)
-                self._conn = None
-                return failed("connection", f"{type(exc).__name__}: {exc}")
+        try:
+            conn = self._connection()
+        except SessionConfigError as exc:
+            return failed("config", str(exc))
+        except Exception as exc:  # bad credentials, no route, ...
+            logger.debug("besapi connection failed", exc_info=True)
+            return failed("connection", f"{type(exc).__name__}: {exc}")
+        try:
+            result = session_relevance_result(
+                conn, relevance, timeout=(SESSION_CONNECT_TIMEOUT_S, timeout_s)
+            )
+        except Exception as exc:  # network, HTTP, a non-XML answer
+            logger.debug("session query failed", exc_info=True)
+            self._drop(conn)
+            return failed("connection", f"{type(exc).__name__}: {exc}")
         return SessionEvaluation(
             relevance,
             self.host,
@@ -489,6 +511,16 @@ async def evaluate_session(
     """
     connector = connector or default_connector()
     return await asyncio.to_thread(connector.query, session_relevance, opts.timeout_s)
+
+
+def session_row_wanted(ev: SessionEvaluation, *, optional: bool) -> bool:
+    """Whether a session result gets a results row.
+
+    ``optional`` means nobody asked for session relevance (auto added it beside
+    client relevance that has targets). Then "no server configured" isn't an
+    error to show; anything else, a connection failure included, still is.
+    """
+    return not (optional and ev.error_kind == "config")
 
 
 def session_result_to_dict(ev: SessionEvaluation) -> dict[str, Any]:

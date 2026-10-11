@@ -47,10 +47,10 @@ from bigfix_relevance_debugger.evaluation import (
     EvalOptions,
     InventoryLoad,
     LevelResult,
+    NoTargetsError,
     ResultRow,
     SessionEvaluation,
     TargetForm,
-    TargetFormError,
     breakdown_qna_note,
     build_targets,
     choose_breakdown_target,
@@ -62,6 +62,7 @@ from bigfix_relevance_debugger.evaluation import (
     results_table_row,
     run_breakdown,
     session_result_to_dict,
+    session_row_wanted,
     stream_results,
     total_work,
     visible_results,
@@ -524,8 +525,9 @@ async def root() -> None:
         """The run's targets and options, or None after saying what's wrong.
 
         ``client=False`` (session relevance only) needs no targets at all. With
-        ``session`` too, having no client targets isn't an error: the run goes
-        ahead as session relevance only, and says so.
+        ``session`` too, having no client targets selected isn't an error: the
+        run goes ahead as session relevance only, and says so. A selected
+        target with a bad field (an SSH target with no host) still is.
         """
         try:
             opts = EvalOptions(
@@ -551,7 +553,7 @@ async def root() -> None:
                 progress_label.set_text("")
             try:
                 targets = build_targets(state.form, inventory.targets, image_arches)
-            except TargetFormError as exc:
+            except NoTargetsError as exc:
                 if not session:
                     raise
                 ui.notify(f"{exc} Running session relevance only.", type="info")
@@ -621,17 +623,30 @@ async def root() -> None:
             progress.set_value(0)
             progress_label.set_text(f"0 / {total}")
 
-            def arrived(row: ResultRow) -> None:
+            def tick() -> None:
                 nonlocal done
-                state.table_rows.append(results_table_row(len(state.rows), row))
-                state.rows.append(row)
                 done += 1
                 progress.set_value(done / total if total else 1)
                 progress_label.set_text(f"{done} / {total}")
+
+            def arrived(row: ResultRow) -> None:
+                state.table_rows.append(results_table_row(len(state.rows), row))
+                state.rows.append(row)
+                tick()
                 render_results()
+
+            # With no client targets the session row is all there is to show.
+            session_optional = view.session_optional and bool(targets)
 
             async def run_session() -> None:
                 ev = await evaluate_session(text, opts)
+                if not session_row_wanted(ev, optional=session_optional):
+                    activity.push(
+                        "session relevance skipped: no BigFix server is configured. "
+                        "Pick Session or Both in the Dialect picker to see where it looked."
+                    )
+                    tick()
+                    return
                 state.session_results.append(ev)
                 outcome = (
                     f"{len(ev.answers)} answer(s)" if ev.ok else f"{ev.error_kind}: {ev.error}"

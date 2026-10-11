@@ -81,7 +81,7 @@ class DialectFit:
       ``operating system of <bes computer>``, never a bare ``operating system``)
     - ``"either"``: both type checks accept it, e.g. ``now``
     - ``"unclear"``: neither type check accepts it (a typo) and the text gives
-      no hint, so neither is ruled out
+      no hint: client, as for a statement that doesn't parse
     - ``"mixed"``: it uses references from both dialects (``Dialect.UNCERTAIN``)
     - ``"classified"``: it doesn't parse or type-check, but the text classifier
       has a view (``bes <word>`` reads as session)
@@ -137,7 +137,7 @@ def dialect_fit(text: str) -> DialectFit:
             return fit(both, "either")
         if classified in (Dialect.CLIENT, Dialect.SESSION):
             return fit(frozenset({classified}), "classified")
-        return fit(both, "unclear")
+        return fit(frozenset({Dialect.CLIENT}), "unclear")
     # Unparsed, or nothing resolved: fall back on the text classifier.
     if classified in (Dialect.CLIENT, Dialect.SESSION):
         return fit(frozenset({classified}), "classified")

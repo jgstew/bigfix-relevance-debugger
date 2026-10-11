@@ -7,6 +7,7 @@ injected fake transport and resolver, so no Docker, qna or SSH is needed.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ from bigfix_relevance_debugger.evaluation import (
     SESSION_HOST_UNKNOWN,
     EvalOptions,
     LevelResult,
+    NoTargetsError,
     ProbeView,
     ResultRow,
     SessionConnector,
@@ -41,6 +43,7 @@ from bigfix_relevance_debugger.evaluation import (
     results_table_row,
     run_breakdown,
     session_result_to_dict,
+    session_row_wanted,
     stream_results,
     total_work,
     visible_results,
@@ -287,24 +290,31 @@ def test_ssh_verify_host_key_can_be_turned_off():
     assert target.verify_host_key is False
 
 
-def test_ssh_without_host_is_rejected():
-    with pytest.raises(TargetFormError, match="host"):
-        build_targets(TargetForm(ssh=True, ssh_host="  "))
+@pytest.mark.parametrize(
+    ("form", "message"),
+    [
+        (TargetForm(ssh=True, ssh_host="  "), "host"),
+        (TargetForm(container=True, container_arches=[]), "arch"),
+        (TargetForm(container=True, container_images=" , "), "image"),
+        # A bad field is still a bad field when another target is fine.
+        (TargetForm(local=True, ssh=True, ssh_host=""), "host"),
+    ],
+)
+def test_a_bad_target_field_is_rejected_as_a_form_error(form, message):
+    with pytest.raises(TargetFormError, match=message) as raised:
+        build_targets(form)
 
-
-def test_container_without_arch_is_rejected():
-    with pytest.raises(TargetFormError, match="arch"):
-        build_targets(TargetForm(container=True, container_arches=[]))
-
-
-def test_container_without_image_is_rejected():
-    with pytest.raises(TargetFormError, match="image"):
-        build_targets(TargetForm(container=True, container_images=" , "))
+    # Not "nothing selected": a run for both dialects must not fall back on it.
+    assert not isinstance(raised.value, NoTargetsError)
 
 
 def test_nothing_selected_is_rejected():
-    with pytest.raises(TargetFormError, match="target"):
+    with pytest.raises(NoTargetsError, match="target"):
         build_targets(TargetForm())
+
+
+def test_no_targets_is_a_target_form_error():
+    assert issubclass(NoTargetsError, TargetFormError)
 
 
 def test_inventory_selection_by_index():
@@ -318,7 +328,7 @@ def test_inventory_selection_by_index():
 def test_inventory_selection_out_of_range_selects_nothing():
     inventory = [Target(kind="ssh", name="a")]
 
-    with pytest.raises(TargetFormError):
+    with pytest.raises(NoTargetsError):
         build_targets(TargetForm(inventory_selected=[5]), inventory)
 
 
@@ -866,7 +876,7 @@ def test_no_compatible_target_still_picks_one_and_says_so():
 
 
 def test_choose_from_nothing_is_an_error():
-    with pytest.raises(TargetFormError):
+    with pytest.raises(NoTargetsError):
         choose_breakdown_target(summarize(REGISTRY), [])
 
 
@@ -1306,6 +1316,80 @@ async def test_session_query_failure_drops_the_connection():
     assert factory.calls == 2
 
 
+class BlockingBESConnection(FakeBESConnection):
+    """Holds a query for ``relevance`` until ``release`` is set, then answers or raises."""
+
+    def __init__(self, relevance, raises=None, fails=()):
+        super().__init__()
+        self.blocking = relevance
+        self.blocked_raises = raises
+        self.fails = fails
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def session_relevance_xml(self, relevance, **kwargs):
+        if relevance == self.blocking:
+            self.entered.set()
+            assert self.release.wait(5), "test never released the query"
+            if self.blocked_raises is not None:
+                raise self.blocked_raises
+        if relevance in self.fails:
+            raise TimeoutError("read timed out")
+        return super().session_relevance_xml(relevance, **kwargs)
+
+
+def query_in_thread(connector, relevance):
+    """Run a blocking ``connector.query`` on a thread; returns (thread, results list)."""
+    results: list = []
+    thread = threading.Thread(target=lambda: results.append(connector.query(relevance, 30)))
+    thread.start()
+    return thread, results
+
+
+def test_a_slow_session_query_does_not_hold_up_the_next_one():
+    # A cancelled run's query keeps going in its thread; the next run (or
+    # another page sharing the connector) must not wait for it to finish.
+    conn = BlockingBESConnection("slow")
+    connector = SessionConnector(CountingFactory(conn))
+    slow, _ = query_in_thread(connector, "slow")
+    try:
+        assert conn.entered.wait(5)
+
+        fast, results = query_in_thread(connector, "now")
+        fast.join(2)
+
+        assert not fast.is_alive(), "the second query waited for the first"
+        [ev] = results
+        assert ev.ok
+        assert ev.elapsed_ms is not None and ev.elapsed_ms < 1000
+    finally:
+        conn.release.set()
+        slow.join(5)
+
+
+def test_a_failed_query_does_not_drop_a_newer_connection():
+    # Query "a" is in flight on the first connection when "b" fails on it and
+    # "c" reconnects. When "a" then fails too, the newer connection stays.
+    first = BlockingBESConnection("a", raises=TimeoutError("read timed out"), fails=("b",))
+    second = FakeBESConnection()
+    factory = CountingFactory(first, second)
+    connector = SessionConnector(factory)
+    a, a_results = query_in_thread(connector, "a")
+    try:
+        assert first.entered.wait(5)
+        assert connector.query("b", 30).error_kind == "connection"
+        assert connector.query("c", 30).ok
+    finally:
+        first.release.set()
+        a.join(5)
+
+    [a_ev] = a_results
+    assert a_ev.error_kind == "connection"
+    assert connector.query("d", 30).ok
+    assert factory.calls == 2
+    assert [call[0] for call in second.calls] == ["c", "d"]
+
+
 async def test_session_default_connector_uses_besapi_plugin_connection(monkeypatch):
     # conftest makes the real one fail loudly; this checks it is the one used.
     from besapi import plugin_utilities
@@ -1356,6 +1440,27 @@ def test_session_error_row():
     assert not r.ok
     assert r.status == "relevance"
     assert r.error == 'The operator "nme" is not defined.'
+
+
+@pytest.mark.parametrize(
+    ("error_kind", "optional", "wanted"),
+    [
+        (None, True, True),
+        # Nobody asked for session and no server is configured: not an error to show.
+        ("config", True, False),
+        # A server is configured but unreachable: worth knowing either way.
+        ("connection", True, True),
+        ("relevance", True, True),
+        # Session was asked for, so say why it didn't run.
+        ("config", False, True),
+    ],
+)
+def test_session_row_wanted(error_kind, optional, wanted):
+    ev = evaluation.SessionEvaluation(
+        "now", SESSION_HOST_UNKNOWN, error="x" if error_kind else None, error_kind=error_kind
+    )
+
+    assert session_row_wanted(ev, optional=optional) is wanted
 
 
 def test_session_rows_list_first_even_when_they_fail():

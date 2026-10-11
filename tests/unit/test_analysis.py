@@ -59,6 +59,8 @@ def test_costly_inspectors_surface():
             ("session", "client"),
             "session + client",
         ),
+        # A typo: client, not a query to the root server as well.
+        ("name of operating sytem", ("client",), "client"),
     ],
 )
 def test_auto_dialect_decides_what_runs(text, run, dialect):
@@ -77,6 +79,7 @@ def test_auto_dialect_decides_what_runs(text, run, dialect):
         ("now", "either"),
         ("names of bes computers whose (name of it = computer name)", "computer name"),
         ("name of (operating system", "assuming client"),
+        ("name of operating sytem", "neither dialect; assuming client"),
         ("names of (bes computers", "looks like session"),
     ],
 )
@@ -94,6 +97,25 @@ def test_dialect_override_narrows_or_widens_the_run(mode, run):
     assert view.dialect_mode == mode
     assert view.run_dialects == run
     assert "set to" in view.dialect_reason
+
+
+@pytest.mark.parametrize(
+    ("text", "mode", "optional"),
+    [
+        # Auto added session only because the expression is valid in either.
+        ("now", "auto", True),
+        ("names of bes computers whose (name of it = computer name)", "auto", True),
+        # Session is the point of these runs.
+        ("names of bes computers", "auto", False),
+        ("now", "both", False),
+        ("now", "session", False),
+        # No session at all.
+        ("name of operating system", "auto", False),
+        ("now", "client", False),
+    ],
+)
+def test_session_is_optional_only_when_auto_added_it_beside_client(text, mode, optional):
+    assert summarize(text, mode).session_optional is optional
 
 
 def test_unknown_dialect_mode_is_rejected():

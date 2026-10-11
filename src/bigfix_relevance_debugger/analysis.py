@@ -104,6 +104,14 @@ class AnalysisView:
         """For display: ``"client"``, ``"session"`` or ``"session + client"``."""
         return " + ".join(self.run_dialects)
 
+    @property
+    def session_optional(self) -> bool:
+        """Auto added session beside client, so nobody asked for it.
+
+        Then a missing root server configuration isn't worth an error row.
+        """
+        return self.dialect_mode == AUTO and self.run_dialects == (SESSION, CLIENT)
+
 
 def _type_summary(check: object) -> str | None:
     value = getattr(check, "value", None)
@@ -134,7 +142,7 @@ def _fit_reason(fit: DialectFit) -> str:
         case "either":
             return "valid as either client or session relevance"
         case "unclear":
-            return "type-checks as neither dialect, so trying both"
+            return "type-checks as neither dialect; assuming client relevance"
         case "mixed":
             if fit.session_only and fit.client_only:
                 return (

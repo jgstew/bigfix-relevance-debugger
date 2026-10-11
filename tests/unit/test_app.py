@@ -1550,6 +1550,31 @@ async def test_both_without_client_targets_still_runs_session_and_says_so(user, 
     assert calls == ["now"]
 
 
+async def test_both_with_a_bad_target_field_warns_and_runs_nothing(user, monkeypatch):
+    calls: list[str] = []
+    streamed: list[list[Target]] = []
+    monkeypatch.setattr(app_module, "evaluate_session", fake_session(calls))
+
+    async def fake_stream(text, targets, opts, **upstream):
+        streamed.append(targets)
+        for _ in ():
+            yield
+
+    monkeypatch.setattr(app_module, "stream_results", fake_stream)
+    await user.open("/")
+    await set_text(user, "now")
+    user.find(marker="target-local").click()
+    # Ticked with the host left blank: a mistake to fix, not "no client targets".
+    user.find(marker="target-ssh").click()
+
+    user.find(marker="evaluate").click()
+
+    await user.should_see("SSH target needs a host")
+    await asyncio.sleep(0.1)
+    assert streamed == []
+    assert calls == []
+
+
 async def test_session_error_shows_as_an_error_row(user, monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(
@@ -1569,6 +1594,59 @@ async def test_session_error_shows_as_an_error_row(user, monkeypatch):
     assert row["ok"] is False
     assert row["status"] == "config"
     assert "No BigFix server" in row["preview"]
+
+
+NO_SERVER = {"answers": (), "error": "No BigFix server is configured", "error_kind": "config"}
+
+
+async def test_no_server_hides_the_session_row_auto_added(user, monkeypatch):
+    # `now` runs both only because it's valid in either; most users have no
+    # root server, and a red row on every such run would be noise.
+    calls: list[str] = []
+    monkeypatch.setattr(app_module, "evaluate_session", fake_session(calls, **NO_SERVER))
+    monkeypatch.setattr(app_module, "stream_results", stream_of(result("local", ["a"])))
+    await user.open("/")
+    await set_text(user, "now")
+    user.find(marker="target-local").click()
+
+    user.find(marker="evaluate").click()
+
+    await user.should_see("2 / 2")
+    await user.should_see("session relevance skipped")
+    assert calls == ["now"]
+    assert [r["dialect"] for r in results_table(user).rows] == ["client"]
+
+
+async def test_no_server_still_shows_when_both_was_picked(user, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(app_module, "evaluate_session", fake_session(calls, **NO_SERVER))
+    monkeypatch.setattr(app_module, "stream_results", stream_of(result("local", ["a"])))
+    await user.open("/")
+    await set_text(user, "now")
+    user.find(marker="target-local").click()
+    [picker] = user.find(marker="dialect").elements
+    picker.set_value("both")
+
+    user.find(marker="evaluate").click()
+
+    await user.should_see("2 / 2")
+    rows = results_table(user).rows
+    assert [(r["dialect"], r["status"]) for r in rows] == [("session", "config"), ("client", "ok")]
+
+
+async def test_no_server_still_shows_when_session_is_all_that_runs(user, monkeypatch):
+    # Auto picked both, but with no client targets the session row is the
+    # whole result, so hiding it would leave nothing to say what happened.
+    calls: list[str] = []
+    monkeypatch.setattr(app_module, "evaluate_session", fake_session(calls, **NO_SERVER))
+    await user.open("/")
+    await set_text(user, "now")
+
+    user.find(marker="evaluate").click()
+
+    await user.should_see("1 / 1")
+    [row] = results_table(user).rows
+    assert row["status"] == "config"
 
 
 async def test_session_only_expression_cannot_break_down(user):

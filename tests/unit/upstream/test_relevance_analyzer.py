@@ -87,8 +87,8 @@ C, S = Dialect.CLIENT, Dialect.SESSION
         ("now", {C, S}, "either"),
         ('(1, "a")', {C, S}, "either"),
         ("names of bes computers whose (name of it = computer name)", {C, S}, "mixed"),
-        # A typo type-checks in neither, so neither can be ruled out...
-        ("nme of operating system", {C, S}, "unclear"),
+        # A typo type-checks in neither: client, as when a typo breaks the parse...
+        ("nme of operating system", {C}, "unclear"),
         # ...unless the text itself says which: "bes <word>" is session.
         ("names of bes computerz", {S}, "classified"),
         ("names of (bes computers", {S}, "classified"),

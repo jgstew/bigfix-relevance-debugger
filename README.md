@@ -110,8 +110,12 @@ plugins use), so there's nothing to configure in this app:
    ```
 
 The app connects on the first session run, not at startup, and reuses that
-login. If nothing is configured, the session row says so and any client
-evaluation still runs. Queries are read-only (`/api/query`); the server's own
+login. If nothing is configured, the client evaluation still runs. When auto
+added session relevance only because the expression is valid in either
+dialect (`now`), that is noted in the activity log, not shown as an error
+row. When you asked for session relevance (a session-only expression, or
+**Session** / **Both** in the picker), the session row says so and lists
+where it looked. Queries are read-only (`/api/query`); the server's own
 evaluation time shows in the expanded row. besapi doesn't verify the server's
 TLS certificate by default.
 
