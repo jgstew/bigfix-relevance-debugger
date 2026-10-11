@@ -231,9 +231,19 @@ jobs:
           local = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in pathlib.Path("dist").glob(f"{stem}[-.]*")}
           if not any(n.endswith(".whl") for n in local) or not any(n.endswith(".tar.gz") for n in local):
               sys.exit(f"::error::dist/ has no wheel and sdist for {version}: {sorted(local)}")
+          # The simple index (PEP 691 JSON), the same source `uv publish
+          # --check-url` reads. Not /pypi/<pkg>/<version>/json: PyPI's CDN can
+          # keep serving a 404 for that URL for a while after an upload (seen
+          # on the 0.1.0 release), which would hide files PyPI already has.
+          # Filtered by filename, since the index lists every version. A 404
+          # here means the project has no releases yet.
+          request = urllib.request.Request(
+              f"https://pypi.org/simple/{package}/",
+              headers={"Accept": "application/vnd.pypi.simple.v1+json"},
+          )
           try:
-              with urllib.request.urlopen(f"https://pypi.org/pypi/{package}/{version}/json", timeout=30) as r:
-                  released = {f["filename"]: f["digests"]["sha256"] for f in json.load(r)["urls"]}
+              with urllib.request.urlopen(request, timeout=30) as r:
+                  released = {f["filename"]: f["hashes"]["sha256"] for f in json.load(r)["files"]}
           except urllib.error.HTTPError as e:
               if e.code != 404:
                   raise
