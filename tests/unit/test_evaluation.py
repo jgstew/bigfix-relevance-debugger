@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from bigfix_remote_client_relevance import ClientRelevanceResult, ResolvedQna, Target
@@ -17,10 +18,13 @@ from bigfix_relevance_debugger import evaluation
 from bigfix_relevance_debugger.analysis import summarize
 from bigfix_relevance_debugger.evaluation import (
     PREVIEW_CHARS,
+    SESSION_CONNECT_TIMEOUT_S,
+    SESSION_HOST_UNKNOWN,
     EvalOptions,
     LevelResult,
     ProbeView,
     ResultRow,
+    SessionConnector,
     TargetForm,
     TargetFormError,
     analyzer_platform,
@@ -28,6 +32,7 @@ from bigfix_relevance_debugger.evaluation import (
     breakdown_qna_note,
     build_targets,
     choose_breakdown_target,
+    evaluate_session,
     load_inventory_targets,
     order_results,
     resolve_container_arches,
@@ -35,6 +40,7 @@ from bigfix_relevance_debugger.evaluation import (
     results_summary,
     results_table_row,
     run_breakdown,
+    session_result_to_dict,
     stream_results,
     total_work,
     visible_results,
@@ -1069,9 +1075,11 @@ def test_table_row_cells_are_scalars():
     assert cells["host"] == "h"
     assert cells["platform"] == "debian/arm64"
     assert cells["qna"] == "11.0.7.61"
+    assert cells["dialect"] == "client"
     assert details == {
         "answers": "a\nb",
         "types": "string",
+        "detail": "qna 11.0.7.61",
         "error": None,
         "raw": "Q: x\nA: a\nA: b\n",
     }
@@ -1183,3 +1191,204 @@ def test_summary_when_filtered_says_showing_n_of_m_and_the_query():
 
 def test_summary_of_nothing_is_empty():
     assert results_summary([], 0, "") == ""
+
+
+# --- session relevance (issue 7) ------------------------------------------------------
+
+FIXTURES = Path(__file__).parent / "upstream" / "fixtures" / "besapi"
+
+
+class FakeBESConnection:
+    """Stands in for besapi's BESConnection: answers every query with ``xml``."""
+
+    rootserver = "https://bigfix.example.com:52311"
+
+    def __init__(self, xml=None, raises=None):
+        self.xml = xml if xml is not None else (FIXTURES / "plural.xml").read_text()
+        self.raises = raises
+        self.calls = []
+
+    def session_relevance_xml(self, relevance, **kwargs):
+        self.calls.append((relevance, kwargs))
+        if self.raises is not None:
+            raise self.raises
+        return SimpleNamespace(text=self.xml, request=SimpleNamespace(status_code=200))
+
+
+class CountingFactory:
+    def __init__(self, *results):
+        self.results = list(results)
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        result = self.results.pop(0) if len(self.results) > 1 else self.results[0]
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+
+async def test_session_evaluation_answers_with_server_details():
+    conn = FakeBESConnection()
+    connector = SessionConnector(CountingFactory(conn))
+
+    ev = await evaluate_session("(1;2;3)", EvalOptions(timeout_s=12), connector=connector)
+
+    assert ev.ok
+    assert ev.host == "bigfix.example.com"
+    assert ev.answers == ("1", "2", "3")
+    assert ev.answer_types == ("integer", "integer", "integer")
+    assert ev.plural is True
+    assert ev.evaluation_time == "0.39ms"
+    assert ev.elapsed_ms is not None and ev.elapsed_ms >= 0
+    # A short connect timeout, and the run's own timeout for the answer,
+    # instead of besapi's (90, 600) default.
+    assert conn.calls == [("(1;2;3)", {"timeout": (SESSION_CONNECT_TIMEOUT_S, 12.0)})]
+
+
+async def test_session_connection_is_made_once_and_reused():
+    factory = CountingFactory(FakeBESConnection())
+    connector = SessionConnector(factory)
+
+    await evaluate_session("now", EvalOptions(), connector=connector)
+    await evaluate_session("now", EvalOptions(), connector=connector)
+
+    assert factory.calls == 1
+
+
+async def test_session_relevance_error_is_a_result_not_a_raise():
+    conn = FakeBESConnection((FIXTURES / "error.xml").read_text())
+
+    ev = await evaluate_session(
+        "nme of bes computers", EvalOptions(), connector=SessionConnector(CountingFactory(conn))
+    )
+
+    assert not ev.ok
+    assert ev.error_kind == "relevance"
+    assert ev.error == 'The operator "nme" is not defined.'
+
+
+async def test_session_without_any_besapi_config_says_where_it_looked():
+    ev = await evaluate_session("now", EvalOptions(), connector=SessionConnector(lambda: None))
+
+    assert not ev.ok
+    assert ev.error_kind == "config"
+    assert ev.host == SESSION_HOST_UNKNOWN
+    assert ev.error is not None
+    assert "BES_ROOT_SERVER" in ev.error
+    assert "~/.besapi.conf" in ev.error
+
+
+async def test_session_login_failure_is_reported_and_retried_next_time():
+    factory = CountingFactory(ConnectionError("connection refused"), FakeBESConnection())
+    connector = SessionConnector(factory)
+
+    first = await evaluate_session("now", EvalOptions(), connector=connector)
+    second = await evaluate_session("now", EvalOptions(), connector=connector)
+
+    assert first.error_kind == "connection"
+    assert first.error is not None and "connection refused" in first.error
+    assert second.ok
+    assert factory.calls == 2
+
+
+async def test_session_query_failure_drops_the_connection():
+    broken = FakeBESConnection(raises=TimeoutError("read timed out"))
+    factory = CountingFactory(broken, FakeBESConnection())
+    connector = SessionConnector(factory)
+
+    first = await evaluate_session("now", EvalOptions(), connector=connector)
+    second = await evaluate_session("now", EvalOptions(), connector=connector)
+
+    assert first.error_kind == "connection"
+    assert first.host == "bigfix.example.com"
+    assert second.ok
+    assert factory.calls == 2
+
+
+async def test_session_default_connector_uses_besapi_plugin_connection(monkeypatch):
+    # conftest makes the real one fail loudly; this checks it is the one used.
+    from besapi import plugin_utilities
+
+    calls = []
+
+    def fake_get_besapi_connection(args=None):
+        calls.append(args)
+        return FakeBESConnection()
+
+    monkeypatch.setattr(plugin_utilities, "get_besapi_connection", fake_get_besapi_connection)
+
+    ev = await evaluate_session("(1;2;3)", EvalOptions())
+
+    assert ev.ok
+    assert calls == [None]
+
+
+def session_row(xml="plural.xml", factory=None):
+    conn = FakeBESConnection((FIXTURES / xml).read_text())
+    connector = SessionConnector(factory or CountingFactory(conn))
+    ev = asyncio.run(evaluate_session("x", EvalOptions(), connector=connector))
+    return ResultRow.from_session(ev)
+
+
+def test_session_result_row():
+    r = session_row("tuples.xml")
+
+    assert r.dialect == "session"
+    assert r.ok
+    assert r.status == "ok"
+    assert r.host == "bigfix.example.com"
+    assert r.display_host == "bigfix.example.com"
+    assert r.answers == ("1, a", "2, b")
+    assert r.answer_types_text == "( integer, string )"
+    assert r.platform_text == "session"
+    assert r.qna_version_text == ""
+    assert "0.47ms" in r.detail_text
+
+
+def test_client_result_row_is_client_dialect():
+    assert row("h", ["a"]).dialect == "client"
+
+
+def test_session_error_row():
+    r = session_row("error.xml")
+
+    assert not r.ok
+    assert r.status == "relevance"
+    assert r.error == 'The operator "nme" is not defined.'
+
+
+def test_session_rows_list_first_even_when_they_fail():
+    rows = [row("three", "abc"), session_row("error.xml"), row("one", "a")]
+
+    assert order_results(rows)[0] == 1
+
+
+def test_session_and_client_rows_for_one_host_stay_apart():
+    # A root server can also be an inventory host (fastquery or ssh to it).
+    rows = [row("bigfix.example.com", "a", transport="local"), session_row()]
+
+    order = order_results(rows)
+
+    assert order == [1, 0]
+    assert results_table_row(1, rows[1])["dialect"] == "session"
+    assert results_table_row(0, rows[0])["dialect"] == "client"
+
+
+def test_session_result_dict_for_export():
+    conn = FakeBESConnection((FIXTURES / "tuples.xml").read_text())
+    ev = asyncio.run(
+        evaluate_session("q", EvalOptions(), connector=SessionConnector(CountingFactory(conn)))
+    )
+
+    d = session_result_to_dict(ev)
+
+    assert d["dialect"] == "session"
+    assert d["host"] == "bigfix.example.com"
+    assert d["session_relevance"] == "q"
+    assert d["answers"] == ["1, a", "2, b"]
+    assert d["answer_types"] == ["( integer, string )", "( integer, string )"]
+    assert d["plural"] is True
+    assert d["evaluation_time"] == "0.47ms"
+    assert d["error"] is None
+    assert d["error_kind"] is None

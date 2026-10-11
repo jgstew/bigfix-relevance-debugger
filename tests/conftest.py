@@ -33,3 +33,24 @@ def _no_real_auto_discovery(monkeypatch):
         raise AssertionError(f"a test reached real auto-discovery (would write {path})")
 
     monkeypatch.setattr(remote_client_relevance, "run_auto_discovery", refuse)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_besapi_connection(monkeypatch):
+    """Fail loudly instead of connecting to a real BigFix root server.
+
+    besapi reads credentials from the environment and ~/.besapi.conf, so a
+    test that reached it could log in to whatever server the developer has
+    configured. The process-wide session connector is reset too, so a
+    connection one test made can't leak into the next.
+    """
+    from besapi import besapi, plugin_utilities
+
+    from bigfix_relevance_debugger import evaluation
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a test reached a real besapi connection")
+
+    monkeypatch.setattr(plugin_utilities, "get_besapi_connection", refuse)
+    monkeypatch.setattr(besapi.BESConnection, "login", refuse)
+    monkeypatch.setattr(evaluation, "_default_connector", None)

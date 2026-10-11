@@ -47,13 +47,81 @@ def test_costly_inspectors_surface():
     assert view.evaluation_cost > 0
 
 
-def test_client_neutral_expression_reports_neutral_dialect():
-    # Nothing in it is specific to either dialect, so the classifier has no opinion.
-    assert summarize("name of operating system").dialect == "neutral"
+@pytest.mark.parametrize(
+    ("text", "run", "dialect"),
+    [
+        ("name of operating system", ("client",), "client"),
+        ("names of bes computers", ("session",), "session"),
+        # Session first: the issue asks for session results to be listed first.
+        ("now", ("session", "client"), "session + client"),
+        (
+            "names of bes computers whose (name of it = computer name)",
+            ("session", "client"),
+            "session + client",
+        ),
+    ],
+)
+def test_auto_dialect_decides_what_runs(text, run, dialect):
+    view = summarize(text)
+
+    assert view.dialect_mode == "auto"
+    assert view.run_dialects == run
+    assert view.dialect == dialect
 
 
-def test_session_only_expression_reports_session_dialect():
-    assert summarize("names of bes computers").dialect == "session"
+@pytest.mark.parametrize(
+    ("text", "words"),
+    [
+        ("name of operating system", "only type-checks as client"),
+        ("names of bes computers", "bes computers"),
+        ("now", "either"),
+        ("names of bes computers whose (name of it = computer name)", "computer name"),
+        ("name of (operating system", "assuming client"),
+        ("names of (bes computers", "looks like session"),
+    ],
+)
+def test_auto_dialect_says_why(text, words):
+    assert words in summarize(text).dialect_reason
+
+
+@pytest.mark.parametrize(
+    ("mode", "run"),
+    [("client", ("client",)), ("session", ("session",)), ("both", ("session", "client"))],
+)
+def test_dialect_override_narrows_or_widens_the_run(mode, run):
+    view = summarize("now", mode)
+
+    assert view.dialect_mode == mode
+    assert view.run_dialects == run
+    assert "set to" in view.dialect_reason
+
+
+def test_unknown_dialect_mode_is_rejected():
+    with pytest.raises(ValueError, match="dialect"):
+        summarize("now", "sometimes")
+
+
+def test_session_only_expression_is_analyzed_and_linted_as_session():
+    view = summarize("names of bes computers")
+
+    # As client relevance it is unknown; as session relevance it type-checks.
+    assert view.type_summary == "plural string"
+    assert view.findings == ()
+
+
+def test_session_only_expression_cannot_break_down_yet():
+    view = summarize("names of bes computers")
+
+    assert view.can_breakdown is False
+    assert view.breakdown_disabled_reason is not None
+    assert "session" in view.breakdown_disabled_reason.lower()
+
+
+def test_expression_run_both_ways_breaks_down_as_client():
+    view = summarize("now")
+
+    assert view.can_breakdown is True
+    assert view.levels
 
 
 def test_parse_error_reports_line_and_column():

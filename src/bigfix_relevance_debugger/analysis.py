@@ -1,4 +1,4 @@
-"""Static analysis of client relevance, flattened into a view-model.
+"""Static analysis of relevance, flattened into a view-model.
 
 Pure and synchronous: wraps ``bigfix-relevance-analyzer`` and returns frozen
 dataclasses of plain values, so the UI never touches analyzer types and this
@@ -13,11 +13,29 @@ from bigfix_relevance_analyzer import (
     Dialect,
     LintConfig,
     analyze_relevance,
-    classify_relevance_dialect,
     lint_text,
 )
 
-from bigfix_relevance_debugger.upstream.relevance_analyzer import client_platforms
+from bigfix_relevance_debugger.upstream.relevance_analyzer import (
+    DialectFit,
+    client_platforms,
+    dialect_fit,
+)
+
+CLIENT = "client"
+SESSION = "session"
+AUTO = "auto"
+DIALECT_MODES = {
+    AUTO: (),
+    CLIENT: (CLIENT,),
+    SESSION: (SESSION,),
+    "both": (SESSION, CLIENT),
+}
+"""Dialect picker choices -> what runs. Session first: its results list first."""
+
+SESSION_BREAKDOWN_REASON = (
+    "Breakdown runs client relevance; session relevance can't break down yet."
+)
 
 
 @dataclass(frozen=True)
@@ -60,8 +78,12 @@ class LevelView:
 class AnalysisView:
     text: str
     parse_error: ParseErrorView | None
-    dialect: str
-    """``"client"``, ``"session"``, ``"uncertain"`` or ``"neutral"`` (no opinion)."""
+    dialect_mode: str
+    """The picker's choice: ``"auto"`` or one of the overrides in ``DIALECT_MODES``."""
+    run_dialects: tuple[str, ...]
+    """What Evaluate runs: ``"session"`` and/or ``"client"``, session first."""
+    dialect_reason: str
+    """User-facing: why ``run_dialects`` is what it is."""
     type_summary: str | None
     """E.g. ``"singular string"``; None when the text did not parse."""
     type_errors: tuple[str, ...]
@@ -77,6 +99,11 @@ class AnalysisView:
     can_breakdown: bool
     breakdown_disabled_reason: str | None
 
+    @property
+    def dialect(self) -> str:
+        """For display: ``"client"``, ``"session"`` or ``"session + client"``."""
+        return " + ".join(self.run_dialects)
+
 
 def _type_summary(check: object) -> str | None:
     value = getattr(check, "value", None)
@@ -89,11 +116,62 @@ def _type_summary(check: object) -> str | None:
     return f"{plurality} {' | '.join(sorted(types))}"
 
 
-def summarize(text: str) -> AnalysisView:
-    """Analyze and lint ``text`` as client relevance. Never raises for bad relevance."""
-    analysis = analyze_relevance(text, dialect=Dialect.CLIENT)
+def _names(names: tuple[str, ...], limit: int = 3) -> str:
+    shown = ", ".join(names[:limit])
+    return shown + (f" (+{len(names) - limit} more)" if len(names) > limit else "")
+
+
+def _fit_reason(fit: DialectFit) -> str:
+    """Why auto picked what it did, in a phrase."""
+    only = next(iter(fit.dialects)) if len(fit.dialects) == 1 else None
+    match fit.basis:
+        case "resolved":
+            names = fit.session_only if only is Dialect.SESSION else fit.client_only
+            kind = only.value if only else ""
+            return f"only {kind} relevance has {_names(names)}" if names else f"{kind} relevance"
+        case "type-check":
+            return f"only type-checks as {only.value if only else ''} relevance"
+        case "either":
+            return "valid as either client or session relevance"
+        case "unclear":
+            return "type-checks as neither dialect, so trying both"
+        case "mixed":
+            if fit.session_only and fit.client_only:
+                return (
+                    f"mixes session ({_names(fit.session_only)}) and client "
+                    f"({_names(fit.client_only)}) inspectors, so trying both"
+                )
+            return "mixes session and client inspectors, so trying both"
+        case "classified":
+            return f"looks like {only.value if only else ''} relevance"
+        case _:
+            return "nothing says which dialect; assuming client relevance"
+
+
+def _run_dialects(text: str, mode: str) -> tuple[tuple[str, ...], str]:
+    if mode not in DIALECT_MODES:
+        raise ValueError(f"unknown dialect mode {mode!r}")
+    if mode != AUTO:
+        return DIALECT_MODES[mode], f"set to {mode}"
+    fit = dialect_fit(text)
+    run = tuple(d for d in (SESSION, CLIENT) if Dialect(d) in fit.dialects)
+    return run, _fit_reason(fit)
+
+
+def summarize(text: str, mode: str = AUTO) -> AnalysisView:
+    """Analyze and lint ``text``, and decide which dialects to run it as.
+
+    ``mode`` is the dialect picker: ``"auto"`` decides from the relevance
+    itself, anything else in ``DIALECT_MODES`` overrides it. Analysis and lint
+    run as session relevance only when that is all that will run; otherwise as
+    client relevance, which is also what Breakdown evaluates. Never raises for
+    bad relevance.
+    """
+    run_dialects, dialect_reason = _run_dialects(text, mode)
+    dialect = Dialect.SESSION if run_dialects == (SESSION,) else Dialect.CLIENT
+    analysis = analyze_relevance(text, dialect=dialect)
     # suggest=True is fine for one statement; it is the "did you mean" list.
-    findings = lint_text(text, LintConfig(dialect=Dialect.CLIENT, suggest=True))
+    findings = lint_text(text, LintConfig(dialect=dialect, suggest=True))
 
     parse_error = None
     if analysis.parse_error is not None:
@@ -101,11 +179,6 @@ def summarize(text: str) -> AnalysisView:
         parse_error = ParseErrorView(
             message=pe.message, offset=pe.offset, line=pe.line, column=pe.column
         )
-
-    # analyze_relevance only classifies when no dialect is requested, and this
-    # tool always requests CLIENT, so ask the classifier directly for display.
-    classified = classify_relevance_dialect(text)
-    dialect = classified.value if classified is not None else "neutral"
 
     check = analysis.check
     type_errors = tuple(d.message for d in check.diagnostics) if check is not None else ()
@@ -127,8 +200,10 @@ def summarize(text: str) -> AnalysisView:
         for i, level in enumerate(analysis.levels)
     )
 
-    if parse_error is not None:
-        reason: str | None = f"Breakdown needs a clean parse: {parse_error.message}"
+    if CLIENT not in run_dialects:
+        reason: str | None = SESSION_BREAKDOWN_REASON
+    elif parse_error is not None:
+        reason = f"Breakdown needs a clean parse: {parse_error.message}"
     elif not levels:
         reason = "Nothing to break down in this expression."
     else:
@@ -138,7 +213,9 @@ def summarize(text: str) -> AnalysisView:
     return AnalysisView(
         text=text,
         parse_error=parse_error,
-        dialect=dialect,
+        dialect_mode=mode,
+        run_dialects=run_dialects,
+        dialect_reason=dialect_reason,
         type_summary=_type_summary(check),
         type_errors=type_errors,
         platforms=platforms,

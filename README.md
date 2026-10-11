@@ -1,6 +1,6 @@
 # bigfix-relevance-debugger
 
-A small browser GUI for BigFix **client relevance**:
+A small browser GUI for BigFix **client and session relevance**:
 
 1. **Live static analysis** while you type: parse errors with line and
    column, dialect, type check, lint findings with "did you mean"
@@ -9,6 +9,9 @@ A small browser GUI for BigFix **client relevance**:
 2. **Evaluation with real `qna`** on local, container (Docker/Podman) and
    SSH targets, with results streaming in as each target finishes. Uses
    [`bigfix-remote-client-relevance`](https://github.com/jgstew/bigfix-remote-client-relevance).
+   **Session relevance** runs on your BigFix root server through
+   [`besapi`](https://github.com/jgstew/besapi). The app works out which
+   dialect the expression is in and runs client, session, or both.
 3. A **per-level breakdown**, like the Fixlet Debugger's graphical breakdown.
    It runs one count probe per level of the expression on the chosen endpoint
    and shows how many objects each level produced, so you can see
@@ -68,6 +71,49 @@ opens a browser tab instead. For a native window, add a toolkit, e.g.
 - **Local:** whether a local qna is available depends on the platform (see
   the `bigfix-remote-client-relevance` docs). Containers are the reliable path
   on macOS.
+
+## Client or session relevance
+
+Evaluate looks at the expression and runs it as **client relevance** (qna on
+the targets), **session relevance** (the root server), or **both**. Session
+results are listed first. The **Dialect** picker shows what it decided and
+why, e.g. `auto: only session relevance has bes computers`:
+
+| The expression | Runs |
+| --- | --- |
+| uses client-only inspectors (`files`, `registry`, ...) | client |
+| uses session-only inspectors (`bes computers`, ...) | session |
+| is valid in either (`now`, `(1;2)`, string handling) | both |
+| mixes the two (`bes computers` and `computer name`) | both, so each side's error shows |
+| doesn't parse or type-check | whatever the text suggests (`bes ...` reads as session), otherwise client |
+
+Pick **Client**, **Session** or **Both** in the picker to override it. A
+session-only run doesn't need any targets selected. **Breakdown** runs client
+relevance only for now.
+
+### Connecting to the root server
+
+Session relevance uses besapi's own connection lookup (the one its server
+plugins use), so there's nothing to configure in this app:
+
+1. on a root server, that server's own credentials;
+2. the `BES_ROOT_SERVER`, `BES_USER_NAME` and `BES_PASSWORD` environment
+   variables;
+3. a `[besapi]` section in `/etc/besapi.conf`, `~/besapi.conf`,
+   `~/.besapi.conf` or `./besapi.conf` (a later file overrides an earlier one):
+
+   ```ini
+   [besapi]
+   BES_ROOT_SERVER = https://<ROOT_SERVER>:52311
+   BES_USER_NAME = <USER>
+   BES_PASSWORD = <PASSWORD>
+   ```
+
+The app connects on the first session run, not at startup, and reuses that
+login. If nothing is configured, the session row says so and any client
+evaluation still runs. Queries are read-only (`/api/query`); the server's own
+evaluation time shows in the expanded row. besapi doesn't verify the server's
+TLS certificate by default.
 
 ## Inventory (shared with `bigfix-remote-client-relevance`)
 
@@ -138,7 +184,12 @@ a specific target, select only that one.
    again. The first level that fails is highlighted with an arrow, and its
    error ("Singular expression refers to nonexistent object") is shown
    inline.
-7. Optional: put the inventory hosts back, add a second image
+7. Session relevance (needs a root server configured, see above): type
+   `names of bes computers`. The picker says `auto: only session relevance
+   has bes computers`. Click **Evaluate**: one row from the root server, no
+   targets needed. Then type `now`, which is valid in either dialect: the
+   session row lists first, then the client rows.
+8. Optional: put the inventory hosts back, add a second image
    (`debian:11, ubuntu:24.04`) or both arches, evaluate
    `names of files of folder "/etc"`, and watch the table re-sort as results
    stream in. Type `lsb-release` in the filter box: only the hosts with that
@@ -152,8 +203,8 @@ already cached, and have Docker running.
 
 ### Reading the results
 
-The results table has one row per result, best first: hosts with the most
-answers at the top, then hosts that answered nothing, then errors (in red).
+The results table has one row per result, best first: the session result
+(marked `session`) at the top, then hosts with the most answers, then hosts that answered nothing, then errors (in red).
 A host listing several qna versions in the inventory gets one row per
 version, kept together and told apart by the qna column. The line above the
 table counts them, e.g. `5 results: 3 with answers, 1 empty, 1 error`.
@@ -189,7 +240,8 @@ uv run ruff check src tests
 uv run pyright src tests
 ```
 
-Unit tests need no Docker, qna or network: evaluation runs the real
-orchestrator against an injected fake transport, and the page is tested with
-NiceGUI's simulated user. See [AGENTS.md](AGENTS.md) for layout and
+Unit tests need no Docker, qna, network or BigFix server: evaluation runs
+the real orchestrator against an injected fake transport, session relevance
+runs against a fake besapi connection with responses recorded from a real
+server, and the page is tested with NiceGUI's simulated user. See [AGENTS.md](AGENTS.md) for layout and
 conventions.

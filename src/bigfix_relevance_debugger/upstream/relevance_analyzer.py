@@ -8,7 +8,14 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from bigfix_relevance_analyzer import Outcome, RelevanceAnalysis, interpret_count_results
+from bigfix_relevance_analyzer import (
+    Dialect,
+    Outcome,
+    Plurality,
+    RelevanceAnalysis,
+    analyze_relevance,
+    interpret_count_results,
+)
 
 
 def client_platforms(analysis: RelevanceAnalysis) -> tuple[str, ...]:
@@ -60,3 +67,80 @@ def summarize_count_results(rows: Sequence[str]) -> CountSummary:
     total = sum(o.count or 0 for o in outcomes if o.outcome is not Outcome.NOT_EVALUABLE)
     outcome = Outcome.COUNT if total > 0 else Outcome.EMPTY_OR_ERROR
     return CountSummary(outcome.value, total, contexts, not_evaluable)
+
+
+@dataclass(frozen=True)
+class DialectFit:
+    """Which dialects a statement can run as: the ones worth evaluating it in.
+
+    ``basis`` says how that was decided:
+
+    - ``"resolved"``: every resolved reference belongs to the one dialect
+    - ``"type-check"``: references exist in both, but only one dialect's type
+      check accepts the statement (``name of operating system``: session has
+      ``operating system of <bes computer>``, never a bare ``operating system``)
+    - ``"either"``: both type checks accept it, e.g. ``now``
+    - ``"unclear"``: neither type check accepts it (a typo) and the text gives
+      no hint, so neither is ruled out
+    - ``"mixed"``: it uses references from both dialects (``Dialect.UNCERTAIN``)
+    - ``"classified"``: it doesn't parse or type-check, but the text classifier
+      has a view (``bes <word>`` reads as session)
+    - ``"default"``: it doesn't parse and nothing hints at session: client
+    """
+
+    dialects: frozenset[Dialect]
+    """``CLIENT`` and/or ``SESSION``; never empty."""
+    basis: str
+    client_only: tuple[str, ...] = ()
+    """References only client relevance has."""
+    session_only: tuple[str, ...] = ()
+    """References only session relevance has."""
+
+
+def _type_checks(text: str, dialect: Dialect) -> bool:
+    check = analyze_relevance(text, dialect=dialect).check
+    return (
+        check is not None
+        and not check.diagnostics
+        and check.value.plurality is not Plurality.UNKNOWN
+    )
+
+
+def dialect_fit(text: str) -> DialectFit:
+    """Decide which dialects ``text`` can run as, from its references and type checks.
+
+    ``RelevanceAnalysis.resolved_dialect`` intersects dialects by reference
+    *name*, so it reports ``BOTH`` for some client-only statements; type
+    checking under each dialect settles those.
+
+    Upstream: ``resolved_dialect`` itself could consult the type check.
+    """
+    both = frozenset({Dialect.CLIENT, Dialect.SESSION})
+    analysis = analyze_relevance(text)
+    client_only = analysis.references_only_in(Dialect.CLIENT)
+    session_only = analysis.references_only_in(Dialect.SESSION)
+
+    def fit(dialects: frozenset[Dialect], basis: str) -> DialectFit:
+        return DialectFit(dialects, basis, client_only, session_only)
+
+    classified = analysis.classified_dialect
+    resolved = analysis.resolved_dialect
+    if resolved in (Dialect.CLIENT, Dialect.SESSION):
+        return fit(frozenset({resolved}), "resolved")
+    if resolved is Dialect.UNCERTAIN:
+        return fit(both, "mixed")
+    if resolved is Dialect.BOTH:
+        ok = frozenset(d for d in both if _type_checks(text, d))
+        if len(ok) == 1:
+            return fit(ok, "type-check")
+        if ok:
+            return fit(both, "either")
+        if classified in (Dialect.CLIENT, Dialect.SESSION):
+            return fit(frozenset({classified}), "classified")
+        return fit(both, "unclear")
+    # Unparsed, or nothing resolved: fall back on the text classifier.
+    if classified in (Dialect.CLIENT, Dialect.SESSION):
+        return fit(frozenset({classified}), "classified")
+    if classified is Dialect.UNCERTAIN:
+        return fit(both, "mixed")
+    return fit(frozenset({Dialect.CLIENT}), "default")
