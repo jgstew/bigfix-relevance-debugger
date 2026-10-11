@@ -45,10 +45,17 @@ def _no_real_container_engine(monkeypatch):
     """
     from bigfix_relevance_debugger import evaluation
 
+    reached: list[str] = []
+
     def refuse():
+        reached.append("default_image_source")
         raise AssertionError("a test reached a real container engine lookup")
 
     monkeypatch.setattr(evaluation, "default_image_source", refuse)
+    yield
+    # Also at teardown: the page's background lookup catches errors (it must
+    # not take the page down), which would swallow the raise above.
+    assert not reached, "a test reached a real container engine lookup"
 
 
 @pytest.fixture(autouse=True)

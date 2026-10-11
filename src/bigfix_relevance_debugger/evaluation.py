@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
 import logging
 import threading
 import time
@@ -248,21 +249,27 @@ async def resolve_container_arches(
     form: TargetForm,
     *,
     images_factory: Callable[[], ImageSource | None] | None = None,
+    known: Mapping[str, Sequence[str]] | None = None,
 ) -> dict[str, list[str]]:
     """Look up the ``auto`` arch for each container image; {} when not needed.
 
     Asks the container engine (and through it the registry) in a worker
-    thread, since both block. The default engine is looked up at call time,
-    so the tests can refuse it.
+    thread, since both block, and only about images missing from ``known``
+    (arches found earlier; an image's published arches rarely change). The
+    default engine is looked up at call time, so the tests can refuse it.
     """
     if not form.container or AUTO_ARCH not in form.container_arches:
         return {}
+    known = known or {}
+    wanted = _images(form)
+    missing = [image for image in wanted if image not in known]
 
     def lookup() -> dict[str, list[str]]:
         images = (images_factory or default_image_source)()
-        return {image: published_arches(image, images) for image in _images(form)}
+        return {image: published_arches(image, images) for image in missing}
 
-    return await asyncio.to_thread(lookup)
+    found = await asyncio.to_thread(lookup) if missing else {}
+    return {image: list(known[image]) if image in known else found[image] for image in wanted}
 
 
 @dataclass(frozen=True)
@@ -766,13 +773,26 @@ class ResultRow:
         error = self.error or ("" if self.ok else self.status)
         return any(needle in text.casefold() for text in (*self.answers, error))
 
+    @functools.cached_property
+    def tally_keys(self) -> tuple[str, ...]:
+        """The answer-summary rows this result counts under, in answer order.
+
+        Cached: a pick tests every row on every render. (A frozen dataclass
+        still has a ``__dict__``, which is where ``cached_property`` stores it.)
+        """
+        return tuple(_row_keys(self))
+
+    @functools.cached_property
+    def _tally_key_set(self) -> frozenset[str]:
+        return frozenset(self.tally_keys)
+
     def has_key(self, key: str) -> bool:
         """Whether this result is counted under the answer-summary row ``key``.
 
         Exact, unlike ``matches``: a pick shows exactly the systems its row
         counted. Session results are never counted, so never match.
         """
-        return self.dialect != "session" and key in _row_keys(self)
+        return self.dialect != "session" and key in self._tally_key_set
 
 
 # --- results view ---------------------------------------------------------------------
@@ -946,7 +966,8 @@ class TallyRow:
         if self.kind == EMPTY:
             return NO_ANSWERS
         if self.kind == ERROR:
-            return f"error: {self.value}"
+            # ResultRow.status is "error" itself when the result had no kind.
+            return "error" if self.value == ERROR else f"error: {self.value}"
         return _shown(self.value)
 
 
@@ -968,7 +989,7 @@ def pick_phrase(key: str) -> str:
     if kind == EMPTY:
         return "with no answers"
     if kind == ERROR:
-        return f"with a {value} error"
+        return "with an error" if value == ERROR else f"with an error ({value})"
     return f'answering "{_shown(value)}"'
 
 
@@ -997,7 +1018,7 @@ class AnswerTally:
         if row.dialect == "session":
             return
         self._systems[row.display_host] = None
-        for key in _row_keys(row):
+        for key in row.tally_keys:
             self._hosts.setdefault(key, {})[row.display_host] = None
 
     @property

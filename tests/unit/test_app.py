@@ -20,6 +20,7 @@ from nicegui.testing.user_download import UserDownload
 from nicegui.testing.user_simulation import user_simulation
 
 from bigfix_relevance_debugger import app as app_module
+from bigfix_relevance_debugger import evaluation
 from bigfix_relevance_debugger.app import Debouncer, build_parser, main
 from bigfix_relevance_debugger.evaluation import (
     AnswerTally,
@@ -2155,13 +2156,16 @@ async def test_target_count_updates_when_a_target_is_ticked(inventory_user):
 
 
 def fake_arches(calls: list[str] | None = None, *, fail: bool = False):
-    async def resolve(form, **kwargs):
+    """A resolve_container_arches that, like the real one, asks only about unknown images."""
+
+    async def resolve(form, *, known=None, **kwargs):
         if fail:
             raise RuntimeError("engine went away")
+        known = known or {}
         images = [i.strip() for i in form.container_images.split(",") if i.strip()]
         if calls is not None:
-            calls.extend(images)
-        return {image: ["x86_64", "arm64"] for image in images}
+            calls.extend(i for i in images if i not in known)
+        return {image: list(known.get(image, ["x86_64", "arm64"])) for image in images}
 
     return resolve
 
@@ -2386,3 +2390,127 @@ async def test_inventory_filter_with_many_hosts_filters_the_table(monkeypatch, t
         await asyncio.sleep(0.05)
 
         assert inventory_table(user).props["filter"] == "lab-3"
+
+
+# --- PR #12 review ----------------------------------------------------------------------------
+
+
+class RecordingImages:
+    """A container engine for the real resolve_container_arches: records what it's asked."""
+
+    def __init__(self, published: dict[str, set[str]]) -> None:
+        self.published = published
+        self.asked: list[str] = []
+
+    def local_tags(self):
+        return []
+
+    def platforms(self, image):
+        self.asked.append(image)
+        return self.published.get(image)
+
+
+def fake_engine(monkeypatch) -> RecordingImages:
+    images = RecordingImages({"debian:11": {"x86_64", "arm64"}, "ubuntu:24.04": {"arm64"}})
+    monkeypatch.setattr(evaluation, "default_image_source", lambda: images)
+    return images
+
+
+async def test_refreshes_do_not_restart_an_arch_lookup_in_flight(user, monkeypatch):
+    gate = asyncio.Event()
+    calls: list[str] = []
+
+    async def slow_registry(form, **kwargs):
+        calls.append(form.container_images)
+        await gate.wait()
+        return {"debian:11": ["x86_64", "arm64"]}
+
+    monkeypatch.setattr(app_module, "resolve_container_arches", slow_registry)
+    await user.open("/")
+    user.find(marker="target-container").click()
+    await after_arch_lookup()
+    assert calls == ["debian:11"]  # started, waiting on the registry
+
+    # Typing and ticking refresh the count; none of that may restart the lookup.
+    for _ in range(3):
+        user.find(marker="target-local").click()
+        await asyncio.sleep(0.1)
+    await set_text(user, "name of operating system")
+    await after_arch_lookup()
+    gate.set()
+    await asyncio.sleep(0.1)
+
+    assert calls == ["debian:11"]
+    await count_reads(user, "3 systems")
+
+
+async def test_arch_lookup_asks_only_for_added_images(user, monkeypatch):
+    images = fake_engine(monkeypatch)
+    await user.open("/")
+    user.find(marker="target-container").click()
+    await after_arch_lookup()
+    await count_reads(user, "2 systems")
+
+    button(user, "container-images").set_value("debian:11, ubuntu:24.04")
+    await after_arch_lookup()
+
+    assert images.asked == ["debian:11", "ubuntu:24.04"]
+    await count_reads(user, "3 systems")
+
+
+async def test_evaluate_reuses_the_arches_the_count_looked_up(user, monkeypatch):
+    images = fake_engine(monkeypatch)
+    monkeypatch.setattr(app_module, "stream_results", stream_of(result("a"), result("b")))
+    await user.open("/")
+    await set_text(user, "name of operating system")
+    user.find(marker="target-container").click()
+    await after_arch_lookup()
+    await count_reads(user, "2 systems")
+
+    user.find(marker="evaluate").click()
+    await user.should_see("2 / 2")
+
+    assert images.asked == ["debian:11"]
+
+
+async def test_arch_lookup_failure_is_shown_and_not_retried_on_every_change(user, monkeypatch):
+    calls: list[int] = []
+
+    async def broken(form, **kwargs):
+        calls.append(1)
+        raise RuntimeError("engine went away")
+
+    monkeypatch.setattr(app_module, "resolve_container_arches", broken)
+    await user.open("/")
+    user.find(marker="target-container").click()
+    await after_arch_lookup()
+
+    user.find(marker="target-local").click()
+    user.find(marker="target-local").click()
+    await after_arch_lookup()
+
+    assert calls == [1]
+    await user.should_see("engine went away")  # in the activity log
+    await count_reads(user, "≥ 1 system")
+
+
+async def test_answer_summary_is_rebuilt_only_when_it_changes(user, monkeypatch):
+    calls: list[int] = []
+    real = AnswerTally.rows
+
+    def counting(self, limit=app_module.TALLY_LIMIT):
+        calls.append(1)
+        return real(self, limit)
+
+    monkeypatch.setattr(AnswerTally, "rows", counting)
+    await evaluated_summary_fleet(user, monkeypatch, *PICK_FLEET)
+    calls.clear()
+
+    await search(user, "debian")
+    await clear_search(user)
+    [row] = [r for r in results_table(user).rows if r["host"] == "rh"]
+    user.find(marker="results").trigger("update:expanded", [row["id"]])
+    assert calls == []
+
+    await pick(user, "Linux Debian 11")  # the picked row's highlight changes
+    assert len(calls) == 1

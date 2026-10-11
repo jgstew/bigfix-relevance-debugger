@@ -239,6 +239,30 @@ async def test_resolve_container_arches_skips_the_registry_when_not_needed():
     )
 
 
+async def test_resolve_container_arches_asks_only_for_images_it_doesnt_know():
+    images = FakeImages({"ubuntu:24.04": {"arm64"}})
+
+    resolved = await resolve_container_arches(
+        TargetForm(container=True, container_images="debian:11, ubuntu:24.04"),
+        images_factory=lambda: images,
+        known={"debian:11": ["x86_64", "arm64"], "other:1": ["arm64"]},
+    )
+
+    assert images.asked == ["ubuntu:24.04"]
+    assert resolved == {"debian:11": ["x86_64", "arm64"], "ubuntu:24.04": ["arm64"]}
+
+
+async def test_resolve_container_arches_all_known_asks_no_engine():
+    def explode():
+        raise AssertionError("no engine lookup expected")
+
+    resolved = await resolve_container_arches(
+        TargetForm(container=True), images_factory=explode, known={"debian:11": ["arm64"]}
+    )
+
+    assert resolved == {"debian:11": ["arm64"]}
+
+
 async def test_resolve_container_arches_default_engine_is_looked_up_at_call_time(monkeypatch):
     # Checked first, so the run before the fix fails here and never asks a real engine.
     assert inspect.signature(resolve_container_arches).parameters["images_factory"].default is None
@@ -1689,7 +1713,17 @@ def test_pick_labels_match_the_summary_rows():
 def test_pick_phrases():
     assert pick_phrase(TallyRow("answer", "", 1).key) == 'answering """"'
     assert pick_phrase(TallyRow("empty", "", 1).key) == "with no answers"
-    assert pick_phrase(TallyRow("error", "transport", 1).key) == "with a transport error"
+    assert pick_phrase(TallyRow("error", "transport", 1).key) == "with an error (transport)"
+    assert pick_phrase(TallyRow("error", "auth", 1).key) == "with an error (auth)"
+
+
+def test_an_error_without_a_kind_reads_as_plain_error():
+    # ResultRow.status falls back to "error" with no error_kind. The library's
+    # failed results always have one, but the wording mustn't read "error error".
+    unknown = TallyRow("error", "error", 1)
+
+    assert unknown.label == "error"
+    assert pick_phrase(unknown.key) == "with an error"
 
 
 PICK_FLEET = [
@@ -1752,7 +1786,7 @@ def test_summary_with_pick_says_which_answer():
         "hosts with no answers"
     )
     assert results_summary(PICK_FLEET, 1, "", TallyRow("error", "transport", 1).key).endswith(
-        "hosts with a transport error"
+        "hosts with an error (transport)"
     )
 
 

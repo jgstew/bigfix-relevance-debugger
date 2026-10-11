@@ -298,7 +298,9 @@ class _PageState:
     """The answer-summary row clicked (its key): results show only the systems it
     counted. Kept across runs like the filter; Clear drops it."""
     image_arches: dict[str, list[str]] = dataclasses.field(default_factory=dict)
-    """``auto`` arches looked up so far, per image, so the target count is exact."""
+    """``auto`` arches looked up so far, per image: the count and Evaluate both reuse them."""
+    arch_lookup_failed: set[str] = dataclasses.field(default_factory=set)
+    """Images whose background lookup failed; only Evaluate tries those again."""
     inventory_ready: bool = False
     """The inventory load (or first-run discovery) has finished."""
 
@@ -641,23 +643,47 @@ async def root() -> None:
         target_count.classes(
             add="text-negative" if problem else "", remove="" if problem else "text-negative"
         )
-        if preview.unresolved_images:
+        # Not while a lookup is in flight: the debounce would cancel it mid-query,
+        # and its worker thread would keep asking the registry regardless.
+        if arches_to_look_up(preview) and (arch_task is None or arch_task.done()):
             arch_debouncer.trigger()
         return preview
 
-    async def look_up_arches() -> None:
-        # A run looks them up itself (and fills the cache); so might the last lookup.
-        if state.running or not current_preview().unresolved_images:
+    def arches_to_look_up(preview: TargetPreview) -> list[str]:
+        return [i for i in preview.unresolved_images if i not in state.arch_lookup_failed]
+
+    arch_task: asyncio.Task[None] | None = None
+
+    def start_arch_lookup() -> None:
+        """After the debounce: look up the count's missing arches, in a task of its own."""
+        nonlocal arch_task
+        # A run looks them up itself and fills the cache.
+        if state.running or (arch_task is not None and not arch_task.done()):
             return
+        images = arches_to_look_up(current_preview())
+        if not images:
+            return
+        arch_task = asyncio.create_task(look_up_arches(images))
+        # Once it's done, so a change made meanwhile gets its own lookup.
+        arch_task.add_done_callback(lambda _: client.is_deleted or refresh_targets())
+
+    async def look_up_arches(images: list[str]) -> None:
         try:
-            found = await resolve_container_arches(state.form)
-        except Exception:
-            logger.debug("arch lookup for the target count failed", exc_info=True)
+            found = await resolve_container_arches(state.form, known=state.image_arches)
+        except Exception as exc:
+            # published_arches already falls back to this machine's arch when
+            # no engine or registry answers, so this is unexpected; say so.
+            state.arch_lookup_failed.update(images)
+            message = (
+                f"couldn't look up the arches of {', '.join(images)} for the target count: "
+                f"{exc}; Evaluate will try again"
+            )
+            logger.warning(message, exc_info=True)
+            activity.push(message)
             return
         state.image_arches.update(found)
-        refresh_targets()
 
-    arch_debouncer = Debouncer(ARCH_LOOKUP_DEBOUNCE_S, look_up_arches)
+    arch_debouncer = Debouncer(ARCH_LOOKUP_DEBOUNCE_S, start_arch_lookup)
     targets_toggle.on_click(side_panel.toggle)
 
     # --- running ----------------------------------------------------------------
@@ -681,7 +707,7 @@ async def root() -> None:
             )
             if not client:
                 return [], opts
-            image_arches = await resolve_container_arches(state.form)
+            image_arches = await resolve_container_arches(state.form, known=state.image_arches)
             state.image_arches.update(image_arches)
             refresh_targets()
             # Wait for the inventory only when the run needs it; the target
@@ -763,6 +789,7 @@ async def root() -> None:
             if state.expanded_before_filter is not None:
                 state.expanded_before_filter = set()  # old keys mean nothing now
             render_results()
+            render_answers()
             progress.set_value(0)
             progress_label.set_text(f"0 / {total}")
 
@@ -778,6 +805,7 @@ async def root() -> None:
                 state.rows.append(row)
                 tick()
                 render_results()
+                render_answers()
 
             # With no client targets the session row is all there is to show.
             session_optional = view.session_optional and bool(targets)
@@ -840,10 +868,13 @@ async def root() -> None:
             pick_chip.value = True  # its ✕ set it False; a new pick shows it again
         pick_chip.set_visibility(state.pick is not None)
         results_section.set_visibility(bool(state.rows))
-        render_answers()
 
     def render_answers() -> None:
-        """The answer summary: the whole run, whatever the filter hides."""
+        """The answer summary: the whole run, whatever the filter hides.
+
+        Only when it changes (a result arrives, a pick, Clear), not on every
+        render_results: filtering and expanding leave it as it is.
+        """
         tally = state.tally
         rows, hidden = tally.rows(TALLY_LIMIT)
         answers_table.rows = [tally_table_row(r, tally.systems, state.pick) for r in rows]
@@ -869,6 +900,7 @@ async def root() -> None:
         key = str(e.args)
         state.pick = None if state.pick == key else key
         render_results()
+        render_answers()  # the picked row's highlight
 
     answers_table.on("pick", on_pick)
 
@@ -876,6 +908,7 @@ async def root() -> None:
         if not e.value and state.pick is not None:
             state.pick = None
             render_results()
+            render_answers()
 
     pick_chip.on_value_change(on_pick_removed)
 
@@ -961,6 +994,7 @@ async def root() -> None:
         state.filter_text = ""
         state.filter_seen = set()
         render_results()
+        render_answers()
         breakdown_box.clear()
         update_stale()
         set_highlight(None)
@@ -989,6 +1023,7 @@ async def root() -> None:
     client.on_delete(debouncer.cancel)
     client.on_delete(filter_debouncer.cancel)
     client.on_delete(arch_debouncer.cancel)
+    client.on_delete(lambda: arch_task is not None and arch_task.cancel())
     client.on_delete(cancel)
 
     # --- inventory -------------------------------------------------------------------
