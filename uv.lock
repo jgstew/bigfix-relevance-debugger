@@ -287,9 +287,9 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "besapi", specifier = ">=4.4.3" },
-    { name = "bigfix-relevance-analyzer", specifier = ">=1.29.1" },
-    { name = "bigfix-remote-client-relevance", specifier = ">=1.5.2" },
+    { name = "besapi", specifier = ">=4.4.3,<5" },
+    { name = "bigfix-relevance-analyzer", specifier = ">=1.29.1,<2" },
+    { name = "bigfix-remote-client-relevance", specifier = ">=1.5.2,<2" },
     { name = "nicegui", extras = ["native"], specifier = ">=3.18.0" },
 ]
 

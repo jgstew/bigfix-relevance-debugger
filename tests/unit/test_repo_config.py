@@ -72,3 +72,18 @@ def test_every_jgstew_package_is_a_dependency():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
     names = {re.split(r"[\[<>=!~; ]", d, maxsplit=1)[0] for d in project["dependencies"]}
     assert names >= JGSTEW_PACKAGES
+
+
+def test_jgstew_dependencies_allow_minor_updates_but_not_the_next_major():
+    # Same-major releases of jgstew's libraries are taken as they come (and
+    # skip the cooldown); a new major is a breaking change to adopt on purpose.
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    for dep in project["dependencies"]:
+        name = re.split(r"[\[<>=!~; ]", dep, maxsplit=1)[0]
+        if name not in JGSTEW_PACKAGES:
+            continue
+        floor = re.search(r">=\s*(\d+)[.\d]*", dep)
+        assert floor, f"{dep}: no >= floor"
+        assert re.search(rf",\s*<\s*{int(floor.group(1)) + 1}(\.0)*\s*$", dep), (
+            f"{dep}: needs an upper bound of <{int(floor.group(1)) + 1}"
+        )
