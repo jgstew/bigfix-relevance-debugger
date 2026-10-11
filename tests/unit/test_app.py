@@ -410,9 +410,11 @@ async def test_default_inventory_is_the_librarys_bigfix_remote_clients_toml(monk
 
     async with user_simulation(root=app_module.root) as user:
         await user.open("/")
-        [select] = user.find(marker="inventory").elements
-        assert list(select.options.values()) == ["shared-lab (ssh)"]
-        assert str(home / ".bigfix" / "remote_clients.toml") in select.props["label"]
+        await user.should_see(marker="inventory")
+        [row] = inventory_table(user).rows
+        assert (row["label"], row["kind"]) == ("shared-lab", "ssh")
+        title = hidden_element(user, "inventory-title").text
+        assert str(home / ".bigfix" / "remote_clients.toml") in title
 
 
 def test_inventory_flag_sets_path(captured_run, monkeypatch, tmp_path):
@@ -480,6 +482,23 @@ async def test_breakdown_shows_probe_error_message_inline(user, monkeypatch):
 def button(user, marker):
     [element] = user.find(marker=marker).elements
     return element
+
+
+def inventory_table(user):
+    return hidden_element(user, "inventory")
+
+
+def selected_ids(user) -> list[int]:
+    return sorted(r["id"] for r in inventory_table(user).selected)
+
+
+async def deselect(user, *ids: int) -> None:
+    """What unticking hosts in the inventory table sends."""
+    rows = [r for r in inventory_table(user).rows if r["id"] in ids]
+    user.find(marker="inventory").trigger(
+        "selection", {"rows": rows, "added": False, "keys": list(ids)}
+    )
+    await asyncio.sleep(0.05)
 
 
 async def test_buttons_reset_after_a_run_finishes(user, monkeypatch):
@@ -551,8 +570,8 @@ async def inventory_user(monkeypatch, tmp_path):
 async def test_inventory_targets_are_all_selected_by_default(inventory_user):
     await inventory_user.open("/")
 
-    [select] = inventory_user.find(marker="inventory").elements
-    assert select.value == [0, 1]
+    await inventory_user.should_see(marker="inventory")
+    assert selected_ids(inventory_user) == [0, 1]
 
 
 async def test_evaluate_defaults_to_every_inventory_target(inventory_user, monkeypatch):
@@ -621,11 +640,16 @@ async def test_breakdown_picks_the_target_matching_the_expressions_platform(monk
     assert seen["target"] is windows
 
 
-async def test_inventory_picker_is_clearable(inventory_user):
+async def test_inventory_can_select_none(inventory_user):
     await inventory_user.open("/")
+    await inventory_user.should_see(marker="inventory")
 
-    [select] = inventory_user.find(marker="inventory").elements
-    assert select.props.get("clearable") is True
+    await deselect(inventory_user, 0, 1)
+
+    assert selected_ids(inventory_user) == []
+    await count_reads(inventory_user, "0 systems")
+    inventory_user.find(marker="evaluate").click()
+    await notified(inventory_user, "Pick at least one target")
 
 
 async def test_container_auto_arch_evaluates_every_published_arch(user, monkeypatch):
@@ -677,8 +701,7 @@ async def test_no_inventory_runs_discovery_and_selects_what_it_found(monkeypatch
     async with user_simulation(root=app_module.root) as user:
         await user.open("/")
         await user.should_see(marker="inventory")
-        [select] = user.find(marker="inventory").elements
-        assert select.value == [0, 1]
+        assert selected_ids(user) == [0, 1]
 
 
 async def test_discovery_progress_shows_while_it_runs(monkeypatch):
@@ -2279,3 +2302,87 @@ async def test_main_column_is_full_width(user):
     results_section = hidden_element(user, "results-section")
     assert "w-full" in results_section.parent_slot.parent.classes
     assert not [e for e in user.client.elements.values() if "w-2/3" in e.classes]
+
+
+# --- inventory table (issue 8) --------------------------------------------------------------
+
+
+async def inventory_page(monkeypatch, tmp_path, targets):
+    monkeypatch.setattr(app_module, "_inventory_path", tmp_path / "remote_clients.toml")
+    monkeypatch.setattr(
+        app_module,
+        "load_inventory_targets",
+        lambda path: InventoryLoad(path=path, targets=list(targets), error=None),
+    )
+
+
+async def test_inventory_table_shows_kind_platform_and_qna(monkeypatch, tmp_path):
+    await inventory_page(
+        monkeypatch,
+        tmp_path,
+        [
+            Target(kind="container", name="deb", image="debian:11", qna_version=["1.0", "2.0"]),
+            Target(kind="ssh", name="lab-box"),
+        ],
+    )
+
+    async with user_simulation(root=app_module.root) as user:
+        await user.open("/")
+        await user.should_see(marker="inventory")
+
+        deb, box = inventory_table(user).rows
+        assert (deb["kind"], deb["platform"], deb["qna"]) == ("container", "debian", "1.0, 2.0")
+        assert (box["label"], box["platform"], box["qna"]) == ("lab-box", "?", "")
+
+
+async def test_deselected_inventory_host_is_not_evaluated(inventory_user, monkeypatch):
+    seen: dict = {}
+
+    async def fake_stream(text, targets, opts, **upstream):
+        seen["targets"] = targets
+        yield ClientRelevanceResult(host="lab-a", transport="ssh", client_relevance=text)
+
+    monkeypatch.setattr(app_module, "stream_results", fake_stream)
+    await inventory_user.open("/")
+    await inventory_user.should_see(marker="inventory")
+    await set_text(inventory_user, "name of operating system")
+
+    await deselect(inventory_user, 1)
+    inventory_user.find(marker="evaluate").click()
+
+    await inventory_user.should_see("1 / 1")
+    assert seen["targets"] == [TWO_HOSTS[0]]
+
+
+async def test_inventory_selection_updates_the_count_and_caption(inventory_user):
+    await inventory_user.open("/")
+    await inventory_user.should_see(marker="inventory")
+    assert hidden_element(inventory_user, "inventory-count").text == "2 of 2 selected"
+
+    await deselect(inventory_user, 1)
+
+    assert hidden_element(inventory_user, "inventory-count").text == "1 of 2 selected"
+    await count_reads(inventory_user, "1 system")
+
+
+async def test_inventory_filter_only_with_many_hosts(inventory_user):
+    await inventory_user.open("/")
+    await inventory_user.should_see(marker="inventory")
+
+    assert not [
+        e for e in inventory_user.client.elements.values() if "inventory-filter" in e._markers
+    ]
+
+
+async def test_inventory_filter_with_many_hosts_filters_the_table(monkeypatch, tmp_path):
+    hosts = [Target(kind="ssh", name=f"lab-{i}") for i in range(9)]
+    await inventory_page(monkeypatch, tmp_path, hosts)
+
+    async with user_simulation(root=app_module.root) as user:
+        await user.open("/")
+        await user.should_see(marker="inventory-filter")
+
+        user.find(marker="inventory-filter").type("lab-3")
+        await asyncio.sleep(0.05)
+
+        assert inventory_table(user).props["filter"] == "lab-3"

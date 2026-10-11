@@ -285,6 +285,18 @@ def load_inventory_targets(path: Path | None) -> InventoryLoad:
         return InventoryLoad(path=path, targets=[], error=f"{type(exc).__name__}: {exc}")
 
 
+def inventory_table_row(key: int, target: Target) -> Cells:
+    """One row of the inventory picker: enough to tell hosts apart before ticking them."""
+    version = target.qna_version
+    return {
+        "id": key,
+        "label": target.label,
+        "kind": target.kind,
+        "platform": target_platform(target) or "?",
+        "qna": version if isinstance(version, str) else ", ".join(version or ()),
+    }
+
+
 # --- target preview -------------------------------------------------------------------
 
 SESSION_TARGET = "BigFix server"

@@ -58,6 +58,7 @@ from bigfix_relevance_debugger.evaluation import (
     build_targets,
     choose_breakdown_target,
     evaluate_session,
+    inventory_table_row,
     load_inventory_targets,
     pick_label,
     preview_targets,
@@ -86,6 +87,8 @@ FILTER_DEBOUNCE_S = 0.2
 ARCH_LOOKUP_DEBOUNCE_S = 0.5
 """The target count looks up an ``auto`` arch once typing in the image field pauses."""
 SIDE_PANEL_WIDTH = 420
+INVENTORY_FILTER_MIN = 9
+"""Hosts it takes for the inventory table to get a filter box."""
 
 EXAMPLES = {
     "name of operating system": "name of operating system",
@@ -224,6 +227,13 @@ _ANSWERS_BODY_SLOT = r"""
   </q-td>
 </q-tr>
 """
+
+_INVENTORY_COLUMNS = [
+    {"name": "label", "label": "Target", "field": "label", "align": "left", "sortable": True},
+    {"name": "kind", "label": "Kind", "field": "kind", "align": "left", "sortable": True},
+    {"name": "platform", "label": "Platform", "field": "platform", "align": "left"},
+    {"name": "qna", "label": "qna", "field": "qna", "align": "left"},
+]
 
 
 class Debouncer:
@@ -414,6 +424,9 @@ async def root() -> None:
             target_count = ui.label().classes("text-caption").mark("target-count")
             with ui.card().classes("w-full"):
                 ui.label("Targets").classes("text-subtitle1")
+                # The inventory first: its hosts are what Evaluate runs on by default.
+                inventory_box = ui.column().classes("w-full gap-0")
+                ui.label("Add targets").classes("text-caption opacity-70 q-mt-sm")
                 ui.checkbox("Local (this machine)").bind_value(state.form, "local").mark(
                     "target-local"
                 ).on_value_change(lambda _: refresh_targets())
@@ -454,8 +467,6 @@ async def root() -> None:
                         "text-caption opacity-70"
                     )
                 ssh_opts.bind_visibility_from(state.form, "ssh")
-
-                inventory_box = ui.column().classes("w-full gap-0")
 
             with ui.card().classes("w-full"):
                 ui.label("Options").classes("text-subtitle1")
@@ -996,18 +1007,52 @@ async def root() -> None:
                     "text-negative text-caption"
                 ).mark("inventory-error")
             elif inventory.targets:
-                ui.select(
-                    {i: _target_option(t) for i, t in enumerate(inventory.targets)},
-                    multiple=True,
-                    clearable=True,
-                    label=f"Inventory ({inventory.path})",
-                ).bind_value(state.form, "inventory_selected").classes("w-full").mark(
-                    "inventory"
-                ).on_value_change(lambda _: refresh_targets())
+                render_inventory_table()
             else:
                 ui.label("No inventory hosts; tick a target above.").classes(
                     "text-caption opacity-70"
                 ).mark("inventory-none")
+
+    def render_inventory_table() -> None:
+        rows = [inventory_table_row(i, t) for i, t in enumerate(inventory.targets)]
+        chosen = set(state.form.inventory_selected or [])
+        ui.label(f"Inventory · {inventory.path}").classes("text-caption").mark("inventory-title")
+        host_filter = (
+            ui.input(placeholder="Filter hosts")
+            .props("dense clearable")
+            .classes("w-full")
+            .mark("inventory-filter")
+            if len(rows) >= INVENTORY_FILTER_MIN
+            else None
+        )
+        table = (
+            ui.table(rows=rows, columns=_INVENTORY_COLUMNS, row_key="id", selection="multiple")
+            .props("dense flat")
+            .classes("w-full")
+            .mark("inventory")
+        )
+        # From the form, not "all": the selection must survive a re-render.
+        table.selected = [r for r in rows if r["id"] in chosen]
+        count = ui.label().classes("text-caption opacity-70").mark("inventory-count")
+
+        def show_count() -> None:
+            count.set_text(f"{len(table.selected)} of {len(rows)} selected")
+
+        def on_select(_: Any) -> None:
+            state.form.inventory_selected = sorted(int(r["id"]) for r in table.selected)
+            show_count()
+            refresh_targets()
+
+        table.on_select(on_select)
+        if host_filter is not None:
+
+            def on_filter(e: ValueChangeEventArguments) -> None:
+                # QTable's own filter: a small static table, on its visible columns.
+                table.props["filter"] = e.value or ""
+                table.update()
+
+            host_filter.on_value_change(on_filter)
+        show_count()
 
     async def load_inventory() -> None:
         nonlocal inventory
@@ -1048,10 +1093,6 @@ _discovery_lock = threading.Lock()
 def _discover_inventory_once() -> Path | None:
     with _discovery_lock:
         return find_or_discover_inventory()
-
-
-def _target_option(target: Target) -> str:
-    return f"{target.label} ({target.kind})"
 
 
 def _breakdown_table(

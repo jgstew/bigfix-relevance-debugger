@@ -40,6 +40,7 @@ from bigfix_relevance_debugger.evaluation import (
     build_targets,
     choose_breakdown_target,
     evaluate_session,
+    inventory_table_row,
     load_inventory_targets,
     order_results,
     pick_label,
@@ -1771,6 +1772,22 @@ def test_summary_query_only_is_unchanged():
 
 
 # --- target preview (issue 8) ------------------------------------------------------------
+
+
+def test_inventory_table_row():
+    deb = Target(kind="container", name="deb", image="debian:11", qna_version=["1.0", "2.0"])
+
+    assert inventory_table_row(0, deb) == {
+        "id": 0,
+        "label": "container:debian:11@x86_64",
+        "kind": "container",
+        "platform": "debian",
+        "qna": "1.0, 2.0",
+    }
+    assert inventory_table_row(1, Target(kind="ssh", name="box"))["platform"] == "?"
+    assert inventory_table_row(1, Target(kind="ssh", name="box"))["qna"] == ""
+    assert inventory_table_row(2, Target(kind="ssh", name="b", qna_version="1.0"))["qna"] == "1.0"
+
 
 INV = [Target(kind="ssh", name=f"lab-{c}") for c in "abc"]
 
