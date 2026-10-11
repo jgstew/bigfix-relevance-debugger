@@ -19,15 +19,19 @@ from bigfix_remote_client_relevance import ClientRelevanceResult, ResolvedQna, T
 from bigfix_relevance_debugger import evaluation
 from bigfix_relevance_debugger.analysis import summarize
 from bigfix_relevance_debugger.evaluation import (
+    NO_ANSWERS,
     PREVIEW_CHARS,
     SESSION_CONNECT_TIMEOUT_S,
     SESSION_HOST_UNKNOWN,
+    TALLY_LIMIT,
+    AnswerTally,
     EvalOptions,
     LevelResult,
     NoTargetsError,
     ProbeView,
     ResultRow,
     SessionConnector,
+    TallyRow,
     TargetForm,
     TargetFormError,
     analyzer_platform,
@@ -38,6 +42,7 @@ from bigfix_relevance_debugger.evaluation import (
     evaluate_session,
     load_inventory_targets,
     order_results,
+    pick_phrase,
     resolve_container_arches,
     results_row_details,
     results_summary,
@@ -46,6 +51,7 @@ from bigfix_relevance_debugger.evaluation import (
     session_result_to_dict,
     session_row_wanted,
     stream_results,
+    tally_table_row,
     total_work,
     visible_results,
 )
@@ -1509,3 +1515,248 @@ def test_session_result_dict_for_export():
     assert d["evaluation_time"] == "0.47ms"
     assert d["error"] is None
     assert d["error_kind"] is None
+
+
+# --- answer summary (issue 8) ----------------------------------------------------------
+
+
+def tallied(*rows):
+    tally = AnswerTally()
+    for r in rows:
+        tally.add(r)
+    return tally
+
+
+def counts(tally, limit=TALLY_LIMIT):
+    shown, _ = tally.rows(limit)
+    return [(r.label, r.systems) for r in shown]
+
+
+def server_row(answers=("x",)):
+    return ResultRow.from_session(
+        evaluation.SessionEvaluation("q", "bigfix.example.com", answers=tuple(answers))
+    )
+
+
+def test_tally_counts_distinct_systems_per_answer():
+    tally = tallied(row("a", ["Linux"]), row("b", ["Linux"]), row("c", ["Win"]))
+
+    assert counts(tally) == [("Linux", 2), ("Win", 1)]
+    assert tally.systems == 3
+
+
+def test_tally_counts_a_host_once_across_its_qna_versions():
+    tally = tallied(row("multi", ["x"], qna_version="a"), row("multi", ["x"], qna_version="b"))
+
+    assert counts(tally) == [("x", 1)]
+    assert tally.systems == 1
+
+
+def test_tally_counts_a_repeated_answer_once_per_host():
+    assert counts(tallied(row("h", ["x", "x"]))) == [("x", 1)]
+
+
+def test_tally_host_whose_versions_disagree_counts_under_each():
+    tally = tallied(row("multi", ["x"], qna_version="a"), row("multi", [], qna_version="b"))
+
+    assert counts(tally) == [("x", 1), (NO_ANSWERS, 1)]
+
+
+def test_tally_counts_systems_by_display_host():
+    # An inventory can list one address as both ssh and fastquery: two systems.
+    tally = tallied(row("10.0.0.5", ["x"]), row("10.0.0.5", ["x"], transport="fastquery"))
+
+    assert counts(tally) == [("x", 2)]
+    assert tally.systems == 2
+
+
+def test_tally_orders_by_systems_then_answer_then_arrival():
+    tally = tallied(
+        row("1", ["B"]), row("2", ["a"]), row("3", ["top"]), row("4", ["top"]), row("5", ["c"])
+    )
+
+    assert counts(tally) == [("top", 2), ("a", 1), ("B", 1), ("c", 1)]
+
+
+def test_tally_puts_no_answers_then_errors_last():
+    tally = tallied(
+        row("err1", error="boom", error_kind="transport"),
+        *(row(f"empty{i}") for i in range(5)),
+        row("one", ["x"]),
+    )
+
+    assert counts(tally) == [("x", 1), (NO_ANSWERS, 5), ("error: transport", 1)]
+
+
+def test_tally_groups_errors_by_kind():
+    tally = tallied(
+        row("a", error="Permission denied", error_kind="transport"),
+        row("b", error="No route to host", error_kind="transport"),
+        row("c", error="qna crashed", error_kind="qna"),
+    )
+
+    assert counts(tally) == [("error: transport", 2), ("error: qna", 1)]
+
+
+def test_tally_limit_hides_the_rarest_answers_and_counts_them():
+    common = [f"common{i:02}" for i in range(50)]
+    rare = [f"rare{i}" for i in range(10)]
+    tally = tallied(row("a", common + rare), row("b", common), row("c"))
+
+    shown, hidden = tally.rows(TALLY_LIMIT)
+
+    assert hidden == 10
+    assert [r.label for r in shown] == [*common, NO_ANSWERS]
+
+
+def test_tally_shows_an_empty_string_answer_as_quotes():
+    assert counts(tallied(row("a", [""]))) == [('""', 1)]
+
+
+def test_tally_ignores_session_rows():
+    tally = tallied(server_row(), row("a", ["x"]))
+
+    assert counts(tally) == [("x", 1)]
+    assert tally.systems == 1
+
+
+def test_tally_table_row_cells_are_scalars():
+    tally = tallied(row("a", ["x"]), row("b", error="boom"))
+    shown, _ = tally.rows()
+    assert len(shown) == 2
+
+    for r in shown:
+        cells = tally_table_row(r, tally.systems, pick=None)
+        assert all(isinstance(v, str | int | float | bool | type(None)) for v in cells.values())
+
+
+def test_tally_table_row_share_and_percent():
+    tally = tallied(row("a", ["x"]), row("b", ["y"]), row("c", ["y"]))
+    [y, x] = tally.rows()[0]
+
+    cells = tally_table_row(x, tally.systems, pick=None)
+
+    assert cells["share"] == pytest.approx(1 / 3)
+    assert cells["percent"] == 33
+    assert cells["systems"] == 1
+    assert cells["kind"] == "answer"
+    assert tally_table_row(y, tally.systems, pick=None)["percent"] == 67
+
+
+def test_tally_table_row_marks_the_pick():
+    tally = tallied(row("a", ["x"]), row("b", ["y"]))
+    [x, y] = tally.rows()[0]
+
+    assert tally_table_row(x, 2, pick=x.key)["picked"] is True
+    assert tally_table_row(y, 2, pick=x.key)["picked"] is False
+
+
+def test_has_key_answer_is_exact_and_case_sensitive():
+    debian = row("a", ["Linux Debian 11"])
+
+    assert debian.has_key(TallyRow("answer", "Linux Debian 11", 1).key)
+    assert not debian.has_key(TallyRow("answer", "linux debian 11", 1).key)
+    assert not debian.has_key(TallyRow("answer", "Linux", 1).key)
+
+
+def test_has_key_for_no_answers_and_error_kind():
+    empty = TallyRow("empty", "", 1).key
+    transport = TallyRow("error", "transport", 1).key
+
+    assert row("a").has_key(empty)
+    assert not row("a", ["x"]).has_key(empty)
+    assert not row("a", error="boom").has_key(empty)
+    assert row("a", error="boom", error_kind="transport").has_key(transport)
+    assert not row("a", error="boom", error_kind="qna").has_key(transport)
+
+
+def test_pick_key_round_trips_answers_containing_colons():
+    key = TallyRow("answer", "a:b:c", 1).key
+
+    assert row("h", ["a:b:c"]).has_key(key)
+    assert pick_phrase(key) == 'answering "a:b:c"'
+
+
+def test_pick_phrases():
+    assert pick_phrase(TallyRow("answer", "", 1).key) == 'answering """"'
+    assert pick_phrase(TallyRow("empty", "", 1).key) == "with no answers"
+    assert pick_phrase(TallyRow("error", "transport", 1).key) == "with a transport error"
+
+
+PICK_FLEET = [
+    row("deb", ["Linux Debian 11"], qna_version="a"),
+    row("rh", ["Linux Red Hat 9"], qna_version="a"),
+    row("multi", ["Linux Debian 11"], qna_version="a"),
+    row("multi", [], qna_version="b"),
+    row("down", error="Permission denied", error_kind="transport"),
+    row("plural", ["Linux Debian 11", "extra"]),
+]
+
+
+def test_visible_results_with_pick_keeps_every_result_of_a_matching_host():
+    key = TallyRow("empty", "", 1).key
+
+    assert hosts(PICK_FLEET, visible_results(PICK_FLEET, "", key)) == ["multi", "multi"]
+
+
+def test_visible_results_pick_and_query_combine():
+    key = TallyRow("answer", "Linux Debian 11", 1).key
+
+    assert set(hosts(PICK_FLEET, visible_results(PICK_FLEET, "", key))) == {
+        "deb",
+        "multi",
+        "plural",
+    }
+    assert hosts(PICK_FLEET, visible_results(PICK_FLEET, "extra", key)) == ["plural"]
+
+
+def test_visible_results_without_pick_is_unchanged():
+    for query in ("", "debian", "denied", "nothing"):
+        assert visible_results(PICK_FLEET, query, None) == visible_results(PICK_FLEET, query)
+
+
+def test_pick_shows_exactly_the_tallied_systems():
+    rows = [*PICK_FLEET, row("other", error="crash", error_kind="qna"), row("e2")]
+    tally = tallied(*rows)
+    tallies, _ = tally.rows()
+    assert len(tallies) == 6  # 3 answers, no answers, 2 error kinds
+
+    for r in tallies:
+        shown = {rows[i].display_host for i in visible_results(rows, "", r.key)}
+        assert len(shown) == r.systems, r.label
+
+
+def test_session_rows_never_match_a_pick():
+    rows = [server_row(["x"]), row("a", ["x"])]
+
+    assert hosts(rows, visible_results(rows, "", TallyRow("answer", "x", 1).key)) == ["a"]
+
+
+def test_summary_with_pick_says_which_answer():
+    debian = TallyRow("answer", "Linux Debian 11", 1).key
+
+    assert (
+        results_summary(PICK_FLEET, 4, "", debian)
+        == 'Showing 4 of 6 results: hosts answering "Linux Debian 11"'
+    )
+    assert results_summary(PICK_FLEET, 2, "", TallyRow("empty", "", 1).key).endswith(
+        "hosts with no answers"
+    )
+    assert results_summary(PICK_FLEET, 1, "", TallyRow("error", "transport", 1).key).endswith(
+        "hosts with a transport error"
+    )
+
+
+def test_summary_with_pick_and_query():
+    debian = TallyRow("answer", "Linux Debian 11", 1).key
+
+    assert results_summary(PICK_FLEET, 1, " extra ", debian) == (
+        'Showing 1 of 6 results: hosts answering "Linux Debian 11" '
+        'and an answer or error containing "extra"'
+    )
+
+
+def test_summary_query_only_is_unchanged():
+    assert results_summary(PICK_FLEET, 3, "debian") == (
+        'Showing 3 of 6 results: hosts with an answer or error containing "debian"'
+    )

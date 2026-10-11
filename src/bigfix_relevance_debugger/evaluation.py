@@ -637,6 +637,14 @@ class ResultRow:
         error = self.error or ("" if self.ok else self.status)
         return any(needle in text.casefold() for text in (*self.answers, error))
 
+    def has_key(self, key: str) -> bool:
+        """Whether this result is counted under the answer-summary row ``key``.
+
+        Exact, unlike ``matches``: a pick shows exactly the systems its row
+        counted. Session results are never counted, so never match.
+        """
+        return self.dialect != "session" and key in _row_keys(self)
+
 
 # --- results view ---------------------------------------------------------------------
 
@@ -672,13 +680,17 @@ def order_results(rows: Sequence[ResultRow]) -> list[int]:
     return [i for _, indexes in sorted(groups.items(), key=host_key) for i in indexes]
 
 
-def visible_results(rows: Sequence[ResultRow], query: str) -> list[int]:
+def visible_results(rows: Sequence[ResultRow], query: str, pick: str | None = None) -> list[int]:
     """``order_results``, keeping only hosts with at least one matching result.
 
     A matching host keeps *all* its results, so a search shows each
-    computer's whole answer set rather than just the matching rows.
+    computer's whole answer set rather than just the matching rows. ``pick``
+    is an answer-summary row key; with it, a host also needs a result counted
+    under that row (see ``ResultRow.has_key``).
     """
     groups = {row.group for row in rows if row.matches(query)}
+    if pick is not None:
+        groups &= {row.group for row in rows if row.has_key(pick)}
     return [i for i in order_results(rows) if rows[i].group in groups]
 
 
@@ -717,7 +729,7 @@ def answers_preview(row: ResultRow, limit: int = PREVIEW_CHARS) -> str:
     return f"{text} (+{hidden} more)" if hidden else text
 
 
-Cells = dict[str, str | int | bool | None]
+Cells = dict[str, str | int | float | bool | None]
 """A results-table row. Scalars only: NiceGUI warns list cells can crash the browser."""
 
 
@@ -754,16 +766,19 @@ def _plural(n: int, word: str) -> str:
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
-def results_summary(rows: Sequence[ResultRow], shown: int, query: str) -> str:
-    """The line above the results table; says so when a search hides some of them."""
+def results_summary(
+    rows: Sequence[ResultRow], shown: int, query: str, pick: str | None = None
+) -> str:
+    """The line above the results table; says so when a search or a pick hides some."""
     if not rows:
         return ""
     needle = query.strip()
+    showing = f"Showing {shown} of {_plural(len(rows), 'result')}"
+    if pick is not None:
+        also = f' and an answer or error containing "{needle}"' if needle else ""
+        return f"{showing}: hosts {pick_phrase(pick)}{also}"
     if needle:
-        return (
-            f"Showing {shown} of {_plural(len(rows), 'result')}: "
-            f'hosts with an answer or error containing "{needle}"'
-        )
+        return f'{showing}: hosts with an answer or error containing "{needle}"'
     answered = sum(1 for r in rows if r.ok and r.answers)
     empty = sum(1 for r in rows if r.ok and not r.answers)
     errors = len(rows) - answered - empty
@@ -771,6 +786,119 @@ def results_summary(rows: Sequence[ResultRow], shown: int, query: str) -> str:
         f"{_plural(len(rows), 'result')}: {answered} with answers, {empty} empty, "
         f"{_plural(errors, 'error')}"
     )
+
+
+# --- answer summary -------------------------------------------------------------------
+
+TALLY_LIMIT = 50
+"""Most answer rows the summary shows; plural relevance on a fleet can have thousands."""
+
+ANSWER, EMPTY, ERROR = "answer", "empty", "error"
+_TALLY_KINDS = (ANSWER, EMPTY, ERROR)
+
+
+@dataclass(frozen=True)
+class TallyRow:
+    """One row of the answer summary: how many systems gave this answer."""
+
+    kind: str
+    """``"answer"``, ``"empty"`` (ok, no answers) or ``"error"``."""
+    value: str
+    """The answer; ``""`` for empty; the error kind (``ResultRow.status``) for errors."""
+    systems: int
+
+    @property
+    def key(self) -> str:
+        """Identifies the row in the table and as the results pick."""
+        return f"{self.kind}:{self.value}"
+
+    @property
+    def label(self) -> str:
+        if self.kind == EMPTY:
+            return NO_ANSWERS
+        if self.kind == ERROR:
+            return f"error: {self.value}"
+        return _shown(self.value)
+
+
+def _split_key(key: str) -> tuple[str, str]:
+    # The kind never contains ":", so an answer that does survives the split.
+    kind, _, value = key.partition(":")
+    return kind, value
+
+
+def pick_phrase(key: str) -> str:
+    """How the results summary describes the hosts a pick keeps."""
+    kind, value = _split_key(key)
+    if kind == EMPTY:
+        return "with no answers"
+    if kind == ERROR:
+        return f"with a {value} error"
+    return f'answering "{_shown(value)}"'
+
+
+def _row_keys(row: ResultRow) -> list[str]:
+    if not row.ok:
+        return [TallyRow(ERROR, row.status, 0).key]
+    if not row.answers:
+        return [TallyRow(EMPTY, "", 0).key]
+    return [TallyRow(ANSWER, a, 0).key for a in dict.fromkeys(row.answers)]
+
+
+class AnswerTally:
+    """Distinct systems per answer, built as results stream in: one ``add`` per result.
+
+    A system is a ``display_host``, so a host listing several qna versions
+    counts once per answer, and one whose versions disagree counts under each.
+    Session results are left out: they come from one server, not a fleet.
+    """
+
+    def __init__(self) -> None:
+        # key -> display hosts, in arrival order (the last tie-break).
+        self._hosts: dict[str, dict[str, None]] = {}
+        self._systems: dict[str, None] = {}
+
+    def add(self, row: ResultRow) -> None:
+        if row.dialect == "session":
+            return
+        self._systems[row.display_host] = None
+        for key in _row_keys(row):
+            self._hosts.setdefault(key, {})[row.display_host] = None
+
+    @property
+    def systems(self) -> int:
+        return len(self._systems)
+
+    def rows(self, limit: int = TALLY_LIMIT) -> tuple[list[TallyRow], int]:
+        """(rows in display order, distinct answers left out by ``limit``).
+
+        Answers by systems, highest first, then text ignoring case, then
+        arrival; then no answers; then errors by kind. Empty and error rows
+        are never cut and always go last: they aren't answers.
+        """
+        arrival = {key: i for i, key in enumerate(self._hosts)}
+        by_kind: dict[str, list[TallyRow]] = {kind: [] for kind in _TALLY_KINDS}
+        for key, hosts in self._hosts.items():
+            kind, value = _split_key(key)
+            by_kind[kind].append(TallyRow(kind, value, len(hosts)))
+        for kind_rows in by_kind.values():
+            kind_rows.sort(key=lambda r: (-r.systems, r.value.casefold(), arrival[r.key]))
+        answers = by_kind[ANSWER]
+        return answers[:limit] + by_kind[EMPTY] + by_kind[ERROR], max(0, len(answers) - limit)
+
+
+def tally_table_row(row: TallyRow, total_systems: int, pick: str | None) -> Cells:
+    """The cells of one answer-summary row; ``share`` is of the systems in the run."""
+    share = row.systems / total_systems if total_systems else 0.0
+    return {
+        "key": row.key,
+        "kind": row.kind,
+        "label": row.label,
+        "systems": row.systems,
+        "share": share,
+        "percent": round(share * 100),
+        "picked": row.key == pick,
+    }
 
 
 # --- breakdown ------------------------------------------------------------------------
