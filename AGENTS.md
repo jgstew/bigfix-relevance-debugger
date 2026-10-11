@@ -125,3 +125,16 @@ tags `v<version>`, creates the GitHub release and publishes to PyPI with
 trusted publishing. **Never tag by hand:** an existing tag is how the
 workflow knows a version is already released, so a hand-made tag means that
 version never reaches PyPI.
+
+The whole workflow is a no-op until the repository variable `PYPI_PUBLISH`
+is `true`. A version with an `a`, `b`, `rc` or `.dev` part becomes a GitHub
+pre-release, and the version must be in normalized PEP 440 form (`1.0.0b1`,
+not `1.0.0-beta`) so the tag matches PyPI.
+
+If a release fails partway, use **"Re-run failed jobs" on that run**. It
+publishes the same bytes the gates tested, reuses the draft release, and
+`uv publish --check-url` skips files PyPI already has. Run workflow on `main`
+also works, but only if nothing that changes the package has merged since
+the version bump, or if PyPI got nothing in the failed run. Otherwise PyPI
+already has different bytes for that version and the run stops before
+changing anything; bump the version instead.

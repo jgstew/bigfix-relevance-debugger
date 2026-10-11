@@ -1,0 +1,338 @@
+---
+# Tags, releases and publishes to PyPI on a version bump. Nothing here bumps
+# the version: change `[project] version` in pyproject.toml in a PR, merge it
+# to main, and this workflow does the rest. A cut-down version of
+# bigfix-relevance-analyzer's, which also builds a playground and a VS Code
+# extension; here the wheel and sdist are the only assets.
+name: Tag and Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "pyproject.toml"
+      - "uv.lock"
+      - "src/**"
+      - ".github/workflows/tag_and_release.yaml"
+      - ".github/workflows/test.yaml"
+      - ".github/workflows/pre-commit.yaml"
+      - ".github/actions/**"
+  # a re-run path for when a release run failed after the version was already
+  # merged, and for the first release; the tag check below still makes it a
+  # no-op if the tag exists
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One release at a time, repo-wide. Releases only happen from main (see the
+  # `version` job), so keying on github.ref would only add a way to overlap.
+  # Serializing also keeps the tag check sound: a draft has no tag until it's
+  # published, so a second run that started mid-release would see no tag and
+  # try to release the same version again.
+  # Deliberately no cancel-in-progress: never kill a release mid-flight.
+  # GitHub keeps at most ONE pending run per group: a newer queued run
+  # replaces an older queued one (never the running one). The newer run
+  # releases whatever version its own commit has, so an intermediate bump
+  # whose run got replaced is skipped, not released late.
+  group: release
+
+jobs:
+  # Decides whether there is anything to do, so the jobs below can be skipped
+  # outright. A push that touches src/** without bumping the version gets a
+  # green, near-instant run and no release.
+  version:
+    name: Check for an untagged version
+    runs-on: ubuntu-latest
+    # Every later job needs this one, so skipping it skips the whole release.
+    # fork guard: a fork that pushes to its own main should not try to release.
+    # main guard: `push` is already limited to main, but workflow_dispatch can
+    # be started from any branch, and would release that branch's version.
+    # PYPI_PUBLISH guard: unlike the analyzer, which gates only its PyPI step,
+    # this gates the whole release. For this repo PyPI is the point of a
+    # release, and a GitHub-only release would tag the version, so the tag
+    # check would never publish it to PyPI later. Until the repository
+    # variable PYPI_PUBLISH is `true` (Settings > Secrets and variables >
+    # Actions > Variables), every run is a green no-op.
+    if: >-
+      github.repository == 'jgstew/bigfix-relevance-debugger'
+      && github.ref == 'refs/heads/main'
+      && vars.PYPI_PUBLISH == 'true'
+    outputs:
+      version: ${{ steps.getversion.outputs.version }}
+      prerelease: ${{ steps.getversion.outputs.prerelease }}
+      release_needed: ${{ steps.tagged.outputs.release_needed }}
+    steps:
+      # shallow: this job only reads pyproject.toml; the tag check asks the
+      # remote instead of needing every tag locally
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # `[project] version` in pyproject.toml is the single source of truth:
+      # __version__ reads the installed package metadata, so there is no
+      # second place to bump. tomllib is stdlib on 3.11+, and the runner's
+      # preinstalled python is new enough, so no setup-python step is needed.
+      #
+      # Only the normalized PEP 440 spelling is accepted (X.Y.Z, then
+      # optionally aN/bN/rcN, .postN, .devN), so the tag v<version> matches
+      # the version PyPI and the wheel filename use: `1.0.0-beta` would be
+      # tagged as written but published as 1.0.0b0. A pre-release (a, b, rc or
+      # dev) becomes a GitHub pre-release, so it is never marked Latest.
+      - name: Read version from pyproject.toml
+        id: getversion
+        run: |
+          version="$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"])')"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?$'; then
+            echo "::error::'$version' in pyproject.toml isn't a normalized X.Y.Z[aN|bN|rcN][.postN][.devN] version"
+            exit 1
+          fi
+          if printf '%s' "$version" | grep -Eq '(a|b|rc|\.dev)[0-9]+'; then
+            prerelease=true
+          else
+            prerelease=false
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "version: $version (prerelease: $prerelease)"
+
+      # Release only if this version has no tag yet. This is what makes the
+      # workflow idempotent and safe to re-run. `ls-remote --exit-code` exits
+      # 2 for "no such ref"; anything else non-zero is a real failure and
+      # must not be read as "untagged".
+      - name: Check whether v<version> is already tagged
+        id: tagged
+        env:
+          VERSION: ${{ steps.getversion.outputs.version }}
+        run: |
+          rc=0
+          git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" > /dev/null || rc=$?
+          case "$rc" in
+            0)
+              echo "release_needed=false" >> "$GITHUB_OUTPUT"
+              echo "v${VERSION} is already tagged - nothing to release"
+              ;;
+            2)
+              echo "release_needed=true" >> "$GITHUB_OUTPUT"
+              echo "v${VERSION} has no tag yet - will release"
+              ;;
+            *)
+              echo "::error::git ls-remote failed (exit $rc) checking for tag v${VERSION}"
+              exit 1
+              ;;
+          esac
+
+  # The gates. Reusing the test and pre-commit workflows means the release is
+  # blocked by the exact same jobs that guard PRs (including the wheel smoke
+  # test on Linux, macOS and Windows), with no polling. Both run in parallel
+  # off `version`.
+  #
+  # The calls keep `./` and silence zizmor's self-repository audit, which
+  # wants GitHub's newer `$/` syntax that actionlint v1.7.12 rejects
+  # (rhysd/actionlint#711, #732), as in the analyzer.
+  test:
+    name: Test
+    needs: version
+    if: needs.version.outputs.release_needed == 'true'
+    uses: ./.github/workflows/test.yaml # zizmor: ignore[self-repository]
+
+  pre-commit:
+    name: pre-commit
+    needs: version
+    if: needs.version.outputs.release_needed == 'true'
+    uses: ./.github/workflows/pre-commit.yaml # zizmor: ignore[self-repository]
+    with:
+      # a push only carries its own diff; a release checks the whole tree
+      all-files: true
+
+  release:
+    name: Tag, release and publish
+    needs: [version, test, pre-commit]
+    runs-on: ubuntu-latest
+    # Gates the whole job - tag, GitHub release and PyPI upload - so an
+    # environment protection rule (required reviewer, branch restriction)
+    # stops a release before anything is created. The name must match the
+    # `Environment name` of the PyPI trusted publisher exactly: PyPI checks the
+    # `environment` claim in the OIDC token.
+    environment: pypi
+    permissions:
+      # contents: write - create the release (and so the tag) and upload assets
+      # id-token: write - OIDC for PyPI trusted publishing
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # setup-python, then the uv version pinned in .pre-commit-config.yaml;
+      # the same action test.yaml and pre-commit.yaml use
+      - uses: ./.github/actions/install-uv # zizmor: ignore[self-repository]
+        with:
+          python-version: "3.13"
+
+      # The exact bytes the gates tested: test.yaml's `build` job uploaded
+      # them and its smoke matrix ran them on Linux, macOS and Windows. No
+      # second `uv build` here: the wheel records the hatchling that built it
+      # (WHEEL's Generator), so a rebuild after a hatchling release would ship
+      # untested bytes, and a re-run's rebuild would no longer match what an
+      # earlier attempt already put on PyPI. Artifacts belong to the run, so
+      # "Re-run failed jobs" downloads the first attempt's.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: test-dist
+          path: dist
+
+      # `sha256sum -c`-verifiable, with no directory prefix, so it checks out
+      # wherever the assets are downloaded to
+      - name: Compute SHA-256 checksums
+        working-directory: dist
+        run: |
+          sha256sum ./*.whl ./*.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      # PyPI never replaces a file. If an earlier attempt already uploaded this
+      # version from other bytes (a newer commit on main, or a rebuild), stop
+      # here, before the draft's assets are touched; `uv publish --check-url`
+      # would only catch it after they had been replaced. Files PyPI doesn't
+      # have yet, or has with the same hash, are fine: that's a re-run
+      # finishing a partial release. Also checks dist/ is for this version.
+      - name: Check PyPI doesn't already have different bytes for this version
+        env:
+          PACKAGE: bigfix-relevance-debugger
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          python - <<'EOF'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import sys
+          import urllib.error
+          import urllib.request
+
+          package, version = os.environ["PACKAGE"], os.environ["VERSION"]
+          stem = package.replace("-", "_") + "-" + version
+          local = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in pathlib.Path("dist").glob(f"{stem}[-.]*")}
+          if not any(n.endswith(".whl") for n in local) or not any(n.endswith(".tar.gz") for n in local):
+              sys.exit(f"::error::dist/ has no wheel and sdist for {version}: {sorted(local)}")
+          try:
+              with urllib.request.urlopen(f"https://pypi.org/pypi/{package}/{version}/json", timeout=30) as r:
+                  released = {f["filename"]: f["digests"]["sha256"] for f in json.load(r)["urls"]}
+          except urllib.error.HTTPError as e:
+              if e.code != 404:
+                  raise
+              released = {}
+          differ = sorted(n for n, h in local.items() if n in released and released[n] != h)
+          if differ:
+              sys.exit(
+                  f"::error::PyPI already has {', '.join(differ)} for {version} with different bytes. "
+                  "PyPI never replaces a file: bump the version, or re-run the original run's failed jobs."
+              )
+          for name in sorted(local):
+              print(f"{name}: {'already on PyPI (identical)' if name in released else 'not on PyPI yet'}")
+          EOF
+
+      # Created as a DRAFT and published only at the end, once PyPI has the
+      # package. That keeps this compatible with GitHub's immutable releases,
+      # which lock a release's assets at publication. A draft does not create
+      # its tag either: the target is recorded now, the tag appears on publish.
+      #
+      # A re-run that finds the draft from a failed attempt reuses it: it
+      # moves the target to this run's commit (a run from a newer main would
+      # otherwise tag the old commit next to the new commit's assets) and
+      # replaces the assets (--clobber). The lookup lists releases with
+      # `gh api`, so a failed request fails the step rather than reading as
+      # "no draft" and creating a second one.
+      - name: Create or reuse the draft GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+        run: |
+          drafts="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" \
+            --jq ".[] | select(.draft and .tag_name == \"v${VERSION}\") | .id")"
+          count="$(printf '%s' "$drafts" | grep -c . || true)"
+          case "$count" in
+            0)
+              gh release create "v${VERSION}" --repo "$GITHUB_REPOSITORY" \
+                --draft \
+                --prerelease="${PRERELEASE}" \
+                --target "${GITHUB_SHA}" \
+                --title "v${VERSION}" \
+                --notes "Draft: publishing to PyPI." \
+                dist/*.whl dist/*.tar.gz dist/SHA256SUMS.txt
+              ;;
+            1)
+              echo "draft v${VERSION} (id ${drafts}) exists from an earlier attempt; retargeting it to ${GITHUB_SHA} and replacing its assets"
+              gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${drafts}" \
+                -f "target_commitish=${GITHUB_SHA}" \
+                -F "prerelease=${PRERELEASE}" > /dev/null
+              gh release upload "v${VERSION}" --repo "$GITHUB_REPOSITORY" --clobber \
+                dist/*.whl dist/*.tar.gz dist/SHA256SUMS.txt
+              ;;
+            *)
+              echo "::error::${count} draft releases are tagged v${VERSION} (ids: ${drafts//$'\n'/ }); delete the extras and re-run"
+              exit 1
+              ;;
+          esac
+
+      # Trusted publishing: `uv publish` speaks OIDC natively given id-token:
+      # write, so there is no long-lived API token to store and no
+      # pypa/gh-action-pypi-publish pin to maintain. Needs a PyPI trusted
+      # publisher (or pending publisher) for this repo with workflow
+      # `tag_and_release.yaml` and environment `pypi`.
+      # The explicit globs keep SHA256SUMS.txt out of the upload. --check-url
+      # skips files PyPI already has, so a re-run after a partial upload
+      # finishes the job instead of failing on "File already exists".
+      - name: Publish to PyPI (trusted publishing)
+        run: >-
+          uv publish --trusted-publishing always
+          --check-url https://pypi.org/simple/
+          dist/*.whl dist/*.tar.gz
+
+      # GitHub's own generated notes with the checksums appended, so the
+      # hashes are readable in the release body as well as downloadable.
+      - name: Build release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          notes_file="${RUNNER_TEMP}/release-notes.md"
+          if ! gh api "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+                --method POST \
+                -f "tag_name=v${VERSION}" \
+                -f "target_commitish=${GITHUB_SHA}" \
+                --jq '.body' > "$notes_file"; then
+            echo "::warning::could not generate release notes; falling back to a plain body"
+            printf 'Release v%s\n' "${VERSION}" > "$notes_file"
+          fi
+          # The backticks below are Markdown in release-note text, not command
+          # substitutions; single quotes keep them literal.
+          # shellcheck disable=SC2016
+          {
+            printf '\n## Install\n\n'
+            printf '```bash\nuvx bigfix-relevance-debugger@%s\n```\n' "${VERSION}"
+            printf '\n## SHA-256\n\n'
+            printf 'Verify with `sha256sum -c SHA256SUMS.txt`:\n\n'
+            printf '```\n'
+            cat dist/SHA256SUMS.txt
+            printf '```\n'
+          } >> "$notes_file"
+          echo "NOTES_FILE=$notes_file" >> "$GITHUB_ENV"
+          cat "$notes_file"
+
+      # Publishing is the last step and the point where the tag is created
+      # and, with immutable releases on, everything is locked.
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+          PRERELEASE: ${{ needs.version.outputs.prerelease }}
+        run: |
+          gh release edit "v${VERSION}" --repo "$GITHUB_REPOSITORY" \
+            --notes-file "${NOTES_FILE}" \
+            --prerelease="${PRERELEASE}" \
+            --draft=false

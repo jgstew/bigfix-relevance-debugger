@@ -81,13 +81,15 @@ jobs:
       - name: sha256 of the built artifacts
         run: sha256sum dist/*
 
-      # the smoke job tests these exact bytes on every OS, rather than each
-      # runner building its own
+      # The smoke job tests these exact bytes on every OS, rather than each
+      # runner building its own, and tag_and_release.yaml publishes them.
+      # overwrite: a "Re-run all jobs" builds again in the same run.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: test-dist
           path: dist/
           if-no-files-found: error
+          overwrite: true
 
   # Runs the built wheel the way users will: `uvx` installs it and its
   # dependencies from PyPI into a throwaway environment, so a dependency with
