@@ -114,3 +114,14 @@ uv run pyright src tests
   `name of operating system` on `debian:11` / `arm64` / qna `11.0.7.61`.
   For session relevance, `now` runs both dialects if a root server is
   configured (read-only queries only).
+
+## Releasing
+
+Bump `[project] version` in `pyproject.toml` in a PR and merge it. That is
+the only place the version lives (`__version__` reads the installed
+metadata). On `main`, `.github/workflows/tag_and_release.yaml` sees an
+untagged version, runs `test.yaml` and `pre-commit.yaml` as gates, then
+tags `v<version>`, creates the GitHub release and publishes to PyPI with
+trusted publishing. **Never tag by hand:** an existing tag is how the
+workflow knows a version is already released, so a hand-made tag means that
+version never reaches PyPI.

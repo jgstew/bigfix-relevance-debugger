@@ -1,5 +1,8 @@
 # bigfix-relevance-debugger
 
+[![PyPI](https://img.shields.io/pypi/v/bigfix-relevance-debugger)](https://pypi.org/project/bigfix-relevance-debugger/)
+[![test](https://github.com/jgstew/bigfix-relevance-debugger/actions/workflows/test.yaml/badge.svg)](https://github.com/jgstew/bigfix-relevance-debugger/actions/workflows/test.yaml)
+
 A small browser GUI for BigFix **client and session relevance**:
 
 1. **Live static analysis** while you type: parse errors with line and
@@ -28,6 +31,12 @@ progress for every tab's runs.
 With [uv](https://docs.astral.sh/uv/) installed:
 
 ```bash
+uvx bigfix-relevance-debugger
+```
+
+The latest unreleased `main`:
+
+```bash
 uvx --from git+https://github.com/jgstew/bigfix-relevance-debugger bigfix-relevance-debugger
 ```
 
@@ -38,8 +47,7 @@ uvx --from . bigfix-relevance-debugger
 ```
 
 or `uv run bigfix-relevance-debugger`, or
-`uv run python -m bigfix_relevance_debugger`. Once it's published to
-PyPI, plain `uvx bigfix-relevance-debugger` will work.
+`uv run python -m bigfix_relevance_debugger`.
 
 It opens in a **native app window** by default (via pywebview, which is
 installed with it). Closing the window stops the app.
@@ -186,7 +194,7 @@ a specific target, select only that one.
 
 ## Demo script
 
-1. `uvx --from git+https://github.com/jgstew/bigfix-relevance-debugger bigfix-relevance-debugger`
+1. `uvx bigfix-relevance-debugger`
 2. Type `name of operating system`. Live analysis shows a clean parse, the
    type `singular string` and a low complexity score.
 3. Open the side panel from the header (it reads e.g. `5 systems`), untick
@@ -286,8 +294,12 @@ answers "why is my relevance false?".
 uv sync
 uv run pytest
 uv run ruff check src tests
+uv run ruff format src tests
 uv run pyright src tests
 ```
+
+CI runs the same (with `ruff format --check`) on Python 3.11 and 3.13, plus pre-commit and a smoke test
+of the built wheel through `uvx` on Linux, macOS and Windows.
 
 Unit tests need no Docker, qna, network or BigFix server: evaluation runs
 the real orchestrator against an injected fake transport, session relevance

@@ -1,0 +1,112 @@
+---
+name: pre-commit
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+  # so .github/workflows/tag_and_release.yaml can gate a release on this exact
+  # job rather than polling for other checks to go green
+  workflow_call:
+    inputs:
+      all-files:
+        description: run every hook on the whole tree instead of the pushed diff
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  # github.workflow keeps a workflow_call from tag_and_release.yaml out of the
+  # group a push to main starts for this workflow on its own
+  group: pre-commit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    # no-commit-to-branch guards a developer's local `git commit`; it has
+    # nothing to check on a runner, and on a push to main it would fail the
+    # run of every merged PR. This repo doesn't use that hook today; the SKIP
+    # keeps CI working if it's added. zizmor is skipped here and runs in its
+    # own step at the end, the only one that gets GH_TOKEN. SKIP is read by
+    # pre-commit itself.
+    env:
+      SKIP: no-commit-to-branch,zizmor
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # required to grab the history of the PR for pre-commit
+          fetch-depth: 0
+          persist-credentials: false
+
+      # setup-python, then the uv version pinned in .pre-commit-config.yaml.
+      # `./` rather than zizmor's preferred `$/`, which actionlint v1.7.12
+      # rejects (rhysd/actionlint#711, #732), as in the analyzer.
+      # The local pyright and pytest hooks are `language: system` and run
+      # `uv run`, so uv has to be on PATH or both fail.
+      - uses: ./.github/actions/install-uv # zizmor: ignore[self-repository]
+        with:
+          python-version: "3.12"
+
+      # A PR or a push: the hooks on the changed files, including the
+      # manual-stage ones (pytest and the workflow linters).
+      # In a called workflow github.event_name is the caller's event, so a
+      # release started by a push would land here too; the all-files input is
+      # what sends it to the next step instead.
+      - name: pre-commit on the diff
+        if: >-
+          !inputs.all-files
+          && (github.event_name == 'pull_request' || github.event_name == 'push')
+        uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
+        with:
+          extra_args: >-
+            --color=always
+            --from-ref ${{ github.event.pull_request.base.sha || github.event.before }}
+            --to-ref ${{ github.event.pull_request.head.sha || github.sha }}
+            --hook-stage manual
+
+      # manual dispatch, and tag_and_release.yaml: every hook against the full
+      # tree, not just a diff range
+      - name: pre-commit on all files
+        if: inputs.all-files || github.event_name == 'workflow_dispatch'
+        uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
+        with:
+          extra_args: --color=always --all-files --hook-stage manual
+
+      # The two steps above cover pull_request, push and workflow_dispatch, and
+      # a workflow_call with all-files. Any other caller event would run no
+      # hooks at all, and pre-commit (installed by pre-commit/action) wouldn't
+      # be on PATH for the steps below; fail here and say why instead.
+      - name: no pre-commit run for this event
+        if: >-
+          !inputs.all-files
+          && !contains(fromJSON('["pull_request", "push", "workflow_dispatch"]'), github.event_name)
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          echo "::error::pre-commit.yaml has no diff range for a '${EVENT_NAME}' event; call it with all-files: true"
+          exit 1
+
+      # zizmor on its own, so GH_TOKEN reaches only it and not every hook
+      # (pytest and pyright run PR code). The token puts zizmor in online mode
+      # (offline is the default without one), so it can fetch the referenced
+      # actions for the audits that need them. The runner's GITHUB_TOKEN is
+      # enough for a public repo and is read-only per `permissions:` above.
+      # The workflow files are few, so this checks all of them every time.
+      - name: zizmor (online)
+        env:
+          SKIP: no-commit-to-branch
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: pre-commit run zizmor --color=always --all-files --hook-stage manual
+
+      # pre-commit/action restores the previous cache on a config change and
+      # saves it back under the new key, so every hook rev bump would leave its
+      # old environment in the cache forever. gc deletes the environments no
+      # live config references. Last on purpose: the cache is saved in the
+      # action's post step, after this.
+      - name: prune unused hook environments before the cache is saved
+        run: pre-commit gc
