@@ -70,6 +70,7 @@ from bigfix_relevance_debugger.evaluation import (
     tally_table_row,
     total_work,
     visible_results,
+    waits_for_inventory,
 )
 from bigfix_relevance_debugger.log_bridge import attach, detach
 from bigfix_relevance_debugger.upstream.remote_client_relevance import find_or_discover_inventory
@@ -596,13 +597,9 @@ async def root() -> None:
             if not client:
                 return [], opts
             image_arches = await resolve_container_arches(state.form)
-            form = state.form
-            explicit = form.local or form.container or form.ssh
-            # Wait for the inventory only when the run needs it: hosts are
-            # selected, or discovery is still going and nothing else is ticked
-            # (its hosts will be the default). A first-run Local/Container/SSH
-            # evaluation starts at once.
-            if form.inventory_selected or (not inventory_task.done() and not explicit):
+            # Wait for the inventory only when the run needs it; the target
+            # count applies the same rule.
+            if waits_for_inventory(state.form, pending=not inventory_task.done()):
                 if not inventory_task.done():
                     progress_label.set_text("waiting for inventory auto-discovery ...")
                 # Shielded: cancelling a run must not cancel the shared load.

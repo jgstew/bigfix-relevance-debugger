@@ -285,6 +285,121 @@ def load_inventory_targets(path: Path | None) -> InventoryLoad:
         return InventoryLoad(path=path, targets=[], error=f"{type(exc).__name__}: {exc}")
 
 
+# --- target preview -------------------------------------------------------------------
+
+SESSION_TARGET = "BigFix server"
+"""How the target count names the root server session relevance runs on."""
+
+
+def waits_for_inventory(form: TargetForm, *, pending: bool) -> bool:
+    """Whether Evaluate waits for the inventory load before building targets.
+
+    It does when hosts are selected, or while discovery is still going and
+    nothing else is ticked (its hosts will be the default). A first-run
+    Local/Container/SSH evaluation starts at once.
+    """
+    explicit = form.local or form.container or form.ssh
+    return bool(form.inventory_selected) or (pending and not explicit)
+
+
+@dataclass(frozen=True)
+class TargetPreview:
+    """What Evaluate would run on right now, for the target count."""
+
+    systems: int | None
+    """Client targets; None while Evaluate would wait for inventory discovery."""
+    exact: bool = True
+    """False while an ``auto``-arch image hasn't been looked up: it counts as one."""
+    runs: int = 0
+    """Results the run yields: a host listing several qna versions runs once per version."""
+    sources: tuple[tuple[str, int], ...] = ()
+    """Where the systems come from, e.g. ``(("inventory", 10), ("local", 1))``."""
+    problem: str | None = None
+    """Why nothing would run (the ``TargetFormError`` message)."""
+    unresolved_images: tuple[str, ...] = ()
+    session: bool = False
+    """Session relevance runs on the root server too (or only, with no systems)."""
+
+    @property
+    def text(self) -> str:
+        """Short, for the header: ``"12 systems"``, ``"≥ 2 systems"``, ``"BigFix server"``."""
+        if self.systems is None:
+            text = "finding inventory …"
+        elif self.session and self.systems == 0:
+            return SESSION_TARGET
+        else:
+            bound = "" if self.exact else "≥ "
+            text = f"{bound}{_plural(self.systems, 'system')}"
+        return f"{text} + {SESSION_TARGET}" if self.session else text
+
+    @property
+    def detail(self) -> str:
+        """Long, for the tooltip and the side panel: where they come from and caveats."""
+        parts = []
+        if self.problem:
+            parts.append(self.problem)
+        if self.systems is None:
+            parts.append("waiting for inventory auto-discovery")
+        if self.sources:
+            parts.append(" · ".join(f"{n} {name}" for name, n in self.sources))
+        if self.systems and self.runs != self.systems:
+            parts.append(f"{self.runs} runs: some hosts list several qna versions")
+        if self.unresolved_images:
+            parts.append(f"arches of {', '.join(self.unresolved_images)} not looked up yet")
+        if self.session:
+            parts.append(f"session relevance on the {SESSION_TARGET}")
+        return "; ".join(parts)
+
+
+def preview_targets(
+    form: TargetForm,
+    inventory: Sequence[Target],
+    image_arches: Mapping[str, Sequence[str]],
+    *,
+    qna_spec: str | None,
+    inventory_pending: bool,
+    client: bool = True,
+    session: bool = False,
+) -> TargetPreview:
+    """What Evaluate would target right now, by its own rules.
+
+    Builds the targets with ``build_targets``, so the count can't drift from
+    the run. ``client=False`` (session relevance only) needs no targets; with
+    ``session``, having none selected isn't a problem either (the run goes
+    ahead as session only), but a selected target with a bad field still is.
+    """
+    if not client:
+        return TargetPreview(systems=0, session=session)
+    if inventory_pending and waits_for_inventory(form, pending=True):
+        return TargetPreview(systems=None, session=session)
+    try:
+        targets = build_targets(form, inventory, image_arches)
+    except NoTargetsError as exc:
+        if session:
+            return TargetPreview(systems=0, session=True)
+        return TargetPreview(systems=0, problem=str(exc))
+    except TargetFormError as exc:
+        return TargetPreview(systems=0, problem=str(exc), session=session)
+
+    unresolved: tuple[str, ...] = ()
+    if form.container and AUTO_ARCH in form.container_arches:
+        unresolved = tuple(i for i in _images(form) if i not in image_arches)
+    # build_targets puts the inventory hosts last.
+    from_inventory = sum(1 for i in form.inventory_selected or [] if 0 <= i < len(inventory))
+    explicit = targets[: len(targets) - from_inventory]
+    sources = [("inventory", from_inventory)] + [
+        (kind, sum(1 for t in explicit if t.kind == kind)) for kind in ("local", "container", "ssh")
+    ]
+    return TargetPreview(
+        systems=len(targets),
+        exact=not unresolved,
+        runs=count_work(targets, qna_spec),
+        sources=tuple((name, n) for name, n in sources if n),
+        unresolved_images=unresolved,
+        session=session,
+    )
+
+
 # --- options -----------------------------------------------------------------------
 
 

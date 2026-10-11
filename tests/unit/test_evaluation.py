@@ -44,6 +44,7 @@ from bigfix_relevance_debugger.evaluation import (
     order_results,
     pick_label,
     pick_phrase,
+    preview_targets,
     resolve_container_arches,
     results_row_details,
     results_summary,
@@ -55,6 +56,7 @@ from bigfix_relevance_debugger.evaluation import (
     tally_table_row,
     total_work,
     visible_results,
+    waits_for_inventory,
 )
 
 WHOSE_EXAMPLE = 'names of files whose (size of it > 1000) of folder "/etc"'
@@ -1766,3 +1768,157 @@ def test_summary_query_only_is_unchanged():
     assert results_summary(PICK_FLEET, 3, "debian") == (
         'Showing 3 of 6 results: hosts with an answer or error containing "debian"'
     )
+
+
+# --- target preview (issue 8) ------------------------------------------------------------
+
+INV = [Target(kind="ssh", name=f"lab-{c}") for c in "abc"]
+
+
+def preview(form, inventory=INV, image_arches=None, **kwargs):
+    kwargs = {"qna_spec": None, "inventory_pending": False} | kwargs
+    return preview_targets(form, inventory, image_arches or {}, **kwargs)
+
+
+def test_preview_counts_inventory_selection_and_explicit_targets():
+    p = preview(TargetForm(local=True, inventory_selected=[0, 2]))
+
+    assert p.systems == 3
+    assert p.exact
+    assert p.problem is None
+    assert p.text == "3 systems"
+    assert "2 inventory" in p.detail
+    assert "1 local" in p.detail
+
+
+def test_preview_with_nothing_selected_reports_the_form_problem():
+    p = preview(TargetForm())
+
+    assert p.systems == 0
+    assert p.problem == "Pick at least one target."
+    assert p.text == "0 systems"
+    assert p.problem in p.detail
+
+
+def test_preview_container_without_image_is_the_build_targets_message():
+    p = preview(TargetForm(container=True, container_images=" "))
+
+    with pytest.raises(TargetFormError) as raised:
+        build_targets(TargetForm(container=True, container_images=" "))
+    assert p.problem == str(raised.value)
+
+
+def test_preview_auto_arch_unknown_is_a_lower_bound(monkeypatch):
+    monkeypatch.setattr(evaluation, "host_arch", lambda: "arm64")
+
+    p = preview(TargetForm(container=True, inventory_selected=[]))
+
+    assert p.systems == 1
+    assert not p.exact
+    assert p.text == "≥ 1 system"
+    assert p.unresolved_images == ("debian:11",)
+    assert "debian:11" in p.detail
+
+
+def test_preview_auto_arch_known_is_exact():
+    p = preview(TargetForm(container=True), image_arches={"debian:11": ["x86_64", "arm64"]})
+
+    assert p.systems == 2
+    assert p.exact
+    assert p.unresolved_images == ()
+    assert p.text == "2 systems"
+    assert "2 container" in p.detail
+
+
+def test_preview_explicit_arches_need_no_lookup():
+    p = preview(TargetForm(container=True, container_arches=["arm64"]))
+
+    assert p.text == "1 system"
+    assert p.exact
+    assert p.unresolved_images == ()
+
+
+def test_preview_waits_for_inventory_like_evaluate():
+    pending = preview(TargetForm(), inventory=[], inventory_pending=True)
+
+    assert pending.systems is None
+    assert pending.problem is None
+    assert pending.text == "finding inventory …"
+
+    explicit = preview(TargetForm(local=True), inventory=[], inventory_pending=True)
+    assert explicit.systems == 1
+    assert explicit.exact
+
+
+def test_waits_for_inventory():
+    assert waits_for_inventory(TargetForm(inventory_selected=[0]), pending=False)
+    assert waits_for_inventory(TargetForm(), pending=True)
+    assert not waits_for_inventory(TargetForm(local=True), pending=True)
+    assert not waits_for_inventory(TargetForm(), pending=False)
+
+
+def test_preview_counts_runs_when_hosts_list_several_qna_versions():
+    inv = [Target(kind="ssh", name="multi", qna_version=["a", "b"]), Target(kind="ssh", name="x")]
+
+    p = preview(TargetForm(inventory_selected=[0, 1]), inventory=inv)
+
+    assert p.systems == 2
+    assert p.runs == 3
+    assert "3 runs" in p.detail
+
+
+def test_preview_says_nothing_about_runs_when_they_equal_systems():
+    detail = preview(TargetForm(inventory_selected=[0, 1])).detail
+
+    assert detail == "2 inventory"
+
+
+@pytest.mark.parametrize(
+    ("form", "arches"),
+    [
+        (TargetForm(local=True), {}),
+        (TargetForm(ssh=True, ssh_host="box"), {}),
+        (TargetForm(container=True, container_arches=["x86_64", "arm64"]), {}),
+        (TargetForm(container=True, container_images="a:1, b:2"), {"a:1": ["x86_64", "arm64"]}),
+        (TargetForm(inventory_selected=[1]), {}),
+        (TargetForm(local=True, inventory_selected=None), {}),
+        (TargetForm(local=True, ssh=True, ssh_host="b", inventory_selected=[0, 1, 2, 7]), {}),
+    ],
+)
+def test_preview_matches_build_targets(form, arches):
+    # The count must never drift from what Evaluate runs.
+    assert preview(form, image_arches=arches).systems == len(build_targets(form, INV, arches))
+
+
+def test_preview_text_singular_and_plural():
+    assert preview(TargetForm(local=True, inventory_selected=[])).text == "1 system"
+    assert preview(TargetForm(inventory_selected=[0, 1])).text == "2 systems"
+
+
+def test_preview_session_only_needs_no_targets():
+    p = preview(TargetForm(), client=False, session=True)
+
+    assert p.problem is None
+    assert p.text == "BigFix server"
+    assert "session" in p.detail
+
+
+def test_preview_both_adds_the_server():
+    assert (
+        preview(TargetForm(inventory_selected=[0, 1]), session=True).text
+        == "2 systems + BigFix server"
+    )
+
+
+def test_preview_both_without_client_targets_runs_session_only():
+    p = preview(TargetForm(), session=True)
+
+    assert p.problem is None
+    assert p.text == "BigFix server"
+
+
+def test_preview_both_with_a_bad_target_is_still_a_problem():
+    p = preview(TargetForm(ssh=True), session=True)
+
+    assert p.problem is not None
+    assert "SSH" in p.problem
