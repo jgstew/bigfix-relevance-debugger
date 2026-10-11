@@ -18,6 +18,7 @@ on:
       - ".github/workflows/test.yaml"
       - ".github/workflows/pre-commit.yaml"
       - ".github/actions/**"
+      - ".github/scripts/**"
   # for the first release, for re-running one that failed after the version
   # was merged, and, with PYPI_PUBLISH unset, for testing everything up to
   # the release job; the tag check below still makes it a no-op if the tag
@@ -206,47 +207,14 @@ jobs:
           sha256sum ./*.whl ./*.tar.gz > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
-      # PyPI never replaces a file. If an earlier attempt already uploaded this
-      # version from other bytes (a newer commit on main, or a rebuild), stop
-      # here, before the draft's assets are touched; `uv publish --check-url`
-      # would only catch it after they had been replaced. Files PyPI doesn't
-      # have yet, or has with the same hash, are fine: that's a re-run
-      # finishing a partial release. Also checks dist/ is for this version.
+      # Stop before the draft's assets are touched if PyPI already has this
+      # version from other bytes; see the script's docstring. Tested offline
+      # in tests/unit/test_pypi_precheck.py. Also checks dist/ is for this
+      # version.
       - name: Check PyPI doesn't already have different bytes for this version
         env:
-          PACKAGE: bigfix-relevance-debugger
           VERSION: ${{ needs.version.outputs.version }}
-        run: |
-          python - <<'EOF'
-          import hashlib
-          import json
-          import os
-          import pathlib
-          import sys
-          import urllib.error
-          import urllib.request
-
-          package, version = os.environ["PACKAGE"], os.environ["VERSION"]
-          stem = package.replace("-", "_") + "-" + version
-          local = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in pathlib.Path("dist").glob(f"{stem}[-.]*")}
-          if not any(n.endswith(".whl") for n in local) or not any(n.endswith(".tar.gz") for n in local):
-              sys.exit(f"::error::dist/ has no wheel and sdist for {version}: {sorted(local)}")
-          try:
-              with urllib.request.urlopen(f"https://pypi.org/pypi/{package}/{version}/json", timeout=30) as r:
-                  released = {f["filename"]: f["digests"]["sha256"] for f in json.load(r)["urls"]}
-          except urllib.error.HTTPError as e:
-              if e.code != 404:
-                  raise
-              released = {}
-          differ = sorted(n for n, h in local.items() if n in released and released[n] != h)
-          if differ:
-              sys.exit(
-                  f"::error::PyPI already has {', '.join(differ)} for {version} with different bytes. "
-                  "PyPI never replaces a file: bump the version, or re-run the original run's failed jobs."
-              )
-          for name in sorted(local):
-              print(f"{name}: {'already on PyPI (identical)' if name in released else 'not on PyPI yet'}")
-          EOF
+        run: python .github/scripts/pypi_precheck.py bigfix-relevance-debugger "${VERSION}"
 
       # Created as a DRAFT and published only at the end, once PyPI has the
       # package. That keeps this compatible with GitHub's immutable releases,
