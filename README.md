@@ -121,12 +121,12 @@ TLS certificate by default.
 
 ## Inventory (shared with `bigfix-remote-client-relevance`)
 
-The target picker lists the hosts from the **same `remote_clients.toml` the
+The side panel's **Inventory** table lists the hosts from the **same `remote_clients.toml` the
 `bigfix-remote-client-relevance` CLI uses**, found with that library's own
 search: `./remote_clients.toml`, then `~/.bigfix/remote_clients.toml`, then
 the all-users config dir. Hosts added there, by hand or by its
 `--auto-discovery`, show up here too. `--inventory PATH` points at a
-different file. A file that fails to load is shown as an error in the picker
+different file. A file that fails to load is shown as an error in the panel
 and doesn't stop the app.
 
 **No inventory yet?** On first start, when none of those places has a file,
@@ -136,14 +136,36 @@ evaluator, and containers for each arch (images you have already pulled
 first, else defaults), and **writes the hosts that work to
 `~/.bigfix/remote_clients.toml`**. If none work, it writes a placeholder so
 discovery doesn't repeat on every start. The page opens right away; the
-picker fills in when discovery finishes, and its progress is in the activity
+table fills in when discovery finishes, and its progress is in the activity
 log.
 
 **Every inventory host is selected by default**, so **Evaluate** runs on the
-whole inventory (plus any Local/Container/SSH target you tick). Remove hosts
-from the picker to narrow a run. With many container hosts, the first run
-against images that aren't cached yet is slow; **Max parallel** limits how
-many targets run at once.
+whole inventory (plus any Local/Container/SSH target you tick under **Add
+targets**). The inventory is a checkbox table with each host's kind,
+platform and qna version(s); untick hosts to narrow a run, or use the header
+checkbox for all or none. From 9 hosts it gets a filter box. With many
+container hosts, the first run against images that aren't cached yet is
+slow; **Max parallel** limits how many targets run at once.
+
+### The side panel and the target count
+
+Targets, options and the activity log live in a side panel that is
+**collapsed by default**, so the editor and results get the full width. The
+button at the right of the header opens and closes it, and **always shows how
+many systems Evaluate would run on right now**, e.g. `12 systems`. Hover it
+(or open the panel) for where they come from (`10 inventory · 2 container`),
+and for how many runs that makes when hosts list several qna versions. It
+reads:
+
+- `≥ 1 system` for a Container with arch `auto` until the image's arches have
+  been looked up. That happens in the background, once per image, and the
+  count then turns exact (e.g. `2 systems` for `debian:11`).
+- `finding inventory …` while first-run auto-discovery is still going.
+- `12 systems + BigFix server` when session relevance runs too, and
+  `BigFix server` when only session relevance runs.
+- `0 systems`, with a warning icon, when nothing would run. The panel then
+  opens itself and says why. It also opens when a run stops on a target or
+  option problem, but it never closes itself.
 
 **Breakdown** runs on one endpoint and picks it for you from the selected
 targets, without asking:
@@ -167,10 +189,12 @@ a specific target, select only that one.
 1. `uvx --from git+https://github.com/jgstew/bigfix-relevance-debugger bigfix-relevance-debugger`
 2. Type `name of operating system`. Live analysis shows a clean parse, the
    type `singular string` and a low complexity score.
-3. Clear the **Inventory** picker (every host in it is selected by default),
-   then tick **Container**, keep image `debian:11` and Arch `auto`, set qna
+3. Open the side panel from the header (it reads e.g. `5 systems`), untick
+   every **Inventory** host with the table's header checkbox, then tick
+   **Container**, keep image `debian:11` and Arch `auto`, set qna
    version to `11.0.7.61`, and click **Evaluate**. `auto` runs every arch the
-   image publishes, so the results table gets two rows, x86_64 and arm64,
+   image publishes, so the header count reads `2 systems` and the results
+   table gets two rows, x86_64 and arm64,
    each with its answer count, answers, platform/arch, qna version and
    elapsed time. If the library had to step back to an older qna build for
    that image, the qna column says so ("fell back from ..."). Click a row's
@@ -195,9 +219,12 @@ a specific target, select only that one.
    session row lists first, then the client rows.
 8. Optional: put the inventory hosts back, add a second image
    (`debian:11, ubuntu:24.04`) or both arches, evaluate
-   `names of files of folder "/etc"`, and watch the table re-sort as results
-   stream in. Type `lsb-release` in the filter box: only the hosts with that
-   answer stay, opened to show all their answers.
+   `names of files of folder "/etc"`, and watch the tables re-sort as results
+   stream in. The **Answers** summary lists each file with how many systems
+   have it. Click `lsb-release` there: only the systems with that file stay
+   in the results; click it again to show them all. Or type `lsb-release` in
+   the filter box: only the hosts with that answer stay, opened to show all
+   their answers.
    **Cancel** stops a run and cleans up its containers. **Export JSON**
    saves every result, including any the filter hides. **Clear** empties the
    results and the breakdown (not the activity log).
@@ -206,6 +233,24 @@ a specific target, select only that one.
 already cached, and have Docker running.
 
 ### Reading the results
+
+The results area reads top to bottom: the **breakdown** (when you ran one),
+then the **Answers** summary, then **Results by system**.
+
+**Answers** has one row per distinct answer, with how many systems returned
+it and a bar for its share of the systems in the run, most common first.
+Then come one `(no answers)` row and one row per error kind
+(`error: transport`, ...); they always go last. A system counts once per
+answer, however many qna versions it ran, so plural answers' shares can add
+up to more than 100%. It shows the 50 most common answers and says how many
+more there are. It covers the whole run, whatever the filter hides, and
+leaves the session result out (that's one server, not a fleet). With a
+single system it's hidden, since it would only repeat that system's row.
+
+**Click a row in Answers** to show only the systems it counted. They keep all
+their rows, and a removable `Only: ...` chip says what's picked. Click the row
+again, or the chip's ✕, to show everything. It combines with the filter box,
+stays across Evaluate like the filter, and **Clear** drops it.
 
 The results table has one row per result, best first: the session result
 (marked `session`) at the top, then hosts with the most answers, then hosts that answered nothing, then errors (in red).
