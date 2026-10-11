@@ -28,9 +28,9 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-    "besapi>=4.4.3",
-    "bigfix-relevance-analyzer>=1.29.1",
-    "bigfix-remote-client-relevance>=1.5.2",
+    "besapi>=4.4.3,<5",
+    "bigfix-relevance-analyzer>=1.29.1,<2",
+    "bigfix-remote-client-relevance>=1.5.2,<2",
     "nicegui[native]>=3.18.0",
 ]
 
