@@ -125,3 +125,8 @@ tags `v<version>`, creates the GitHub release and publishes to PyPI with
 trusted publishing. **Never tag by hand:** an existing tag is how the
 workflow knows a version is already released, so a hand-made tag means that
 version never reaches PyPI.
+
+The whole workflow is a no-op until the repository variable `PYPI_PUBLISH`
+is `true`. If a release fails partway, re-run it ("Re-run failed jobs", or
+Run workflow on `main`): it reuses the draft release, and `uv publish
+--check-url` skips files PyPI already has.
