@@ -358,11 +358,6 @@ class ResultRow:
     error: str | None
     raw_qna_output: str
 
-    @property
-    def headline(self) -> str:
-        """``host: answers`` on success, ``host: error`` (or its kind) on failure."""
-        return f"{self.host}: {self.answers_text if self.ok else (self.error or self.status)}"
-
     @classmethod
     def from_result(cls, result: ClientRelevanceResult) -> ResultRow:
         if result.ok:
@@ -386,6 +381,136 @@ class ResultRow:
             error=result.error,
             raw_qna_output=result.raw_qna_output or "",
         )
+
+    @property
+    def answer_count(self) -> int:
+        return len(self.answers)
+
+    @property
+    def rank(self) -> tuple[int, int]:
+        """Sort key, best first: answered (most answers first), then ok but empty, then errors."""
+        if not self.ok:
+            return 2, 0
+        return (0, -self.answer_count) if self.answers else (1, 0)
+
+    def matches(self, query: str) -> bool:
+        """Whether an answer or the error contains ``query``, ignoring case. Blank matches all.
+
+        Host, platform and qna version are left out on purpose: in a debian:11 /
+        qna 11.x run, ``11`` would otherwise match every row.
+        """
+        needle = query.strip().casefold()
+        if not needle:
+            return True
+        return any(needle in text.casefold() for text in (*self.answers, self.error or ""))
+
+
+# --- results view ---------------------------------------------------------------------
+
+PREVIEW_CHARS = 60
+"""Longest answers preview in a collapsed results-table row: about one line of
+the results column in the native window's default size."""
+
+
+def order_results(rows: Sequence[ResultRow]) -> list[int]:
+    """Indexes into ``rows`` in display order.
+
+    Grouped by host, since a host listing several qna versions yields one
+    result per version and they belong together. Hosts are ranked by their
+    best result (see ``ResultRow.rank``), then by name ignoring case, then by
+    first arrival; a host's own results stay in arrival order.
+    """
+    groups: dict[str, list[int]] = {}
+    for index, row in enumerate(rows):
+        groups.setdefault(row.host, []).append(index)
+
+    def host_key(item: tuple[str, list[int]]) -> tuple[tuple[int, int], str, int]:
+        host, indexes = item
+        return min(rows[i].rank for i in indexes), host.casefold(), indexes[0]
+
+    return [i for _, indexes in sorted(groups.items(), key=host_key) for i in indexes]
+
+
+def visible_results(rows: Sequence[ResultRow], query: str) -> list[int]:
+    """``order_results``, keeping only hosts with at least one matching result.
+
+    A matching host keeps *all* its results, so a search shows each
+    computer's whole answer set rather than just the matching rows.
+    """
+    hosts = {row.host for row in rows if row.matches(query)}
+    return [i for i in order_results(rows) if rows[i].host in hosts]
+
+
+def _cut(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def answers_preview(row: ResultRow, limit: int = PREVIEW_CHARS) -> str:
+    """One line for a collapsed row: as many whole answers as fit, then ``(+N more)``.
+
+    An error is cut to fit too; the expanded row has it whole.
+    """
+    if not row.ok:
+        return _cut(row.error or row.status, limit)
+    if not row.answers:
+        return "(no answers)"
+    shown: list[str] = []
+    length = 0
+    for answer in row.answers:
+        extra = len(answer) + (2 if shown else 0)
+        if length + extra > limit:
+            break
+        shown.append(answer)
+        length += extra
+    if not shown:
+        # Not even the first answer fits: cut it.
+        shown = [_cut(row.answers[0], limit)]
+    text = "; ".join(shown)
+    hidden = row.answer_count - len(shown)
+    return f"{text} (+{hidden} more)" if hidden else text
+
+
+def results_table_row(key: int, row: ResultRow) -> dict[str, str | int | bool | None]:
+    """One results-table row. Every cell is a scalar: NiceGUI warns list cells can
+    crash the browser, so the answers are newline-joined for the expanded view."""
+    return {
+        "id": key,
+        "ok": row.ok,
+        "status": row.status,
+        "host": row.host,
+        "count": row.answer_count,
+        "preview": answers_preview(row),
+        "platform": row.platform_text,
+        "elapsed_ms": row.elapsed_ms,
+        "answers": "\n".join(row.answers),
+        "types": row.answer_types_text,
+        "qna": row.qna_version_text,
+        "error": row.error,
+        "raw": row.raw_qna_output,
+    }
+
+
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+
+def results_summary(rows: Sequence[ResultRow], shown: int, query: str) -> str:
+    """The line above the results table; says so when a search hides some of them."""
+    if not rows:
+        return ""
+    needle = query.strip()
+    if needle:
+        return (
+            f"Showing {shown} of {_plural(len(rows), 'result')}: "
+            f'hosts with an answer or error containing "{needle}"'
+        )
+    answered = sum(1 for r in rows if r.ok and r.answers)
+    empty = sum(1 for r in rows if r.ok and not r.answers)
+    errors = len(rows) - answered - empty
+    return (
+        f"{_plural(len(rows), 'result')}: {answered} with answers, {empty} empty, "
+        f"{_plural(errors, 'error')}"
+    )
 
 
 # --- breakdown ------------------------------------------------------------------------
