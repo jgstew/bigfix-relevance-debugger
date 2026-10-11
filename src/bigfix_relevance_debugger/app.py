@@ -43,6 +43,8 @@ from bigfix_relevance_debugger.analysis import (
 from bigfix_relevance_debugger.evaluation import (
     ARCHES,
     AUTO_ARCH,
+    TALLY_LIMIT,
+    AnswerTally,
     Cells,
     EvalOptions,
     InventoryLoad,
@@ -64,6 +66,7 @@ from bigfix_relevance_debugger.evaluation import (
     session_result_to_dict,
     session_row_wanted,
     stream_results,
+    tally_table_row,
     total_work,
     visible_results,
 )
@@ -187,6 +190,31 @@ _RESULTS_BODY_SLOT = r"""
 </q-tr>
 """
 
+# Answer summary: one row per distinct answer, from tally_table_row(), already
+# in display order (most systems first; no answers and errors last).
+_ANSWER_COLUMNS = [
+    {"name": "label", "label": "Answer", "field": "label", "align": "left"},
+    {"name": "systems", "label": "Systems", "field": "systems", "align": "right"},
+    {"name": "share", "label": "Share of systems", "field": "share", "align": "left"},
+]
+
+# Answers come from the endpoint: interpolate ({{ }}), never v-html.
+_ANSWERS_BODY_SLOT = r"""
+<q-tr :props="props"
+      :class="[props.row.kind === 'error' ? 'text-negative' : '',
+               props.row.kind === 'empty' ? 'opacity-70' : '']">
+  <q-td key="label" :props="props" class="bfrd-mono">{{ props.row.label }}</q-td>
+  <q-td key="systems" :props="props">{{ props.row.systems }}</q-td>
+  <q-td key="share" :props="props" style="min-width: 10rem">
+    <div class="row no-wrap items-center q-gutter-x-sm">
+      <q-linear-progress :value="props.row.share" size="10px" rounded class="col"
+                         :color="props.row.kind === 'error' ? 'negative' : 'primary'" />
+      <span class="text-caption">{{ props.row.percent }}%</span>
+    </div>
+  </q-td>
+</q-tr>
+"""
+
 
 class Debouncer:
     """Run ``callback`` once, ``delay`` seconds after the last ``trigger()``."""
@@ -242,6 +270,8 @@ class _PageState:
     """What the user had open before a search auto-opened the matches; restored after."""
     breakdown_text: str | None = None
     """The expression the breakdown on screen was run on."""
+    tally: AnswerTally = dataclasses.field(default_factory=AnswerTally)
+    """Systems per answer over the whole run, for the answer summary."""
 
     @property
     def running(self) -> bool:
@@ -313,7 +343,20 @@ async def root() -> None:
             # The breakdown goes above the results so it's in view whichever
             # ran last; a long result table would push it off-screen otherwise.
             breakdown_box = ui.column().classes("w-full gap-0").mark("breakdown-section")
+            # Then how many systems gave each answer, then the systems one by one.
+            with ui.column().classes("w-full gap-1").mark("answers-section") as answers_section:
+                answers_title = ui.label().classes("text-subtitle1").mark("answers-title")
+                answers_table = (
+                    ui.table(rows=[], columns=_ANSWER_COLUMNS, row_key="key")
+                    .props("dense flat wrap-cells")
+                    .classes("w-full")
+                    .mark("answers")
+                )
+                answers_table.add_slot("body", _ANSWERS_BODY_SLOT)
+                answers_more = ui.label().classes("text-caption opacity-70").mark("answers-more")
+            answers_section.set_visibility(False)
             with ui.column().classes("w-full gap-1").mark("results-section") as results_section:
+                ui.label("Results by system").classes("text-subtitle1").mark("results-title")
                 results_filter = (
                     ui.input(placeholder="Filter by answer or error text")
                     .props("clearable dense")
@@ -615,6 +658,7 @@ async def root() -> None:
             state.session_results = []
             state.rows = []
             state.table_rows = []
+            state.tally = AnswerTally()
             state.expanded = set()
             state.filter_seen = set()
             if state.expanded_before_filter is not None:
@@ -631,6 +675,7 @@ async def root() -> None:
 
             def arrived(row: ResultRow) -> None:
                 state.table_rows.append(results_table_row(len(state.rows), row))
+                state.tally.add(row)
                 state.rows.append(row)
                 tick()
                 render_results()
@@ -692,6 +737,22 @@ async def root() -> None:
         results_table.update()
         results_summary_label.set_text(results_summary(state.rows, len(order), query))
         results_section.set_visibility(bool(state.rows))
+        render_answers()
+
+    def render_answers() -> None:
+        """The answer summary: the whole run, whatever the filter hides."""
+        tally = state.tally
+        rows, hidden = tally.rows(TALLY_LIMIT)
+        answers_table.rows = [tally_table_row(r, tally.systems, None) for r in rows]
+        answers_table.update()
+        systems = f"{tally.systems} system" + ("" if tally.systems == 1 else "s")
+        answers_title.set_text(f"Answers · {systems}")
+        answers_more.set_text(
+            f"+{hidden} more distinct answers; use the filter below to find one" if hidden else ""
+        )
+        answers_more.set_visibility(bool(hidden))
+        # One system's summary would only repeat its row.
+        answers_section.set_visibility(tally.systems >= 2)
 
     def on_expanded(e: GenericEventArguments) -> None:
         state.expanded = {int(key) for key in e.args or []}
@@ -776,6 +837,7 @@ async def root() -> None:
         results_filter.set_value("")
         filter_debouncer.cancel()  # cleared now, not after the debounce
         state.table_rows = []
+        state.tally = AnswerTally()
         state.filter_text = ""
         state.filter_seen = set()
         render_results()

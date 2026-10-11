@@ -22,6 +22,7 @@ from nicegui.testing.user_simulation import user_simulation
 from bigfix_relevance_debugger import app as app_module
 from bigfix_relevance_debugger.app import Debouncer, build_parser, main
 from bigfix_relevance_debugger.evaluation import (
+    AnswerTally,
     InventoryLoad,
     LevelResult,
     ProbeView,
@@ -1694,3 +1695,170 @@ async def test_clear_removes_session_results_too(user, monkeypatch):
     assert hidden_element(user, "results").rows == []
     [export] = user.find(marker="export").elements
     assert not export.enabled
+
+
+# --- answer summary (issue 8) ---------------------------------------------------------------
+
+# Two systems agree, one differs, one answers nothing, one fails.
+SUMMARY_FLEET = (
+    result("deb", ["Linux Debian 11"]),
+    result("deb2", ["Linux Debian 11"]),
+    result("rh", ["Linux Red Hat 9"]),
+    result("empty"),
+    result("down", error="Permission denied (publickey)", error_kind="transport"),
+)
+
+
+def answers_table(user):
+    # Looked up among all elements: the summary is hidden for fewer than 2 systems.
+    return hidden_element(user, "answers")
+
+
+def answer_rows(user) -> list[tuple[str, int]]:
+    return [(r["label"], r["systems"]) for r in answers_table(user).rows]
+
+
+async def evaluated_summary_fleet(user, monkeypatch, *results):
+    results = results or SUMMARY_FLEET
+    await evaluate_with(user, monkeypatch, stream_of(*results))
+    await user.should_see(f"{len(results)} / {len(results)}")
+    await asyncio.sleep(0.1)
+
+
+async def test_sections_go_breakdown_then_answers_then_results(user, monkeypatch):
+    monkeypatch.setattr(app_module, "run_breakdown", counting_breakdown())
+    await evaluated_summary_fleet(user, monkeypatch)
+    user.find(marker="breakdown").click()
+    await user.should_see(marker="breakdown-level")
+
+    breakdown_at, answers_at, results_at = section_order(
+        user, "breakdown-section", "answers-section", "results-section"
+    )
+    assert breakdown_at < answers_at < results_at
+
+
+async def test_answer_summary_counts_systems_per_answer_highest_first(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch)
+
+    await user.should_see(marker="answers")
+    assert answer_rows(user) == [
+        ("Linux Debian 11", 2),
+        ("Linux Red Hat 9", 1),
+        ("(no answers)", 1),
+        ("error: transport", 1),
+    ]
+    assert [r["percent"] for r in answers_table(user).rows] == [40, 20, 20, 20]
+
+
+async def test_answer_summary_title_counts_systems(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch)
+
+    [title] = user.find(marker="answers-title").elements
+    assert "5 systems" in title.text
+
+
+async def test_answer_summary_hidden_for_a_single_system(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, result("solo", ["a", "b", "c"]))
+
+    await user.should_see(marker="results")
+    await user.should_not_see(marker="answers-section")
+    assert not hidden_element(user, "answers-section").visible
+
+
+async def test_answer_summary_hidden_before_any_run(user):
+    await user.open("/")
+
+    await user.should_not_see(marker="answers-section")
+    assert not hidden_element(user, "answers-section").visible
+
+
+async def test_answer_summary_updates_as_results_stream(user, monkeypatch):
+    gate = asyncio.Event()
+    stream = stream_of(
+        result("a", ["x"]), result("b", ["x"]), result("c", ["x"]), gate=gate, after=2
+    )
+    await evaluate_with(user, monkeypatch, stream)
+    await user.should_see("2 / 3")
+    assert answer_rows(user) == [("x", 2)]
+
+    gate.set()
+
+    await user.should_see("3 / 3")
+    assert answer_rows(user) == [("x", 3)]
+
+
+async def test_answer_summary_ignores_the_filter(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch)
+    before = answer_rows(user)
+
+    await search(user, "debian")
+
+    assert result_hosts(user) == ["deb", "deb2"]
+    assert answer_rows(user) == before
+
+
+async def test_answer_summary_says_how_many_more(user, monkeypatch):
+    many = [f"file{i:02}" for i in range(60)]
+    await evaluated_summary_fleet(user, monkeypatch, result("a", many), result("b", many[:5]))
+
+    assert len(answer_rows(user)) == app_module.TALLY_LIMIT
+    [more] = user.find(marker="answers-more").elements
+    assert more.text.startswith("+10 more distinct answers")
+
+
+async def test_answer_summary_more_caption_hidden_when_everything_fits(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch)
+
+    await user.should_not_see(marker="answers-more")
+    assert not hidden_element(user, "answers-more").visible
+
+
+async def test_answer_summary_is_not_rendered_as_html(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch, result("a", ["<b>x</b>"]), result("b"))
+
+    slots = "".join(str(s.template) for s in answers_table(user).slots.values() if s.template)
+    assert "v-html" not in slots
+    assert answer_rows(user)[0] == ("<b>x</b>", 1)
+
+
+async def test_clear_removes_the_answer_summary(user, monkeypatch):
+    await evaluated_summary_fleet(user, monkeypatch)
+
+    user.find(marker="clear").click()
+
+    await user.should_not_see(marker="answers-section")
+    assert answers_table(user).rows == []
+
+
+async def test_answer_summary_ignores_session_results(user, monkeypatch):
+    monkeypatch.setattr(app_module, "evaluate_session", fake_session([]))
+    monkeypatch.setattr(
+        app_module, "stream_results", stream_of(result("a", ["x"]), result("b", ["y"]))
+    )
+    monkeypatch.setattr(app_module, "total_work", lambda targets, opts: 2)
+    await user.open("/")
+    await set_text(user, "now")
+    user.find(marker="target-local").click()
+
+    user.find(marker="evaluate").click()
+
+    await user.should_see("3 / 3")
+    assert answer_rows(user) == [("x", 1), ("y", 1)]
+    [title] = user.find(marker="answers-title").elements
+    assert "2 systems" in title.text
+
+
+async def test_each_result_is_tallied_once(user, monkeypatch):
+    calls: list[str] = []
+    real = AnswerTally.add
+
+    def counting(self, row):
+        calls.append(row.host)
+        real(self, row)
+
+    monkeypatch.setattr(AnswerTally, "add", counting)
+    await evaluated_summary_fleet(user, monkeypatch)
+    await search(user, "debian")
+    await clear_search(user)
+
+    assert sorted(calls) == sorted(r.host for r in SUMMARY_FLEET)
