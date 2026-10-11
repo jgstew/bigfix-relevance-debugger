@@ -18,9 +18,10 @@ on:
       - ".github/workflows/test.yaml"
       - ".github/workflows/pre-commit.yaml"
       - ".github/actions/**"
-  # a re-run path for when a release run failed after the version was already
-  # merged, and for the first release; the tag check below still makes it a
-  # no-op if the tag exists
+  # for the first release, for re-running one that failed after the version
+  # was merged, and, with PYPI_PUBLISH unset, for testing everything up to
+  # the release job; the tag check below still makes it a no-op if the tag
+  # exists
   workflow_dispatch:
 
 permissions:
@@ -50,16 +51,11 @@ jobs:
     # fork guard: a fork that pushes to its own main should not try to release.
     # main guard: `push` is already limited to main, but workflow_dispatch can
     # be started from any branch, and would release that branch's version.
-    # PYPI_PUBLISH guard: unlike the analyzer, which gates only its PyPI step,
-    # this gates the whole release. For this repo PyPI is the point of a
-    # release, and a GitHub-only release would tag the version, so the tag
-    # check would never publish it to PyPI later. Until the repository
-    # variable PYPI_PUBLISH is `true` (Settings > Secrets and variables >
-    # Actions > Variables), every run is a green no-op.
+    # PYPI_PUBLISH gates only the `release` job (see there), so this job and
+    # the test and pre-commit gates run either way.
     if: >-
       github.repository == 'jgstew/bigfix-relevance-debugger'
       && github.ref == 'refs/heads/main'
-      && vars.PYPI_PUBLISH == 'true'
     outputs:
       version: ${{ steps.getversion.outputs.version }}
       prerelease: ${{ steps.getversion.outputs.prerelease }}
@@ -106,6 +102,7 @@ jobs:
         id: tagged
         env:
           VERSION: ${{ steps.getversion.outputs.version }}
+          PYPI_PUBLISH: ${{ vars.PYPI_PUBLISH }}
         run: |
           rc=0
           git ls-remote --exit-code --tags origin "refs/tags/v${VERSION}" > /dev/null || rc=$?
@@ -116,7 +113,13 @@ jobs:
               ;;
             2)
               echo "release_needed=true" >> "$GITHUB_OUTPUT"
-              echo "v${VERSION} has no tag yet - will release"
+              if [ "$PYPI_PUBLISH" = "true" ]; then
+                echo "v${VERSION} has no tag yet - will release"
+              else
+                msg="v${VERSION} has no tag yet, but PYPI_PUBLISH isn't \`true\`: the gates run, the release job is skipped"
+                echo "::notice::${msg}"
+                echo "$msg" >> "$GITHUB_STEP_SUMMARY"
+              fi
               ;;
             *)
               echo "::error::git ls-remote failed (exit $rc) checking for tag v${VERSION}"
@@ -150,6 +153,16 @@ jobs:
   release:
     name: Tag, release and publish
     needs: [version, test, pre-commit]
+    # The only job PYPI_PUBLISH gates. It does all the outward-facing work
+    # (tag, GitHub release, PyPI upload), so with the repository variable
+    # unset (Settings > Secrets and variables > Actions > Variables) a run
+    # still exercises the version check and both gates on the real trigger,
+    # and creates nothing. This gates the whole job, not just the PyPI step
+    # as the analyzer does: for this repo PyPI is the point of a release, and
+    # a GitHub-only release would tag the version, so the tag check would
+    # never publish it to PyPI later. (`needs` still requires the gates to
+    # have succeeded; an `if:` without a status function implies success().)
+    if: vars.PYPI_PUBLISH == 'true'
     runs-on: ubuntu-latest
     # Gates the whole job - tag, GitHub release and PyPI upload - so an
     # environment protection rule (required reviewer, branch restriction)
