@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 
 from bigfix_relevance_analyzer import (
     Dialect,
@@ -148,6 +149,22 @@ def dialect_fit(text: str) -> DialectFit:
     return fit(frozenset({Dialect.CLIENT}), "default")
 
 
+def name_key(written: str) -> str:
+    """An inspector name as written, folded for comparison: lower case, single spaces.
+
+    ``Operating\n  Sytem`` and ``operating sytem`` are the same name to
+    :func:`suggest`; this is the key for "the same name" everywhere else.
+    """
+    return " ".join(written.lower().split())
+
+
+@lru_cache(maxsize=1024)
+def _leads(name: str, dialect: Dialect | None) -> tuple[str, ...]:
+    # suggest() is a fuzzy search over every inspector, milliseconds a call,
+    # and an editor asks again about the same names on every keystroke.
+    return suggest(name, dialect=dialect)
+
+
 def span_leads(
     statement: str, finding: Finding, *, dialect: Dialect | None
 ) -> tuple[tuple[str, ...], ...]:
@@ -157,8 +174,8 @@ def span_leads(
     statement, and its :attr:`Finding.suggestions` merges all their leads, so
     an editor can't tell which lead belongs to which underline. Each span is
     one use of one name; this asks :func:`suggest` about the name as written
-    there, once per name (it costs milliseconds a call), so every use of a
-    name shares one tuple. Any other finding gets ``()`` per span.
+    there (by :func:`name_key`), remembering answers across calls, so every
+    use of a name shares one tuple. Any other finding gets ``()`` per span.
 
     ``statement`` is the text the spans index into (for :func:`lint_text`,
     ``text.strip()``), and ``dialect`` is ``LintConfig.dialect`` as linted.
@@ -166,13 +183,11 @@ def span_leads(
     dialect unless that was only assumed, else every dialect.
 
     Upstream: a ``suggestions`` field on ``TextSpan``, filled where lint
-    already computes each name's leads.
+    already computes each name's leads (which also saves this second search).
     """
     if finding.code != "unknown-inspector":
         return tuple(() for _ in finding.spans)
     if dialect is None:
         report = analyze_relevance(statement)
         dialect = None if report.dialect_assumed else report.dialect
-    names = [" ".join(statement[s.start : s.end].lower().split()) for s in finding.spans]
-    leads = {name: suggest(name, dialect=dialect) for name in dict.fromkeys(names)}
-    return tuple(leads[name] for name in names)
+    return tuple(_leads(name_key(statement[s.start : s.end]), dialect) for s in finding.spans)

@@ -14,6 +14,7 @@ from bigfix_relevance_debugger.upstream.relevance_analyzer import (
     DialectFit,
     client_platforms,
     dialect_fit,
+    name_key,
     span_leads,
     summarize_count_results,
 )
@@ -160,7 +161,8 @@ def test_span_leads_ask_once_per_name():
         ("nme of nme of operating system", Dialect.CLIENT),
         ("names of bes computerz", Dialect.SESSION),
         # Unforced: lint classifies the statement, and so must span_leads.
-        ('names of filez of folder "/etc"', None),
+        ('names of filez of folder "/etc"', None),  # classified client
+        ("names of bes computerz", None),  # classified session
         ('names of bes computerz whose (nme of it = "x")', None),
         # Unforced and unclassifiable: lint searches every dialect.
         ("nme of operating system", None),
@@ -173,6 +175,30 @@ def test_span_leads_together_are_the_findings_suggestions(statement, dialect):
     leads = span_leads(statement, finding, dialect=dialect)
 
     assert tuple(dict.fromkeys(lead for each in leads for lead in each)) == finding.suggestions
+
+
+def test_span_leads_reuse_earlier_answers():
+    # Lint already asked suggest() about each name; the editor asks again on
+    # every keystroke. A repeat must not pay for another fuzzy search.
+    statement = "nme of operating sytem"
+    finding = unknown_finding(statement)
+
+    first = span_leads(statement, finding, dialect=Dialect.CLIENT)
+    again = span_leads(statement, finding, dialect=Dialect.CLIENT)
+
+    assert all(a is b for a, b in zip(first, again, strict=True))
+
+
+@pytest.mark.parametrize(
+    ("written", "key"),
+    [
+        ("nme", "nme"),
+        ("Operating  Sytem", "operating sytem"),
+        ("operating\n\tSYSTEM", "operating system"),
+    ],
+)
+def test_name_key_folds_case_and_spacing(written, key):
+    assert name_key(written) == key
 
 
 def test_span_leads_are_empty_for_other_findings():

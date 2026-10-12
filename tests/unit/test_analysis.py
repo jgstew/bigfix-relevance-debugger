@@ -207,6 +207,16 @@ def test_type_error_surfaces_as_type_error_and_finding():
     assert view.findings[0].severity == "error"
 
 
+@pytest.mark.parametrize("lead", ["\n\n", "  \n \n  "])
+def test_finding_lines_count_the_text_as_typed(lead):
+    # lint_text counts lines from text.strip(); the parse banner counts the
+    # text as typed. Both must say line 3.
+    view = summarize(lead + SETTING)
+
+    assert view.findings[0].line == 3
+    assert summarize(lead + "(1 +").parse_error.line == 3  # type: ignore[union-attr]
+
+
 def test_finding_spans_are_plain_offsets():
     view = summarize("(name of operating system) + 1")
 
@@ -319,6 +329,14 @@ def test_no_fix_when_the_name_is_now_valid():
     assert missing_fix_reason(view, "operating system", "operating systems") == (
         "operating systems no longer applies to operating system."
     )
+
+
+def test_no_fix_when_the_name_is_still_unknown_but_has_no_leads():
+    view = summarize("name of zzqxw")
+    assert view.findings[0].code == "unknown-inspector"
+    assert view.findings[0].fixes == ()
+
+    assert missing_fix_reason(view, "zzqxw", "x") == "x no longer applies to zzqxw."
 
 
 def test_a_name_inside_a_longer_word_is_gone():

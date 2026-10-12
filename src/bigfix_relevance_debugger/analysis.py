@@ -22,6 +22,7 @@ from bigfix_relevance_debugger.upstream.relevance_analyzer import (
     DialectFit,
     client_platforms,
     dialect_fit,
+    name_key,
     span_leads,
 )
 
@@ -211,10 +212,6 @@ def _run_dialects(text: str, mode: str) -> tuple[tuple[str, ...], str]:
     return run, _fit_reason(fit)
 
 
-def _name_key(written: str) -> str:
-    return " ".join(written.lower().split())
-
-
 def _finding_view(text: str, offset: int, finding: Finding, dialect: Dialect) -> FindingView:
     """``finding`` from ``lint_text``, whose spans index ``text.strip()``,
     re-based by ``offset`` (the leading whitespace) onto ``text``."""
@@ -227,7 +224,7 @@ def _finding_view(text: str, offset: int, finding: Finding, dialect: Dialect) ->
     name_leads: dict[str, tuple[str, ...]] = {}
     for span in spans:
         if span.suggestions:
-            name = _name_key(text[span.start : span.end])
+            name = name_key(text[span.start : span.end])
             uses.setdefault(name, []).append((span.start, span.end))
             name_leads.setdefault(name, span.suggestions)
     several = len(name_leads) > 1
@@ -245,7 +242,8 @@ def _finding_view(text: str, offset: int, finding: Finding, dialect: Dialect) ->
         severity=finding.severity.value,
         code=finding.code,
         message=finding.message,
-        line=finding.line,
+        # lint_text counts lines from text.strip(); count the text as typed.
+        line=None if finding.line is None else finding.line + text[:offset].count("\n"),
         spans=spans,
         fixes=fixes,
     )
@@ -363,8 +361,7 @@ def missing_fix_reason(view: AnalysisView, name: str, suggestion: str) -> str:
     whole-word match on lower-cased, single-spaced text: approximate (it
     also finds the name inside a string), but it only picks the message.
     """
-    words = " ".join(view.text.lower().split())
-    if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", words):
+    if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", name_key(view.text)):
         return f"{suggestion} no longer applies to {name}."
     return f"{name} is no longer in the text."
 
