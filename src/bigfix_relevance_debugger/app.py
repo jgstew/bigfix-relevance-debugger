@@ -37,8 +37,9 @@ from bigfix_relevance_debugger.analysis import (
     DIALECT_MODES,
     SESSION,
     AnalysisView,
-    FindingView,
     editor_decorations,
+    missing_fix_reason,
+    suggestion_fix,
     summarize,
 )
 from bigfix_relevance_debugger.evaluation import (
@@ -233,15 +234,23 @@ _ANSWERS_BODY_SLOT = r"""
 
 # Findings: each "did you mean" lead is a button that applies it. Names and
 # leads come from the user's text and the analyzer: interpolate, never v-html.
-_FINDINGS_SUGGESTIONS_SLOT = r"""
+# The slot emits FIX_EVENT with these keys; apply_suggestion reads the same.
+FIX_EVENT = "fix"
+FIX_NAME = "name"
+FIX_SUGGESTION = "suggestion"
+_FINDINGS_SUGGESTIONS_SLOT = (
+    r"""
 <q-td :props="props">
-  <q-btn v-for="fix in props.row.fixes" :key="fix.name + '\u2192' + fix.suggestion"
+  <q-btn v-for="fix in props.row.fixes" :key="fix.label"
          dense flat no-caps size="sm" color="primary" class="bfrd-mono" :label="fix.label"
-         @click="() => $parent.$emit('fix', {name: fix.name, suggestion: fix.suggestion})">
+         @click="() => $parent.$emit('@EVENT@', {@NAME@: fix.name, @SUGGESTION@: fix.suggestion})">
     <q-tooltip>Replace {{ fix.name }} with {{ fix.suggestion }}</q-tooltip>
   </q-btn>
 </q-td>
-"""
+""".replace("@EVENT@", FIX_EVENT)
+    .replace("@NAME@", FIX_NAME)
+    .replace("@SUGGESTION@", FIX_SUGGESTION)
+)
 
 # Three columns fit the side panel; kind and platform share one.
 _INVENTORY_COLUMNS = [
@@ -569,7 +578,7 @@ async def root() -> None:
                             {
                                 "name": "suggestions",
                                 "label": "Suggestions",
-                                "field": "suggestions",
+                                "field": "fixes",
                                 "align": "left",
                                 "style": "white-space: normal",
                             },
@@ -580,8 +589,14 @@ async def root() -> None:
                                 "code": f.code,
                                 "line": f.line,
                                 "message": f.message,
-                                "suggestions": ", ".join(f.suggestions),
-                                "fixes": fix_buttons(f),
+                                "fixes": [
+                                    {
+                                        "name": fix.name,
+                                        "suggestion": fix.suggestion,
+                                        "label": fix.label,
+                                    }
+                                    for fix in f.fixes
+                                ],
                             }
                             for f in shown
                         ],
@@ -591,7 +606,7 @@ async def root() -> None:
                     .mark("findings")
                 )
                 table.add_slot("body-cell-suggestions", _FINDINGS_SUGGESTIONS_SLOT)
-                table.on("fix", apply_suggestion)
+                table.on(FIX_EVENT, apply_suggestion)
         update_stale()
         update_buttons()
         refresh_targets()
@@ -599,18 +614,6 @@ async def root() -> None:
     def reanalyze() -> None:
         state.view = summarize(code.value or "", state.dialect_mode)
         apply_analysis()
-
-    def fix_buttons(finding: FindingView) -> list[dict[str, str]]:
-        """One button per lead; say which name it replaces when there are several."""
-        several = len({f.name for f in finding.fixes}) > 1
-        return [
-            {
-                "name": f.name,
-                "suggestion": f.suggestion,
-                "label": f"{f.name} \u2192 {f.suggestion}" if several else f.suggestion,
-            }
-            for f in finding.fixes
-        ]
 
     def fix_all() -> None:
         # The button belongs to the last analysis; fix what the editor shows now.
@@ -621,21 +624,14 @@ async def root() -> None:
         code.set_value(view.autofix.text)
 
     def apply_suggestion(e: GenericEventArguments) -> None:
-        name, suggestion = e.args["name"], e.args["suggestion"]
+        name, suggestion = e.args[FIX_NAME], e.args[FIX_SUGGESTION]
+        # The table belongs to the last analysis; fix what the editor shows now.
         view = current_view()
-        fix = next(
-            (
-                f
-                for finding in view.findings
-                for f in finding.fixes
-                if (f.name, f.suggestion) == (name, suggestion)
-            ),
-            None,
-        )
-        if fix is None:
-            ui.notify(f"{name} is no longer in the text.", type="warning")
+        text = suggestion_fix(view, name, suggestion)
+        if text is None:
+            ui.notify(missing_fix_reason(view, name, suggestion), type="warning")
             return
-        code.set_value(fix.text)
+        code.set_value(text)
 
     debouncer = Debouncer(DEBOUNCE_S, reanalyze)
     code.on_value_change(lambda _: debouncer.trigger())

@@ -16,6 +16,8 @@ from bigfix_relevance_debugger.analysis import (
     SpanView,
     SuggestionFix,
     editor_decorations,
+    missing_fix_reason,
+    suggestion_fix,
     summarize,
 )
 
@@ -193,7 +195,7 @@ def test_lint_finding_with_suggestions():
     assert finding.code == "unknown-inspector"
     assert finding.severity == "warning"
     assert finding.line == 1
-    assert "operating system" in finding.suggestions
+    assert "operating system" in [f.suggestion for f in finding.fixes]
 
 
 def test_type_error_surfaces_as_type_error_and_finding():
@@ -249,34 +251,61 @@ def test_each_lead_is_a_fix_that_replaces_the_name():
     assert fix == SuggestionFix(
         name="operating sytem",
         suggestion="operating system",
-        text="  name of operating system\n",
+        label="operating system",
+        spans=((10, 25),),
     )
     assert [f.suggestion for f in view.findings[0].fixes] == list(
         view.findings[0].spans[0].suggestions
     )
+    assert (
+        suggestion_fix(view, "operating sytem", "operating system")
+        == "  name of operating system\n"
+    )
 
 
 def test_a_fix_replaces_every_use_of_the_name():
-    view = summarize("nme of nme of operating system")
+    view = summarize("nme of NME of operating system")
 
     [finding] = view.findings
     fix = finding.fixes[0]
     assert fix.name == "nme"
-    assert fix.text == f"{fix.suggestion} of {fix.suggestion} of operating system"
+    assert len(fix.spans) == 2
     assert len(finding.fixes) == len(finding.spans[0].suggestions)  # one per lead, not per use
+    assert (
+        suggestion_fix(view, "nme", fix.suggestion)
+        == f"{fix.suggestion} of {fix.suggestion} of operating system"
+    )
 
 
-def test_fixes_are_per_name():
+def test_fixes_are_per_name_and_say_which_name_when_there_are_several():
     view = summarize("nme of operating sytem")
 
-    names = {f.name for f in view.findings[0].fixes}
-    assert names == {"nme", "operating sytem"}
-    fix = next(f for f in view.findings[0].fixes if f.suggestion == "operating system")
-    assert fix.text == "nme of operating system"
+    fixes = view.findings[0].fixes
+    assert {f.name for f in fixes} == {"nme", "operating sytem"}
+    fix = next(f for f in fixes if f.suggestion == "operating system")
+    assert fix.label == "operating sytem \u2192 operating system"
+    assert suggestion_fix(view, "operating sytem", "operating system") == "nme of operating system"
 
 
 def test_findings_without_leads_have_no_fixes():
     assert summarize("(name of operating system) + 1").findings[0].fixes == ()
+
+
+def test_no_fix_once_the_name_is_gone():
+    view = summarize("name of operating system")
+
+    assert suggestion_fix(view, "operating sytem", "operating system") is None
+    assert missing_fix_reason(view, "operating sytem", "operating system") == (
+        "operating sytem is no longer in the text."
+    )
+
+
+def test_no_fix_when_the_name_is_still_there_but_not_that_lead():
+    # The session dialect has other leads for `filez` than client's `file`.
+    view = summarize('names of filez of folder "/etc"', "session")
+
+    assert suggestion_fix(view, "filez", "file") is None
+    assert missing_fix_reason(view, "filez", "file") == ("file is no longer suggested for filez.")
 
 
 def test_autofix_keeps_the_surrounding_whitespace():

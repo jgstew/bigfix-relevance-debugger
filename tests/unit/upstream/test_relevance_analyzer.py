@@ -144,12 +144,26 @@ def test_span_leads_repeat_for_each_use_of_a_name():
     assert first == second == suggest("nme", dialect=Dialect.CLIENT)
 
 
+def test_span_leads_ask_once_per_name():
+    # suggest() costs ~20 ms a call; a name used 40 times must not cost 40.
+    statement = "nme of NME of operating system"
+
+    first, second = span_leads(statement, unknown_finding(statement), dialect=Dialect.CLIENT)
+
+    assert first is second
+
+
 @pytest.mark.parametrize(
     ("statement", "dialect"),
     [
         ("nme of Operating  Sytem", Dialect.CLIENT),
         ("nme of nme of operating system", Dialect.CLIENT),
         ("names of bes computerz", Dialect.SESSION),
+        # Unforced: lint classifies the statement, and so must span_leads.
+        ('names of filez of folder "/etc"', None),
+        ('names of bes computerz whose (nme of it = "x")', None),
+        # Unforced and unclassifiable: lint searches every dialect.
+        ("nme of operating system", None),
     ],
 )
 def test_span_leads_together_are_the_findings_suggestions(statement, dialect):

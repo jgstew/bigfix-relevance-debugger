@@ -65,13 +65,18 @@ class SpanView:
 
 @dataclass(frozen=True)
 class SuggestionFix:
-    """Replace every use of an unknown name with one of its leads."""
+    """Replace every use of an unknown name with one of its leads.
+
+    Applied on demand with :func:`suggestion_fix`.
+    """
 
     name: str
     """The unknown name, lower-cased with single spaces."""
     suggestion: str
-    text: str
-    """The whole editor text with the fix applied."""
+    label: str
+    """Button text: the lead, prefixed ``name →`` when the finding has several names."""
+    spans: tuple[tuple[int, int], ...]
+    """Every use of ``name``: ``str`` offsets into the text as typed."""
 
 
 @dataclass(frozen=True)
@@ -91,7 +96,6 @@ class FindingView:
     code: str
     message: str
     line: int | None
-    suggestions: tuple[str, ...]
     spans: tuple[SpanView, ...]
     fixes: tuple[SuggestionFix, ...]
     """One per name and lead, in span then lead order."""
@@ -210,12 +214,6 @@ def _name_key(written: str) -> str:
     return " ".join(written.lower().split())
 
 
-def _replace_all(text: str, spans: list[tuple[int, int]], replacement: str) -> str:
-    for start, end in sorted(spans, reverse=True):
-        text = text[:start] + replacement + text[end:]
-    return text
-
-
 def _finding_view(text: str, offset: int, finding: Finding, dialect: Dialect) -> FindingView:
     """``finding`` from ``lint_text``, whose spans index ``text.strip()``,
     re-based by ``offset`` (the leading whitespace) onto ``text``."""
@@ -231,8 +229,14 @@ def _finding_view(text: str, offset: int, finding: Finding, dialect: Dialect) ->
             name = _name_key(text[span.start : span.end])
             uses.setdefault(name, []).append((span.start, span.end))
             name_leads.setdefault(name, span.suggestions)
+    several = len(name_leads) > 1
     fixes = tuple(
-        SuggestionFix(name, lead, _replace_all(text, uses[name], lead))
+        SuggestionFix(
+            name=name,
+            suggestion=lead,
+            label=f"{name} \u2192 {lead}" if several else lead,
+            spans=tuple(uses[name]),
+        )
         for name, leads_ in name_leads.items()
         for lead in leads_
     )
@@ -241,7 +245,6 @@ def _finding_view(text: str, offset: int, finding: Finding, dialect: Dialect) ->
         code=finding.code,
         message=finding.message,
         line=finding.line,
-        suggestions=tuple(finding.suggestions),
         spans=spans,
         fixes=fixes,
     )
@@ -330,6 +333,32 @@ def summarize(text: str, mode: str = AUTO) -> AnalysisView:
         can_breakdown=reason is None,
         breakdown_disabled_reason=reason,
     )
+
+
+def _fixes(view: AnalysisView) -> list[SuggestionFix]:
+    return [fix for finding in view.findings for fix in finding.fixes]
+
+
+def suggestion_fix(view: AnalysisView, name: str, suggestion: str) -> str | None:
+    """``view.text`` with every use of ``name`` replaced by ``suggestion``.
+
+    None when ``view`` no longer offers that fix: the name was edited away,
+    or its leads changed (a different dialect suggests other names).
+    """
+    fix = next((f for f in _fixes(view) if (f.name, f.suggestion) == (name, suggestion)), None)
+    if fix is None:
+        return None
+    text = view.text
+    for start, end in sorted(fix.spans, reverse=True):
+        text = text[:start] + suggestion + text[end:]
+    return text
+
+
+def missing_fix_reason(view: AnalysisView, name: str, suggestion: str) -> str:
+    """Why :func:`suggestion_fix` found nothing, for the user."""
+    if any(f.name == name for f in _fixes(view)):
+        return f"{suggestion} is no longer suggested for {name}."
+    return f"{name} is no longer in the text."
 
 
 def _mark(

@@ -283,7 +283,8 @@ async def test_live_analysis_shows_lint_finding(user):
     [table] = user.find(marker="findings").elements
     [row] = table.rows
     assert row["code"] == "unknown-inspector"
-    assert "operating system" in row["suggestions"]
+    assert "operating system" in [f["suggestion"] for f in row["fixes"]]
+    assert "suggestions" not in row  # the slot renders "fixes"; a string would be dead
 
 
 async def test_live_analysis_decorates_editor(user):
@@ -369,13 +370,29 @@ async def test_findings_offer_each_lead_as_a_fix(user):
     assert any(name == "nme" for name, _ in fixes)
 
 
+def test_suggestion_buttons_emit_what_the_handler_reads():
+    # The page tests trigger the event directly, so pin the slot to the
+    # same event name and payload keys the handler reads.
+    slot = app_module._FINDINGS_SUGGESTIONS_SLOT
+
+    assert f"$emit('{app_module.FIX_EVENT}', " in slot
+    assert (
+        f"{{{app_module.FIX_NAME}: fix.name, {app_module.FIX_SUGGESTION}: fix.suggestion}}" in slot
+    )
+
+
+def pick_lead(user, name, suggestion):
+    user.find(marker="findings").trigger(
+        app_module.FIX_EVENT,
+        {app_module.FIX_NAME: name, app_module.FIX_SUGGESTION: suggestion},
+    )
+
+
 async def test_picking_a_lead_replaces_the_name(user):
     await user.open("/")
     await set_text(user, "name of operating sytem")
 
-    user.find(marker="findings").trigger(
-        "fix", {"name": "operating sytem", "suggestion": "operating system"}
-    )
+    pick_lead(user, "operating sytem", "operating system")
 
     assert editor(user).value == "name of operating system"
 
@@ -385,12 +402,23 @@ async def test_picking_a_lead_after_editing_it_away_warns(user):
     await set_text(user, "name of operating sytem")
 
     editor(user).set_value("name of operating system")
-    user.find(marker="findings").trigger(
-        "fix", {"name": "operating sytem", "suggestion": "operating system"}
-    )
+    pick_lead(user, "operating sytem", "operating system")
 
     await notified(user, "no longer")
     assert editor(user).value == "name of operating system"
+
+
+async def test_picking_a_lead_the_dialect_no_longer_offers_says_so(user):
+    await user.open("/")
+    [picker] = user.find(marker="dialect").elements
+    picker.set_value("client")
+    await set_text(user, 'names of filez of folder "/etc"')
+
+    picker.set_value("session")  # session suggests other names for `filez`
+    pick_lead(user, "filez", "file")
+
+    await notified(user, "file is no longer suggested for filez")
+    assert editor(user).value == 'names of filez of folder "/etc"'
 
 
 async def test_evaluate_without_targets_warns(user):

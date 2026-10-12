@@ -157,14 +157,22 @@ def span_leads(
     statement, and its :attr:`Finding.suggestions` merges all their leads, so
     an editor can't tell which lead belongs to which underline. Each span is
     one use of one name; this asks :func:`suggest` about the name as written
-    there. Any other finding gets ``()`` per span.
+    there, once per name (it costs milliseconds a call), so every use of a
+    name shares one tuple. Any other finding gets ``()`` per span.
 
     ``statement`` is the text the spans index into (for :func:`lint_text`,
-    ``text.strip()``), and ``dialect`` the one it was linted in.
+    ``text.strip()``), and ``dialect`` is ``LintConfig.dialect`` as linted.
+    ``None`` is resolved the way lint resolves it: the statement's own
+    dialect unless that was only assumed, else every dialect.
 
     Upstream: a ``suggestions`` field on ``TextSpan``, filled where lint
     already computes each name's leads.
     """
     if finding.code != "unknown-inspector":
         return tuple(() for _ in finding.spans)
-    return tuple(suggest(statement[s.start : s.end], dialect=dialect) for s in finding.spans)
+    if dialect is None:
+        report = analyze_relevance(statement)
+        dialect = None if report.dialect_assumed else report.dialect
+    names = [" ".join(statement[s.start : s.end].lower().split()) for s in finding.spans]
+    leads = {name: suggest(name, dialect=dialect) for name in dict.fromkeys(names)}
+    return tuple(leads[name] for name in names)
