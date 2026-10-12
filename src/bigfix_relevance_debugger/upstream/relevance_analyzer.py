@@ -10,11 +10,13 @@ from dataclasses import dataclass
 
 from bigfix_relevance_analyzer import (
     Dialect,
+    Finding,
     Outcome,
     Plurality,
     RelevanceAnalysis,
     analyze_relevance,
     interpret_count_results,
+    suggest,
 )
 
 
@@ -144,3 +146,25 @@ def dialect_fit(text: str) -> DialectFit:
     if classified is Dialect.UNCERTAIN:
         return fit(both, "mixed")
     return fit(frozenset({Dialect.CLIENT}), "default")
+
+
+def span_leads(
+    statement: str, finding: Finding, *, dialect: Dialect | None
+) -> tuple[tuple[str, ...], ...]:
+    """The "did you mean" leads for each of ``finding``'s spans, in span order.
+
+    An ``unknown-inspector`` finding covers every unknown name in the
+    statement, and its :attr:`Finding.suggestions` merges all their leads, so
+    an editor can't tell which lead belongs to which underline. Each span is
+    one use of one name; this asks :func:`suggest` about the name as written
+    there. Any other finding gets ``()`` per span.
+
+    ``statement`` is the text the spans index into (for :func:`lint_text`,
+    ``text.strip()``), and ``dialect`` the one it was linted in.
+
+    Upstream: a ``suggestions`` field on ``TextSpan``, filled where lint
+    already computes each name's leads.
+    """
+    if finding.code != "unknown-inspector":
+        return tuple(() for _ in finding.spans)
+    return tuple(suggest(statement[s.start : s.end], dialect=dialect) for s in finding.spans)

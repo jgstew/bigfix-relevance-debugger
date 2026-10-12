@@ -10,9 +10,18 @@ import dataclasses
 
 import pytest
 
-from bigfix_relevance_debugger.analysis import AnalysisView, editor_decorations, summarize
+from bigfix_relevance_debugger.analysis import (
+    AnalysisView,
+    AutofixView,
+    SpanView,
+    SuggestionFix,
+    editor_decorations,
+    summarize,
+)
 
 WHOSE_EXAMPLE = 'names of files whose (size of it > 1000) of folder "/etc"'
+# The analyzer's own autofix example: `setting` mid-chain should be plural.
+SETTING = 'exists values of setting "x" of client'
 
 
 def test_valid_expression_has_no_parse_error_and_can_break_down():
@@ -199,7 +208,89 @@ def test_type_error_surfaces_as_type_error_and_finding():
 def test_finding_spans_are_plain_offsets():
     view = summarize("(name of operating system) + 1")
 
-    assert view.findings[0].spans == ((0, 30),)
+    assert [(s.start, s.end) for s in view.findings[0].spans] == [(0, 30)]
+
+
+@pytest.mark.parametrize("lead", ["  ", "\n", " \n\t"])
+def test_finding_spans_index_the_text_as_typed(lead):
+    # lint_text analyses text.strip(), so its spans start after any leading
+    # whitespace; the view's spans must index what the editor shows.
+    text = lead + "name of operating sytem"
+
+    [span] = summarize(text).findings[0].spans
+
+    assert text[span.start : span.end] == "operating sytem"
+
+
+def test_unknown_name_spans_carry_their_own_message_and_leads():
+    view = summarize("nme of operating sytem")
+
+    first, second = view.findings[0].spans
+    assert isinstance(first, SpanView)
+    assert "`nme`" in (first.message or "") and "operating sytem" not in (first.message or "")
+    assert "`operating sytem`" in (second.message or "")
+    assert second.suggestions[0] == "operating system"
+    assert "operating system" not in first.suggestions
+
+
+def test_other_spans_have_no_leads():
+    [span] = summarize("(name of operating system) + 1").findings[0].spans
+
+    assert span.suggestions == ()
+
+
+# --- fixes -------------------------------------------------------------------
+
+
+def test_each_lead_is_a_fix_that_replaces_the_name():
+    view = summarize("  name of operating sytem\n")
+
+    fix = view.findings[0].fixes[0]
+    assert fix == SuggestionFix(
+        name="operating sytem",
+        suggestion="operating system",
+        text="  name of operating system\n",
+    )
+    assert [f.suggestion for f in view.findings[0].fixes] == list(
+        view.findings[0].spans[0].suggestions
+    )
+
+
+def test_a_fix_replaces_every_use_of_the_name():
+    view = summarize("nme of nme of operating system")
+
+    [finding] = view.findings
+    fix = finding.fixes[0]
+    assert fix.name == "nme"
+    assert fix.text == f"{fix.suggestion} of {fix.suggestion} of operating system"
+    assert len(finding.fixes) == len(finding.spans[0].suggestions)  # one per lead, not per use
+
+
+def test_fixes_are_per_name():
+    view = summarize("nme of operating sytem")
+
+    names = {f.name for f in view.findings[0].fixes}
+    assert names == {"nme", "operating sytem"}
+    fix = next(f for f in view.findings[0].fixes if f.suggestion == "operating system")
+    assert fix.text == "nme of operating system"
+
+
+def test_findings_without_leads_have_no_fixes():
+    assert summarize("(name of operating system) + 1").findings[0].fixes == ()
+
+
+def test_autofix_keeps_the_surrounding_whitespace():
+    view = summarize("  " + SETTING + "\n")
+
+    assert view.autofix == AutofixView(
+        text='  exists values of settings "x" of client\n', applied=1
+    )
+
+
+def test_nothing_to_autofix():
+    assert summarize("name of operating system").autofix is None
+    assert summarize("nme of operating system").autofix is None
+    assert summarize("name of (operating system").autofix is None
 
 
 def test_levels_in_analyzer_order_with_whole_expression_first():
@@ -256,33 +347,55 @@ def test_clean_text_has_no_decorations():
     assert editor_decorations(summarize("name of operating system")) == []
 
 
+def mark(start, end, css_class, title):
+    return {
+        "kind": "mark",
+        "from": start,
+        "to": end,
+        "class": css_class,
+        "attributes": {"title": title},
+    }
+
+
 def test_parse_error_marks_the_offending_character():
     view = summarize("name of ) x")
+    assert view.parse_error is not None
 
-    assert editor_decorations(view) == [
-        {"kind": "mark", "from": 8, "to": 9, "class": "bfrd-parse-error"}
-    ]
+    assert editor_decorations(view) == [mark(8, 9, "bfrd-parse-error", view.parse_error.message)]
 
 
 def test_parse_error_at_end_of_text_marks_the_last_character():
     # A mark cannot be empty, and offset == len(text) has nothing after it.
     view = summarize("name of (operating system")
+    assert view.parse_error is not None
 
-    assert editor_decorations(view) == [
-        {"kind": "mark", "from": 24, "to": 25, "class": "bfrd-parse-error"}
-    ]
+    assert editor_decorations(view) == [mark(24, 25, "bfrd-parse-error", view.parse_error.message)]
 
 
 def test_empty_text_has_nothing_to_mark():
     assert editor_decorations(summarize("")) == []
 
 
-def test_lint_findings_are_marked_by_severity():
+def test_lint_findings_are_marked_by_severity_with_the_span_message():
     view = summarize("name of operating sytem")
+    [span] = view.findings[0].spans
+    assert span.message
 
-    assert editor_decorations(view) == [
-        {"kind": "mark", "from": 8, "to": 23, "class": "bfrd-warning"}
-    ]
+    assert editor_decorations(view) == [mark(8, 23, "bfrd-warning", span.message)]
+
+
+def test_a_span_without_its_own_message_shows_the_findings():
+    view = summarize("(name of operating system) + 1")
+    [finding] = view.findings
+    assert finding.spans[0].message is None
+
+    assert editor_decorations(view) == [mark(0, 30, "bfrd-error", finding.message)]
+
+
+def test_marks_follow_leading_whitespace():
+    [decoration] = editor_decorations(summarize("\n  name of operating sytem"))
+
+    assert (decoration["from"], decoration["to"]) == (11, 26)
 
 
 def test_highlighted_level_span_is_marked():

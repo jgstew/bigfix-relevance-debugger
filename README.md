@@ -6,8 +6,9 @@
 A small browser GUI for BigFix **client and session relevance**:
 
 1. **Live static analysis** while you type: parse errors with line and
-   column, dialect, type check, lint findings with "did you mean"
-   suggestions, complexity score, evaluation cost and costly inspectors. Uses
+   column, dialect, type check, lint findings (hover an underline for its
+   message), one-click "did you mean" fixes and **Fix all safe issues**,
+   complexity score, evaluation cost and costly inspectors. Uses
    [`bigfix-relevance-analyzer`](https://github.com/jgstew/bigfix-relevance-analyzer).
 2. **Evaluation with real `qna`** on local, container (Docker/Podman) and
    SSH targets, with results streaming in as each target finishes. Uses
@@ -209,7 +210,10 @@ a specific target, select only that one.
    chevron to see every answer, the answer types and the raw qna output. The
    first run shows download and image-prep progress in the activity log.
 4. Type a typo, e.g. `name of operating sytem`. The text gets a wavy
-   underline and a lint finding appears with suggestions.
+   underline (hover it for the message) and a lint finding appears with
+   suggestions. Click **operating system** to fix it. For a statement the
+   analyzer can fix safely, e.g. `exists values of setting "x" of client`,
+   **Fix all safe issues** applies every fix; Ctrl-Z undoes it.
 5. Type `names of files whose (size of it > 1000) of folder "/etc"` (or pick
    it from **Examples**) and click **Breakdown**. With several targets
    selected, it picks the best fit itself and says why. Per-level counts appear
