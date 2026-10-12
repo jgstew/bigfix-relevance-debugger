@@ -38,6 +38,8 @@ from bigfix_relevance_debugger.analysis import (
     SESSION,
     AnalysisView,
     editor_decorations,
+    missing_fix_reason,
+    suggestion_fix,
     summarize,
 )
 from bigfix_relevance_debugger.evaluation import (
@@ -229,6 +231,26 @@ _ANSWERS_BODY_SLOT = r"""
   </q-td>
 </q-tr>
 """
+
+# Findings: each "did you mean" lead is a button that applies it. Names and
+# leads come from the user's text and the analyzer: interpolate, never v-html.
+# The slot emits FIX_EVENT with these keys; apply_suggestion reads the same.
+FIX_EVENT = "fix"
+FIX_NAME = "name"
+FIX_SUGGESTION = "suggestion"
+_FINDINGS_SUGGESTIONS_SLOT = (
+    r"""
+<q-td :props="props">
+  <q-btn v-for="fix in props.row.fixes" :key="fix.label"
+         dense flat no-caps size="sm" color="primary" class="bfrd-mono" :label="fix.label"
+         @click="() => $parent.$emit('@EVENT@', {@NAME@: fix.name, @SUGGESTION@: fix.suggestion})">
+    <q-tooltip>Replace {{ fix.name }} with {{ fix.suggestion }}</q-tooltip>
+  </q-btn>
+</q-td>
+""".replace("@EVENT@", FIX_EVENT)
+    .replace("@NAME@", FIX_NAME)
+    .replace("@SUGGESTION@", FIX_SUGGESTION)
+)
 
 # Three columns fit the side panel; kind and platform share one.
 _INVENTORY_COLUMNS = [
@@ -527,37 +549,64 @@ async def root() -> None:
 
         findings_box.clear()
         shown = [f for f in view.findings if f.code != "parse-error"]
+        if view.autofix is not None:
+            with findings_box:
+                edits = view.autofix.applied
+                with (
+                    ui.button("Fix all safe issues", icon="auto_fix_high", on_click=fix_all)
+                    .props("dense outline no-caps")
+                    .mark("fix-all")
+                ):
+                    ui.tooltip(f"Apply the analyzer's {edits} safe edit{'s' if edits != 1 else ''}")
         if shown:
             with findings_box:
-                ui.table(
-                    columns=[
-                        {"name": "severity", "label": "Severity", "field": "severity"},
-                        {"name": "code", "label": "Code", "field": "code"},
-                        {"name": "line", "label": "Line", "field": "line"},
-                        {
-                            "name": "message",
-                            "label": "Message",
-                            "field": "message",
-                            "align": "left",
-                        },
-                        {
-                            "name": "suggestions",
-                            "label": "Suggestions",
-                            "field": "suggestions",
-                            "align": "left",
-                        },
-                    ],
-                    rows=[
-                        {
-                            "severity": f.severity,
-                            "code": f.code,
-                            "line": f.line,
-                            "message": f.message,
-                            "suggestions": ", ".join(f.suggestions),
-                        }
-                        for f in shown
-                    ],
-                ).props("dense flat").classes("w-full").mark("findings")
+                table = (
+                    ui.table(
+                        columns=[
+                            {"name": "severity", "label": "Severity", "field": "severity"},
+                            {"name": "code", "label": "Code", "field": "code"},
+                            {"name": "line", "label": "Line", "field": "line"},
+                            {
+                                "name": "message",
+                                "label": "Message",
+                                "field": "message",
+                                "align": "left",
+                                # Wrap: a long message must not push the
+                                # suggestion buttons out of view.
+                                "style": "white-space: normal; min-width: 16rem",
+                            },
+                            {
+                                "name": "suggestions",
+                                "label": "Suggestions",
+                                "field": "fixes",
+                                "align": "left",
+                                "style": "white-space: normal",
+                            },
+                        ],
+                        rows=[
+                            {
+                                "severity": f.severity,
+                                "code": f.code,
+                                "line": f.line,
+                                "message": f.message,
+                                "fixes": [
+                                    {
+                                        "name": fix.name,
+                                        "suggestion": fix.suggestion,
+                                        "label": fix.label,
+                                    }
+                                    for fix in f.fixes
+                                ],
+                            }
+                            for f in shown
+                        ],
+                    )
+                    .props("dense flat")
+                    .classes("w-full")
+                    .mark("findings")
+                )
+                table.add_slot("body-cell-suggestions", _FINDINGS_SUGGESTIONS_SLOT)
+                table.on(FIX_EVENT, apply_suggestion)
         update_stale()
         update_buttons()
         refresh_targets()
@@ -565,6 +614,24 @@ async def root() -> None:
     def reanalyze() -> None:
         state.view = summarize(code.value or "", state.dialect_mode)
         apply_analysis()
+
+    def fix_all() -> None:
+        # The button belongs to the last analysis; fix what the editor shows now.
+        view = current_view()
+        if view.autofix is None:
+            ui.notify("Nothing to fix in the current text.", type="info")
+            return
+        code.set_value(view.autofix.text)
+
+    def apply_suggestion(e: GenericEventArguments) -> None:
+        name, suggestion = e.args[FIX_NAME], e.args[FIX_SUGGESTION]
+        # The table belongs to the last analysis; fix what the editor shows now.
+        view = current_view()
+        text = suggestion_fix(view, name, suggestion)
+        if text is None:
+            ui.notify(missing_fix_reason(view, name, suggestion), type="warning")
+            return
+        code.set_value(text)
 
     debouncer = Debouncer(DEBOUNCE_S, reanalyze)
     code.on_value_change(lambda _: debouncer.trigger())
