@@ -7,6 +7,7 @@ module can be tested without a browser. No NiceGUI imports here.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from bigfix_relevance_analyzer import (
@@ -355,9 +356,16 @@ def suggestion_fix(view: AnalysisView, name: str, suggestion: str) -> str | None
 
 
 def missing_fix_reason(view: AnalysisView, name: str, suggestion: str) -> str:
-    """Why :func:`suggestion_fix` found nothing, for the user."""
-    if any(f.name == name for f in _fixes(view)):
-        return f"{suggestion} is no longer suggested for {name}."
+    """Why :func:`suggestion_fix` found nothing, for the user.
+
+    Asks the text, not the fixes, whether ``name`` is still there: it can be
+    and have no fixes, when it is valid in the dialect now analysed. A
+    whole-word match on lower-cased, single-spaced text: approximate (it
+    also finds the name inside a string), but it only picks the message.
+    """
+    words = " ".join(view.text.lower().split())
+    if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", words):
+        return f"{suggestion} no longer applies to {name}."
     return f"{name} is no longer in the text."
 
 

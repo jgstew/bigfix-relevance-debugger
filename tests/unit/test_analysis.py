@@ -305,7 +305,28 @@ def test_no_fix_when_the_name_is_still_there_but_not_that_lead():
     view = summarize('names of filez of folder "/etc"', "session")
 
     assert suggestion_fix(view, "filez", "file") is None
-    assert missing_fix_reason(view, "filez", "file") == ("file is no longer suggested for filez.")
+    assert missing_fix_reason(view, "filez", "file") == "file no longer applies to filez."
+
+
+def test_no_fix_when_the_name_is_now_valid():
+    # Unknown as session relevance, a real inspector as client relevance:
+    # the name has no fixes at all now, but it is still in the text.
+    text = "name of Operating\n  System"
+    assert summarize(text, "session").findings[0].fixes[0].name == "operating system"
+    view = summarize(text, "client")
+
+    assert suggestion_fix(view, "operating system", "operating systems") is None
+    assert missing_fix_reason(view, "operating system", "operating systems") == (
+        "operating systems no longer applies to operating system."
+    )
+
+
+def test_a_name_inside_a_longer_word_is_gone():
+    view = summarize("name of operating systems")
+
+    assert missing_fix_reason(view, "operating system", "x") == (
+        "operating system is no longer in the text."
+    )
 
 
 def test_autofix_keeps_the_surrounding_whitespace():

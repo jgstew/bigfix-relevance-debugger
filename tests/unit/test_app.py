@@ -417,7 +417,7 @@ async def test_picking_a_lead_the_dialect_no_longer_offers_says_so(user):
     picker.set_value("session")  # session suggests other names for `filez`
     pick_lead(user, "filez", "file")
 
-    await notified(user, "file is no longer suggested for filez")
+    await notified(user, "file no longer applies to filez")
     assert editor(user).value == 'names of filez of folder "/etc"'
 
 
