@@ -55,3 +55,19 @@ def test_rule_catches_a_violation(tmp_path):
     )
 
     assert top_level_imports(bad) == {"nicegui", "bigfix_relevance_debugger", "<relative>"}
+
+
+def test_nothing_the_analyzer_ships_is_kept_here():
+    """Once the library has it, ours goes: callers use the library's."""
+    import bigfix_relevance_analyzer
+    from bigfix_relevance_analyzer import lsp
+
+    shipped = set(bigfix_relevance_analyzer.__all__) | set(lsp.__all__)
+    tree = ast.parse((UPSTREAM / "relevance_analyzer.py").read_text(encoding="utf-8"))
+    ours = {
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef | ast.ClassDef) and not node.name.startswith("_")
+    }
+
+    assert ours & shipped == set()

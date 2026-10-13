@@ -1,4 +1,0 @@
-{
-  "//": "Lets Node load relevance_editor.js as an ES module on every version (the tests do).",
-  "type": "module"
-}

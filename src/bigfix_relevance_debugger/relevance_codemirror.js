@@ -1,8 +1,10 @@
-// NiceGUI's CodeMirror element plus the relevance language-server client.
+// NiceGUI's CodeMirror element plus relevance highlighting and the
+// language-server client.
 //
 // Extends NiceGUI's own component (registered as the "nicegui-codemirror-base"
 // ESM by editor.py), so every ui.codemirror feature keeps working, and passes
-// its CodeMirror namespace to the shared client: one copy of CodeMirror.
+// its CodeMirror namespace to the analyzer's shared modules (its wheel's web/,
+// the "bigfix-relevance-editor" ESM): one copy of CodeMirror.
 //
 // The transport is NiceGUI's event channel: a request is emitted as "lsp"
 // {id, method, params}; Python answers with lspReply(id, result, error) and
@@ -11,6 +13,7 @@
 import * as CM from "nicegui-codemirror";
 import Base from "nicegui-codemirror-base/codemirror.js";
 import { relevanceEditor } from "bigfix-relevance-editor/relevance_editor.js";
+import { relevanceLanguage } from "bigfix-relevance-editor/relevance_language.js";
 
 export default {
   extends: Base,
@@ -39,6 +42,9 @@ export default {
             return { top, left: 0, bottom: window.innerHeight, right: window.innerWidth };
           },
         }),
+        // The VS Code grammar's rules. The element has no language prop, so
+        // this is the editor's only language.
+        relevanceLanguage(CM),
         relevanceEditor(CM, transport),
       ];
       // Anything that arrived before this client existed, then ask for a refresh.

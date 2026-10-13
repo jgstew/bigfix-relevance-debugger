@@ -1,10 +1,10 @@
 """The relevance editor: NiceGUI's CodeMirror wired to the analyzer's language server.
 
 The browser half is ``relevance_codemirror.js``, which extends NiceGUI's own
-CodeMirror component, and the shared client ``upstream/web/relevance_editor.js``
-(a candidate for bigfix-relevance-analyzer). Python owns the document: the
-element's ``value`` is the text, and an in-process
-:class:`~bigfix_relevance_debugger.upstream.relevance_analyzer.StatementSession`
+CodeMirror component, plus the analyzer wheel's ``web/relevance_editor.js``
+(the shared language-server client) and ``web/relevance_language.js`` (its
+highlighting). Python owns the document: the element's ``value`` is the text,
+and an in-process :class:`bigfix_relevance_analyzer.lsp.StatementSession`
 answers the browser's requests against it.
 
 Messages, over NiceGUI's event channel:
@@ -24,16 +24,17 @@ included.
 from __future__ import annotations
 
 import asyncio
+import importlib.resources
 import logging
 from pathlib import Path
 from typing import Any
 
+import bigfix_relevance_analyzer
 import nicegui
 from bigfix_relevance_analyzer import Dialect
+from bigfix_relevance_analyzer.lsp import LspError, StatementSession
 from nicegui import background_tasks, ui
 from nicegui.events import GenericEventArguments
-
-from bigfix_relevance_debugger.upstream.relevance_analyzer import LspError, StatementSession
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,8 @@ METHOD_NOT_FOUND = -32601
 REQUEST_CANCELLED = -32800
 
 _NICEGUI_CODEMIRROR = Path(nicegui.__file__).parent / "elements" / "codemirror"
-_UPSTREAM_WEB = Path(__file__).parent / "upstream" / "web"
+_ANALYZER_WEB = Path(str(importlib.resources.files(bigfix_relevance_analyzer) / "web"))
+"""The analyzer's browser modules. A real directory: installs are unpacked."""
 
 
 class RelevanceEditor(
@@ -56,7 +58,7 @@ class RelevanceEditor(
     esm={
         # NiceGUI's component, so ours can `extends` it.
         "nicegui-codemirror-base": str(_NICEGUI_CODEMIRROR),
-        "bigfix-relevance-editor": str(_UPSTREAM_WEB),
+        "bigfix-relevance-editor": str(_ANALYZER_WEB),
     },
 ):
     """``ui.codemirror`` plus the analyzer's diagnostics, served in-process."""

@@ -22,8 +22,6 @@ from bigfix_relevance_debugger.upstream.relevance_analyzer import (
     DialectFit,
     client_platforms,
     dialect_fit,
-    name_key,
-    span_leads,
 )
 
 CLIENT = "client"
@@ -215,13 +213,25 @@ def _run_dialects(text: str, mode: str) -> tuple[tuple[str, ...], str]:
     return run, _fit_reason(fit)
 
 
-def _finding_view(text: str, offset: int, finding: Finding, dialect: Dialect) -> FindingView:
+def name_key(written: str) -> str:
+    """An inspector name as written, folded for comparison: lower case, single spaces.
+
+    ``Operating\n  Sytem`` and ``operating sytem`` are the same name to
+    :func:`~bigfix_relevance_analyzer.suggest`; this is the key for "the same
+    name" everywhere else.
+    """
+    return " ".join(written.lower().split())
+
+
+def _finding_view(text: str, offset: int, finding: Finding) -> FindingView:
     """``finding`` from ``lint_text``, whose spans index ``text.strip()``,
-    re-based by ``offset`` (the leading whitespace) onto ``text``."""
-    leads = span_leads(text.strip(), finding, dialect=dialect)
+    re-based by ``offset`` (the leading whitespace) onto ``text``.
+
+    Each span carries its own name's leads (``TextSpan.suggestions``);
+    ``Finding.suggestions`` merges every name's, sorted.
+    """
     spans = tuple(
-        SpanView(s.start + offset, s.end + offset, s.message, lead)
-        for s, lead in zip(finding.spans, leads, strict=True)
+        SpanView(s.start + offset, s.end + offset, s.message, s.suggestions) for s in finding.spans
     )
     uses: dict[str, list[tuple[int, int]]] = {}
     name_leads: dict[str, tuple[str, ...]] = {}
@@ -330,7 +340,7 @@ def summarize(text: str, mode: str = AUTO) -> AnalysisView:
         complexity_score=complexity.score,
         evaluation_cost=complexity.evaluation_cost,
         costly_inspectors=tuple(complexity.costly_inspectors),
-        findings=tuple(_finding_view(text, offset, f, dialect) for f in findings),
+        findings=tuple(_finding_view(text, offset, f) for f in findings),
         autofix=_autofix_view(text, offset, findings),
         levels=levels,
         can_breakdown=reason is None,

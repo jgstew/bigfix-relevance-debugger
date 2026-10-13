@@ -9,7 +9,9 @@ from __future__ import annotations
 import dataclasses
 
 import pytest
+from bigfix_relevance_analyzer import Dialect, LintConfig, lint_text
 
+from bigfix_relevance_debugger import analysis
 from bigfix_relevance_debugger.analysis import (
     AnalysisView,
     AutofixView,
@@ -17,6 +19,7 @@ from bigfix_relevance_debugger.analysis import (
     SuggestionFix,
     editor_decorations,
     missing_fix_reason,
+    name_key,
     suggestion_fix,
     summarize,
 )
@@ -262,6 +265,53 @@ def test_unknown_name_spans_carry_their_own_message_and_leads():
     assert "operating system" not in first.suggestions
 
 
+def test_span_leads_are_the_analyzers_own(monkeypatch):
+    # Each span's leads come from lint (TextSpan.suggestions), not a second search.
+    real_lint_text = analysis.lint_text
+
+    def lint_text_with_marked_leads(text, config):
+        return [
+            dataclasses.replace(
+                f,
+                spans=tuple(
+                    dataclasses.replace(s, suggestions=(f"lead {i}",)) if s.suggestions else s
+                    for i, s in enumerate(f.spans)
+                ),
+            )
+            for f in real_lint_text(text, config)
+        ]
+
+    monkeypatch.setattr(analysis, "lint_text", lint_text_with_marked_leads)
+    view = summarize("nme of operating sytem")
+
+    first, second = view.findings[0].spans
+    assert (first.suggestions, second.suggestions) == (("lead 0",), ("lead 1",))
+    assert [f.suggestion for f in view.findings[0].fixes] == ["lead 0", "lead 1"]
+
+
+def test_span_leads_match_lint_for_every_use_of_a_name():
+    [finding] = lint_text(
+        "nme of NME of operating sytem", LintConfig(dialect=Dialect.CLIENT, suggest=True)
+    )
+    view = summarize("nme of NME of operating sytem", "client")
+
+    assert [s.suggestions for s in view.findings[0].spans] == [s.suggestions for s in finding.spans]
+    assert view.findings[0].spans[0].suggestions == view.findings[0].spans[1].suggestions
+
+
+@pytest.mark.parametrize(
+    ("written", "key"),
+    [
+        ("nme", "nme"),
+        ("Operating  Sytem", "operating sytem"),
+        ("operating\n\tSYSTEM", "operating system"),
+    ],
+)
+def test_name_key_folds_case_and_spacing(written, key):
+    assert name_key(written) == key
+    assert name_key.__module__ == analysis.__name__  # app glue: the analyzer won't ship it
+
+
 def test_other_spans_have_no_leads():
     [span] = summarize("(name of operating system) + 1").findings[0].spans
 
@@ -336,11 +386,10 @@ def test_no_fix_when_the_name_is_still_there_but_not_that_lead():
 
 
 def test_no_fix_when_the_name_is_now_valid():
-    # Unknown as session relevance, a real inspector as client relevance:
-    # the name has no fixes at all now, but it is still in the text.
-    text = "name of Operating\n  System"
-    assert summarize(text, "session").findings[0].fixes[0].name == "operating system"
-    view = summarize(text, "client")
+    # A stale click after the typo was fixed by hand: the name has no fixes
+    # at all now, but it is still in the text (as written, any case or spacing).
+    view = summarize("name of Operating\n  System", "client")
+    assert view.findings == ()
 
     assert suggestion_fix(view, "operating system", "operating systems") is None
     assert missing_fix_reason(view, "operating system", "operating systems") == (

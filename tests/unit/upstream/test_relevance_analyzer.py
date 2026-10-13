@@ -7,15 +7,13 @@ module: only that library's public API and the stdlib are used.
 from __future__ import annotations
 
 import pytest
-from bigfix_relevance_analyzer import Dialect, LintConfig, analyze_relevance, lint_text, suggest
+from bigfix_relevance_analyzer import Dialect, analyze_relevance
 
 from bigfix_relevance_debugger.upstream.relevance_analyzer import (
     CountSummary,
     DialectFit,
     client_platforms,
     dialect_fit,
-    name_key,
-    span_leads,
     summarize_count_results,
 )
 
@@ -114,96 +112,3 @@ def test_dialect_fit_names_what_each_side_contributes_when_mixed():
 
 def test_dialect_fit_names_session_only_references():
     assert dialect_fit("names of bes computers").session_only == ("bes computers",)
-
-
-# --- span_leads -------------------------------------------------------------------
-
-
-def unknown_finding(statement, dialect=Dialect.CLIENT):
-    config = LintConfig(dialect=dialect, suggest=True)
-    [finding] = [f for f in lint_text(statement, config) if f.code == "unknown-inspector"]
-    return finding
-
-
-def test_span_leads_are_per_written_name_in_span_order():
-    statement = "nme of Operating  Sytem"
-
-    leads = span_leads(statement, unknown_finding(statement), dialect=Dialect.CLIENT)
-
-    assert leads == (
-        suggest("nme", dialect=Dialect.CLIENT),
-        suggest("operating sytem", dialect=Dialect.CLIENT),
-    )
-    assert leads[1][0] == "operating system"
-
-
-def test_span_leads_repeat_for_each_use_of_a_name():
-    statement = "nme of nme of operating system"
-
-    first, second = span_leads(statement, unknown_finding(statement), dialect=Dialect.CLIENT)
-
-    assert first == second == suggest("nme", dialect=Dialect.CLIENT)
-
-
-def test_span_leads_ask_once_per_name():
-    # suggest() costs ~20 ms a call; a name used 40 times must not cost 40.
-    statement = "nme of NME of operating system"
-
-    first, second = span_leads(statement, unknown_finding(statement), dialect=Dialect.CLIENT)
-
-    assert first is second
-
-
-@pytest.mark.parametrize(
-    ("statement", "dialect"),
-    [
-        ("nme of Operating  Sytem", Dialect.CLIENT),
-        ("nme of nme of operating system", Dialect.CLIENT),
-        ("names of bes computerz", Dialect.SESSION),
-        # Unforced: lint classifies the statement, and so must span_leads.
-        ('names of filez of folder "/etc"', None),  # classified client
-        ("names of bes computerz", None),  # classified session
-        ('names of bes computerz whose (nme of it = "x")', None),
-        # Unforced and unclassifiable: lint searches every dialect.
-        ("nme of operating system", None),
-    ],
-)
-def test_span_leads_together_are_the_findings_suggestions(statement, dialect):
-    """The finding's own list is every span's leads, de-duplicated in order."""
-    finding = unknown_finding(statement, dialect)
-
-    leads = span_leads(statement, finding, dialect=dialect)
-
-    assert tuple(dict.fromkeys(lead for each in leads for lead in each)) == finding.suggestions
-
-
-def test_span_leads_reuse_earlier_answers():
-    # Lint already asked suggest() about each name; the editor asks again on
-    # every keystroke. A repeat must not pay for another fuzzy search.
-    statement = "nme of operating sytem"
-    finding = unknown_finding(statement)
-
-    first = span_leads(statement, finding, dialect=Dialect.CLIENT)
-    again = span_leads(statement, finding, dialect=Dialect.CLIENT)
-
-    assert all(a is b for a, b in zip(first, again, strict=True))
-
-
-@pytest.mark.parametrize(
-    ("written", "key"),
-    [
-        ("nme", "nme"),
-        ("Operating  Sytem", "operating sytem"),
-        ("operating\n\tSYSTEM", "operating system"),
-    ],
-)
-def test_name_key_folds_case_and_spacing(written, key):
-    assert name_key(written) == key
-
-
-def test_span_leads_are_empty_for_other_findings():
-    statement = "(name of operating system) + 1"
-    [finding] = lint_text(statement, LintConfig(dialect=Dialect.CLIENT, suggest=True))
-
-    assert finding.code == "type-error"
-    assert span_leads(statement, finding, dialect=Dialect.CLIENT) == ((),)
