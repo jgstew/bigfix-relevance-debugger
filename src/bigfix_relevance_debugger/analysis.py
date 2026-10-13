@@ -128,6 +128,9 @@ class AnalysisView:
     """What Evaluate runs: ``"session"`` and/or ``"client"``, session first."""
     dialect_reason: str
     """User-facing: why ``run_dialects`` is what it is."""
+    lint_dialect: str
+    """What analysis and lint ran as: ``"session"`` when only session runs, else
+    ``"client"``. The editor's language server is forced to the same."""
     type_summary: str | None
     """E.g. ``"singular string"``; None when the text did not parse."""
     type_errors: tuple[str, ...]
@@ -320,6 +323,7 @@ def summarize(text: str, mode: str = AUTO) -> AnalysisView:
         dialect_mode=mode,
         run_dialects=run_dialects,
         dialect_reason=dialect_reason,
+        lint_dialect=dialect.value,
         type_summary=_type_summary(check),
         type_errors=type_errors,
         platforms=platforms,

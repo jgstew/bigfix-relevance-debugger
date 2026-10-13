@@ -142,6 +142,23 @@ def test_session_only_expression_is_analyzed_and_linted_as_session():
     assert view.findings == ()
 
 
+@pytest.mark.parametrize(
+    ("text", "mode", "lint_dialect"),
+    [
+        ("names of bes computers", "auto", "session"),
+        ("name of operating system", "auto", "client"),
+        # Runs both ways: linted as client, which Breakdown evaluates too.
+        ("now", "auto", "client"),
+        ("now", "session", "session"),
+        ("now", "both", "client"),
+    ],
+)
+def test_lint_dialect_is_what_the_findings_were_linted_in(text, mode, lint_dialect):
+    # The editor's language server is forced to this, so its squiggles and
+    # the findings table always agree.
+    assert summarize(text, mode).lint_dialect == lint_dialect
+
+
 def test_session_only_expression_cannot_break_down_yet():
     view = summarize("names of bes computers")
 

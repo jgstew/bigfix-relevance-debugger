@@ -5,13 +5,15 @@ See ``upstream/__init__.py`` for the rules.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
+from typing import Any
 
 from bigfix_relevance_analyzer import (
     Dialect,
     Finding,
+    LintConfig,
     Outcome,
     Plurality,
     RelevanceAnalysis,
@@ -19,6 +21,7 @@ from bigfix_relevance_analyzer import (
     interpret_count_results,
     suggest,
 )
+from bigfix_relevance_analyzer.lsp import DocumentLinter, Server
 
 
 def client_platforms(analysis: RelevanceAnalysis) -> tuple[str, ...]:
@@ -191,3 +194,129 @@ def span_leads(
         report = analyze_relevance(statement)
         dialect = None if report.dialect_assumed else report.dialect
     return tuple(_leads(name_key(statement[s.start : s.end]), dialect) for s in finding.spans)
+
+
+class LspError(Exception):
+    """A JSON-RPC error response from the language server."""
+
+    def __init__(self, code: int, message: str) -> None:
+        super().__init__(f"{message} (code {code})")
+        self.code = code
+        self.message = message
+
+
+class StatementSession:
+    """One relevance statement held in an in-process :class:`lsp.Server`.
+
+    For an editor that is not a language client (a web page, a notebook):
+    the caller owns the text and hands it to every call, and the session
+    keeps the server's copy current, opening the document on first use and
+    sending a full-text change whenever the text differs. So a request is
+    always answered against the text it was asked about.
+
+    The document is ``URI`` with language ``bigfix-relevance``: one plain
+    statement, as a ``.rel`` file. ``dialect`` forces it, as
+    ``LintConfig.dialect`` does; ``None`` lets the server decide.
+
+    Positions are LSP's: 0-based line and UTF-16 character, which is also
+    what CodeMirror 6 counts in. Not thread-safe: one caller at a time.
+
+    Upstream: ``lsp``, beside :class:`Server`, for the playground and any
+    other embedder.
+    """
+
+    URI = "untitled:statement"
+    LANGUAGE_ID = "bigfix-relevance"
+    CAPABILITIES: Mapping[str, Any] = {
+        "textDocument": {
+            "codeAction": {
+                "codeActionLiteralSupport": {
+                    "codeActionKind": {"valueSet": ["quickfix", "source.fixAll.bigfix-relevance"]}
+                }
+            },
+            # No snippet support: plain insert text is all a minimal client handles.
+            "completion": {"completionItem": {"snippetSupport": False}},
+        },
+        # Plain {uri: [TextEdit]} edits; this session never versions edits.
+        "workspace": {"workspaceEdit": {"documentChanges": False}},
+    }
+
+    def __init__(self, *, dialect: Dialect | None = None) -> None:
+        self.dialect = dialect
+        config = LintConfig(suggest=True, dialect=dialect)
+        self._server = Server(linter=DocumentLinter(config=config))
+        self._ids = 0
+        self._text: str | None = None
+        self.version = 0
+        """Bumped on every text the server is sent; 0 before the first."""
+        self._closed = False
+        self._call("initialize", {"processId": None, "capabilities": self.CAPABILITIES})
+        self._notify("initialized", {})
+
+    def sync(self, text: str) -> list[dict[str, Any]] | None:
+        """Make the server's copy ``text``. Its diagnostics if that changed it, else None."""
+        if self._closed:
+            raise RuntimeError("StatementSession is closed")
+        if text == self._text:
+            return None
+        self.version += 1
+        if self._text is None:
+            document = {
+                "uri": self.URI,
+                "languageId": self.LANGUAGE_ID,
+                "version": self.version,
+                "text": text,
+            }
+            replies = self._notify("textDocument/didOpen", {"textDocument": document})
+        else:
+            replies = self._notify(
+                "textDocument/didChange",
+                {
+                    "textDocument": {"uri": self.URI, "version": self.version},
+                    "contentChanges": [{"text": text}],
+                },
+            )
+        self._text = text
+        for reply in replies:
+            if reply.get("method") == "textDocument/publishDiagnostics":
+                return list(reply["params"]["diagnostics"])
+        return []
+
+    def request(self, method: str, params: Mapping[str, Any], text: str) -> Any:
+        """``method``'s result for the document holding ``text``.
+
+        ``params`` without ``textDocument``; the session adds it. Raises
+        :class:`LspError` for an error response.
+        """
+        self.sync(text)
+        return self._call(method, {**params, "textDocument": {"uri": self.URI}})
+
+    def close(self) -> None:
+        """Close the document and shut the server down. Safe to call twice."""
+        if self._closed:
+            return
+        if self._text is not None:
+            self._notify("textDocument/didClose", {"textDocument": {"uri": self.URI}})
+        self._call("shutdown", None)
+        self._notify("exit", None)
+        self._closed = True
+
+    def _call(self, method: str, params: Mapping[str, Any] | None) -> Any:
+        self._ids += 1
+        message: dict[str, Any] = {"jsonrpc": "2.0", "id": self._ids, "method": method}
+        if params is not None:
+            message["params"] = params
+        for reply in self._server.handle(message):
+            if reply.get("id") != self._ids:
+                continue
+            if "error" in reply:
+                error = reply["error"]
+                raise LspError(error["code"], error["message"])
+            return reply.get("result")
+        raise LspError(-32603, f"no response to {method}")
+
+    def _notify(self, method: str, params: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+        message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
+        if params is not None:
+            message["params"] = params
+        return self._server.handle(message)
