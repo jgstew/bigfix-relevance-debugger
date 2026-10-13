@@ -5,11 +5,14 @@
 
 A small browser GUI for BigFix **client and session relevance**:
 
-1. **Live static analysis** while you type: parse errors with line and
-   column, dialect, type check, lint findings from the analyzer's language
-   server (underlined with a gutter marker; hover for the message), one-click
-   "did you mean" fixes and **Fix all safe issues**,
-   complexity score, evaluation cost and costly inspectors. Uses
+1. **An editor backed by the analyzer's language server**, the same one the
+   VS Code extension uses: inspector completion while you type (or
+   Ctrl-Space), hover descriptions of inspectors, casts and operators, lint
+   findings underlined with a gutter marker, and quick fixes from the hover or
+   Mod-. (Cmd-. on macOS).
+   **Live static analysis** alongside: parse errors with line and column,
+   dialect, type check, one-click "did you mean" fixes and **Fix all safe
+   issues**, complexity score, evaluation cost and costly inspectors. Uses
    [`bigfix-relevance-analyzer`](https://github.com/jgstew/bigfix-relevance-analyzer).
 2. **Evaluation with real `qna`** on local, container (Docker/Podman) and
    SSH targets, with results streaming in as each target finishes. Uses
@@ -210,11 +213,14 @@ a specific target, select only that one.
    that image, the qna column says so ("fell back from ..."). Click a row's
    chevron to see every answer, the answer types and the raw qna output. The
    first run shows download and image-prep progress in the activity log.
-4. Type a typo, e.g. `name of operating sytem`. The text gets a wavy
+4. Type `name of op`: completion offers `operating system` first; Enter
+   takes it. Hover `operating system` for what it is and where it exists.
+   Type a typo, e.g. `name of operating sytem`. The text gets a wavy
    underline (hover it for the message) and a lint finding appears with
    suggestions. Click **operating system** to fix it. For a statement the
    analyzer can fix safely, e.g. `exists values of setting "x" of client`,
-   **Fix all safe issues** applies every fix; Ctrl-Z undoes it.
+   hover `setting` and click the fix, press Mod-. there, or click
+   **Fix all safe issues**; Ctrl-Z undoes any of them.
 5. Type `names of files whose (size of it > 1000) of folder "/etc"` (or pick
    it from **Examples**) and click **Breakdown**. With several targets
    selected, it picks the best fit itself and says why. Per-level counts appear

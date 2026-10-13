@@ -119,6 +119,17 @@ def test_fix_all_is_offered(session):
     assert [a["kind"] for a in actions] == ["source.fixAll.bigfix-relevance"]
 
 
+def test_only_quickfix_leaves_out_fix_all(session):
+    # A client listing the fixes for one problem asks for just those.
+    actions = session.request(
+        "textDocument/codeAction",
+        {"range": span((0, 20), (0, 20)), "context": {"diagnostics": [], "only": ["quickfix"]}},
+        SETTING,
+    )
+
+    assert [a["kind"] for a in actions] == ["quickfix"]
+
+
 def test_an_error_response_raises(session):
     with pytest.raises(LspError) as raised:
         session.request("textDocument/nonsense", {}, "now")

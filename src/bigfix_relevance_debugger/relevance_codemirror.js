@@ -27,7 +27,20 @@ export default {
           }),
         onNotification: (handler) => lsp.handlers.push(handler),
       };
-      const extensions = [...Base.methods.setupExtensions.call(this), relevanceEditor(CM, transport)];
+      const extensions = [
+        ...Base.methods.setupExtensions.call(this),
+        // The page's fixed header (NiceGUI's ui.header, a q-header) covers the
+        // top of the window; CodeMirror can't see it, so tell it where
+        // tooltips have room. Applies to every tooltip in this editor.
+        CM.tooltips({
+          tooltipSpace: () => {
+            const header = document.querySelector(".q-header");
+            const top = header ? Math.max(0, header.getBoundingClientRect().bottom) : 0;
+            return { top, left: 0, bottom: window.innerHeight, right: window.innerWidth };
+          },
+        }),
+        relevanceEditor(CM, transport),
+      ];
       // Anything that arrived before this client existed, then ask for a refresh.
       for (const [method, params] of this._lastNotify || []) {
         for (const handler of lsp.handlers) handler(method, params);

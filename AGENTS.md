@@ -103,9 +103,16 @@ uv run pyright src tests
   CodeMirror passed in (`relevanceEditor(CM, transport)`), so it only uses
   what `nicegui-codemirror` exports (no `@codemirror/lint` or
   `@codemirror/autocomplete`). `test_editor.py` pins the NiceGUI files this
-  relies on. JS can't run in the tests: test the Python half there (record
-  `run_method`, `trigger("lsp", ...)`) and check the browser in a real run.
-  The preview pane can report a 0x0 viewport; resize it before testing hover.
+  relies on. The shared client's pure helpers (positions, completion
+  mapping, workspace edits, the markdown parser) have Node tests in
+  `tests/unit/upstream/web/`, run by `test_relevance_editor_js.py` against
+  NiceGUI's own CodeMirror bundle (`CM_MODULE`); skipped without `node`.
+  Test-first there too. The rest of the browser half can't run in pytest:
+  test the Python half (record `run_method`, `trigger("lsp", ...)`) and
+  check the browser in a real run. The preview pane can report a 0x0
+  viewport; resize it before testing hover. In a real run, never click
+  Evaluate or Breakdown to test the editor: they run against the real
+  inventory.
 - **The inventory is shared** with the `bigfix-remote-client-relevance` CLI:
   by default it uses that library's `find_inventory_path()` search
   (`~/.bigfix/remote_clients.toml` etc.), and first-run auto-discovery when
