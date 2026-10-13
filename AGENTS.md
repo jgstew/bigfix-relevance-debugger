@@ -24,8 +24,7 @@ Entry point: `bigfix_relevance_debugger.app:main`, run via
   - `app.py`: the page and `main()`. UI wiring only.
   - `upstream/`: code meant to be donated to the libraries, one module per
     library (`remote_client_relevance.py`, `relevance_analyzer.py`,
-    `besapi.py`), plus `upstream/web/relevance_editor.js` for the analyzer.
-    See below.
+    `besapi.py`). See below.
 - `tests/unit/`: offline. No Docker, qna, SSH or network.
 
 **Keep NiceGUI out of `analysis.py`, `evaluation.py` and `log_bridge.py`** so
@@ -87,7 +86,7 @@ uv run pyright src tests
   one `add` per streamed result) and its pick (`ResultRow.has_key`).
 - **Editor intelligence comes only from the analyzer's language server.**
   `editor.RelevanceEditor` extends `ui.codemirror`. Python owns the document:
-  an in-process `upstream.relevance_analyzer.StatementSession` (wrapping
+  an in-process `bigfix_relevance_analyzer.lsp.StatementSession` (wrapping
   `lsp.Server`) is synced from the element's `value` and answers the
   browser's `lsp` events (`{id, method, params}`, only `ALLOWED_REQUESTS`,
   since the page is untrusted input) with `run_method("lspReply", ...)`;
@@ -98,16 +97,18 @@ uv run pyright src tests
 - **The browser half has no build step and one CodeMirror.**
   `relevance_codemirror.js` `extends` NiceGUI's own component (registered as
   the `nicegui-codemirror-base` ESM) and overrides `setupExtensions()`.
-  `upstream/web/relevance_editor.js` is the shared client meant for
-  bigfix-relevance-analyzer (analyzer#142): it imports nothing and gets
-  CodeMirror passed in (`relevanceEditor(CM, transport)`), so it only uses
-  what `nicegui-codemirror` exports (no `@codemirror/lint` or
-  `@codemirror/autocomplete`). `test_editor.py` pins the NiceGUI files this
-  relies on. The shared client's pure helpers (positions, completion
-  mapping, workspace edits, the markdown parser) have Node tests in
-  `tests/unit/upstream/web/`, run by `test_relevance_editor_js.py` against
-  NiceGUI's own CodeMirror bundle (`CM_MODULE`); skipped without `node`.
-  Test-first there too. The rest of the browser half can't run in pytest:
+  The client and the highlighter come from the analyzer wheel's `web/`
+  (`editor._ANALYZER_WEB`, served as the `bigfix-relevance-editor` ESM):
+  `relevance_editor.js` (`relevanceEditor(CM, transport)`) and
+  `relevance_language.js` (`relevanceLanguage(CM)`, generated from the VS
+  Code grammar). Both import nothing and get CodeMirror passed in, so they
+  only use what `nicegui-codemirror` exports, and the analyzer tests them
+  against NiceGUI's CodeMirror. Nothing editor-related lives in `upstream/`;
+  change them in the analyzer. `RelevanceEditor` refuses a `language`
+  (NiceGUI would add a second one), and a failure to build the highlighter
+  costs only the colors. `test_editor.py` pins the NiceGUI and analyzer
+  files this relies on, including that NiceGUI's bundle exports each
+  module's `REQUIRED_CM`. The browser half can't run in pytest:
   test the Python half (record `run_method`, `trigger("lsp", ...)`) and
   check the browser in a real run. The preview pane can report a 0x0
   viewport; resize it before testing hover. In a real run, never click

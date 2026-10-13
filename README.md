@@ -6,13 +6,18 @@
 A small browser GUI for BigFix **client and session relevance**:
 
 1. **An editor backed by the analyzer's language server**, the same one the
-   VS Code extension uses: inspector completion while you type (or
-   Ctrl-Space), hover descriptions of inspectors, casts and operators, lint
-   findings underlined with a gutter marker, and quick fixes from the hover or
-   Mod-. (Cmd-. on macOS).
+   VS Code extension uses: syntax highlighting with the VS Code grammar's
+   rules (keywords, operators, strings, numbers and comments), inspector
+   completion while you type (or Ctrl-Space), hover descriptions of
+   inspectors, casts and operators, lint findings underlined with a gutter
+   marker, and quick fixes from the hover or Mod-. (Cmd-. on macOS),
+   including "Replace `x` with `y`" for a misspelled inspector.
    **Live static analysis** alongside: parse errors with line and column,
    dialect, type check, one-click "did you mean" fixes and **Fix all safe
-   issues**, complexity score, evaluation cost and costly inspectors. Uses
+   issues**, complexity score, evaluation cost and costly inspectors. The
+   findings' "did you mean" buttons stay beside the editor's quick fixes:
+   they are visible without hovering and replace every use of the name at
+   once, where a quick fix replaces the one you hovered. Uses
    [`bigfix-relevance-analyzer`](https://github.com/jgstew/bigfix-relevance-analyzer).
 2. **Evaluation with real `qna`** on local, container (Docker/Podman) and
    SSH targets, with results streaming in as each target finishes. Uses
@@ -215,9 +220,12 @@ a specific target, select only that one.
    first run shows download and image-prep progress in the activity log.
 4. Type `name of op`: completion offers `operating system` first; Enter
    takes it. Hover `operating system` for what it is and where it exists.
+   Keywords, operators, strings and numbers are colored as you type.
    Type a typo, e.g. `name of operating sytem`. The text gets a wavy
-   underline (hover it for the message) and a lint finding appears with
-   suggestions. Click **operating system** to fix it. For a statement the
+   underline and a lint finding appears with suggestions. Hover the
+   underline for the message and a **Replace** button per suggestion (Mod-.
+   lists the same fixes), or click **operating system** in the findings to
+   fix it. For a statement the
    analyzer can fix safely, e.g. `exists values of setting "x" of client`,
    hover `setting` and click the fix, press Mod-. there, or click
    **Fix all safe issues**; Ctrl-Z undoes any of them.

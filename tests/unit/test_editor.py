@@ -1,22 +1,24 @@
 """Tests for editor.py: the CodeMirror element wired to the analyzer's language server.
 
-The browser half (relevance_codemirror.js and upstream/web/relevance_editor.js)
-can't run here, so these pin the Python half of the transport: what reaches
-the browser through run_method, and what the element does with an "lsp"
-event from it. Each test runs the real language server in-process.
+The browser half (relevance_codemirror.js and the analyzer's web/
+relevance_editor.js and relevance_language.js) can't run here, so these pin
+the Python half of the transport: what reaches the browser through
+run_method, and what the element does with an "lsp" event from it. Each test
+runs the real language server in-process.
 """
 
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 
 import pytest
+from bigfix_relevance_analyzer.lsp import StatementSession
 from nicegui import ui
 from nicegui.testing.user_simulation import user_simulation
 
 from bigfix_relevance_debugger.editor import ALLOWED_REQUESTS, RelevanceEditor
-from bigfix_relevance_debugger.upstream import relevance_analyzer
 
 
 def page() -> None:
@@ -105,13 +107,13 @@ async def test_a_cancelled_publish_is_resent(user, monkeypatch):
     # The worker thread finishes the sync even when publish() is cancelled;
     # the browser never got those diagnostics, so the next publish sends them.
     editor, calls = await opened(user)
-    real_sync = relevance_analyzer.StatementSession.sync
+    real_sync = StatementSession.sync
 
     def slow_sync(self, text):
         time.sleep(0.2)
         return real_sync(self, text)
 
-    monkeypatch.setattr(relevance_analyzer.StatementSession, "sync", slow_sync)
+    monkeypatch.setattr(StatementSession, "sync", slow_sync)
     editor.set_value("nme of operating system")
     task = asyncio.create_task(editor.publish())
     await asyncio.sleep(0.05)
@@ -263,24 +265,31 @@ async def test_a_request_after_close_is_answered(user):
 async def test_close_shuts_the_server_down_without_racing_a_request(user, monkeypatch):
     editor, _ = await opened(user)
     editor.set_value("name of operating system")
-    session = editor._session
-    assert session is not None
-    real_request = relevance_analyzer.StatementSession.request
-    closed_while_busy: list[bool] = []
+    real_request, real_close = StatementSession.request, StatementSession.close
+    events: list[str] = []
 
     def slow_request(self, method, params, text):
+        events.append("request")
         time.sleep(0.2)
-        closed_while_busy.append(self._closed)
-        return real_request(self, method, params, text)
+        try:
+            return real_request(self, method, params, text)
+        finally:
+            events.append("request done")
 
-    monkeypatch.setattr(relevance_analyzer.StatementSession, "request", slow_request)
+    def recorded_close(self):
+        events.append("close")
+        real_close(self)
+        events.append("closed")
+
+    monkeypatch.setattr(StatementSession, "request", slow_request)
+    monkeypatch.setattr(StatementSession, "close", recorded_close)
     request(user, 2, "textDocument/hover", {"position": {"line": 0, "character": 12}})
-    await asyncio.sleep(0.05)  # the request is in its worker thread
+    await until(lambda: "request" in events)  # the request is in its worker thread
 
     editor.close()
 
-    await until(lambda: session._closed)
-    assert closed_while_busy == [False]  # the shutdown waited for the request
+    await until(lambda: "closed" in events)
+    assert events == ["request", "request done", "close", "closed"]  # shutdown waited
 
 
 async def test_closed_editor_publishes_nothing(user):
@@ -293,28 +302,107 @@ async def test_closed_editor_publishes_nothing(user):
     assert notifications(calls) == []
 
 
+# --- one language ------------------------------------------------------------------
+
+
+def test_the_element_refuses_a_second_language():
+    # Highlighting is relevanceLanguage(CM); NiceGUI's language prop would add
+    # another language beside it.
+    with pytest.raises(TypeError, match="language"):
+        RelevanceEditor(language="SQL")
+
+
+async def test_the_language_cannot_be_set_later(user):
+    editor, _ = await opened(user)
+
+    with pytest.raises(TypeError, match="language"):
+        editor.set_language("SQL")
+    with pytest.raises(TypeError, match="language"):
+        editor.language = "SQL"
+    assert not editor.props.get("language")
+
+
 # --- what the browser half relies on ----------------------------------------------
+
+SHARED_MODULES = ("relevance_editor.js", "relevance_language.js")
+
+
+def bundle_exports() -> set[str]:
+    """What NiceGUI's CodeMirror bundle (the page's ``CM``) exports, by exported name."""
+    import bigfix_relevance_debugger.editor as editor_module
+
+    bundle = (editor_module._NICEGUI_CODEMIRROR / "dist" / "index.js").read_text(encoding="utf-8")
+    return {
+        item.split(" as ")[-1].strip()
+        for block in re.findall(r"export\s*\{([^}]*)\}", bundle)
+        for item in block.split(",")
+        if item.strip()
+    }
+
+
+def required_cm(name: str) -> list[str]:
+    """A shared module's ``REQUIRED_CM``: the CodeMirror names it uses."""
+    import bigfix_relevance_debugger.editor as editor_module
+
+    source = (editor_module._ANALYZER_WEB / name).read_text(encoding="utf-8")
+    match = re.search(r"export const REQUIRED_CM = \[(.*?)\];", source, re.DOTALL)
+    assert match, f"{name} has no REQUIRED_CM"
+    return re.findall(r'"(\w+)"', match.group(1))
 
 
 def test_the_files_the_browser_imports_exist():
     """A NiceGUI upgrade that moves its CodeMirror component, or drops the
-    hook we extend, should fail here, not silently in the browser."""
+    hook we extend, or an analyzer that stops shipping its web client, should
+    fail here, not silently in the browser."""
     import bigfix_relevance_debugger.editor as editor_module
 
     base = editor_module._NICEGUI_CODEMIRROR / "codemirror.js"
     assert "setupExtensions()" in base.read_text(encoding="utf-8")
-    assert (editor_module._UPSTREAM_WEB / "relevance_editor.js").is_file()
+    for name in SHARED_MODULES:
+        assert (editor_module._ANALYZER_WEB / name).is_file(), name
     component = editor_module.Path(editor_module.__file__).with_name("relevance_codemirror.js")
     source = component.read_text(encoding="utf-8")
     assert 'from "nicegui-codemirror-base/codemirror.js"' in source
     assert 'from "bigfix-relevance-editor/relevance_editor.js"' in source
+    assert 'from "bigfix-relevance-editor/relevance_language.js"' in source
+    assert "relevanceLanguage(CM)" in source
 
 
-def test_the_shared_client_imports_nothing():
-    """It must run on whatever CodeMirror the page passes in (analyzer#142)."""
+@pytest.mark.parametrize("name", SHARED_MODULES)
+def test_nicegui_exports_what_the_shared_modules_need(name):
+    """The analyzer tests these against its own NiceGUI pin; this checks ours.
+    A missing name throws in setupExtensions() and leaves a plain-text editor."""
+    required = required_cm(name)
+
+    assert required
+    assert sorted(set(required) - bundle_exports()) == []
+
+
+def test_bundle_exports_reads_export_names_not_internal_ones():
+    exports = bundle_exports()
+
+    assert {"EditorView", "StreamLanguage", "tooltips"} <= exports
+    assert "nonexistentCodeMirrorName" not in exports
+    assert not any(" " in name for name in exports)
+
+
+def test_the_shared_modules_come_from_the_analyzer():
+    # Nothing editor-related is kept here any more: one copy, the analyzer's.
+    import bigfix_relevance_analyzer
+
     import bigfix_relevance_debugger.editor as editor_module
 
-    source = (editor_module._UPSTREAM_WEB / "relevance_editor.js").read_text(encoding="utf-8")
+    analyzer = editor_module.Path(bigfix_relevance_analyzer.__file__).parent
+    assert editor_module._ANALYZER_WEB == analyzer / "web"
+    assert not (editor_module.Path(editor_module.__file__).parent / "upstream" / "web").exists()
+
+
+@pytest.mark.parametrize("name", SHARED_MODULES)
+def test_the_shared_modules_import_nothing(name):
+    """They must run on whatever CodeMirror the page passes in (analyzer#142)."""
+    import bigfix_relevance_debugger.editor as editor_module
+
+    source = (editor_module._ANALYZER_WEB / name).read_text(encoding="utf-8")
     assert not [line for line in source.splitlines() if line.startswith("import ")]
 
 
@@ -325,16 +413,4 @@ def test_the_host_keeps_tooltips_below_the_page_header():
 
     component = editor_module.Path(editor_module.__file__).with_name("relevance_codemirror.js")
     assert "CM.tooltips({" in component.read_text(encoding="utf-8")
-    bundle = editor_module._NICEGUI_CODEMIRROR / "dist" / "index.js"
-    assert " as tooltips" in bundle.read_text(encoding="utf-8")
-
-
-def test_node_loads_the_shared_client_as_a_module_on_any_version():
-    # Without "type": "module", Node before 22.7 / 20.19 reads a .js file as
-    # CommonJS and fails on `export`.
-    import json
-
-    import bigfix_relevance_debugger.editor as editor_module
-
-    package = json.loads((editor_module._UPSTREAM_WEB / "package.json").read_text(encoding="utf-8"))
-    assert package["type"] == "module"
+    assert "tooltips" in bundle_exports()

@@ -1,10 +1,10 @@
 """The relevance editor: NiceGUI's CodeMirror wired to the analyzer's language server.
 
 The browser half is ``relevance_codemirror.js``, which extends NiceGUI's own
-CodeMirror component, and the shared client ``upstream/web/relevance_editor.js``
-(a candidate for bigfix-relevance-analyzer). Python owns the document: the
-element's ``value`` is the text, and an in-process
-:class:`~bigfix_relevance_debugger.upstream.relevance_analyzer.StatementSession`
+CodeMirror component, plus the analyzer wheel's ``web/relevance_editor.js``
+(the shared language-server client) and ``web/relevance_language.js`` (its
+highlighting). Python owns the document: the element's ``value`` is the text,
+and an in-process :class:`bigfix_relevance_analyzer.lsp.StatementSession`
 answers the browser's requests against it.
 
 Messages, over NiceGUI's event channel:
@@ -26,14 +26,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
+import bigfix_relevance_analyzer
 import nicegui
 from bigfix_relevance_analyzer import Dialect
+from bigfix_relevance_analyzer.lsp import LspError, StatementSession
 from nicegui import background_tasks, ui
 from nicegui.events import GenericEventArguments
-
-from bigfix_relevance_debugger.upstream.relevance_analyzer import LspError, StatementSession
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +47,8 @@ METHOD_NOT_FOUND = -32601
 REQUEST_CANCELLED = -32800
 
 _NICEGUI_CODEMIRROR = Path(nicegui.__file__).parent / "elements" / "codemirror"
-_UPSTREAM_WEB = Path(__file__).parent / "upstream" / "web"
+_ANALYZER_WEB = Path(bigfix_relevance_analyzer.__file__).parent / "web"
+"""The analyzer's browser modules. A real directory: installs are unpacked."""
 
 
 class RelevanceEditor(
@@ -56,12 +57,16 @@ class RelevanceEditor(
     esm={
         # NiceGUI's component, so ours can `extends` it.
         "nicegui-codemirror-base": str(_NICEGUI_CODEMIRROR),
-        "bigfix-relevance-editor": str(_UPSTREAM_WEB),
+        "bigfix-relevance-editor": str(_ANALYZER_WEB),
     },
 ):
     """``ui.codemirror`` plus the analyzer's diagnostics, served in-process."""
 
+    _ONE_LANGUAGE = "RelevanceEditor highlights relevance itself; a language would add a second one"
+
     def __init__(self, value: str = "", *, dialect: str = "client", **kwargs: Any) -> None:
+        if "language" in kwargs:
+            raise TypeError(self._ONE_LANGUAGE)
         super().__init__(value, **kwargs)
         self._dialect = dialect
         self._session: StatementSession | None = StatementSession(dialect=Dialect(dialect))
@@ -71,6 +76,18 @@ class RelevanceEditor(
         """One server call at a time, shutdown included: the session isn't thread-safe."""
         self.on("lsp", self._on_lsp)
         self.on("lspReady", self._on_ready)
+
+    @property
+    def language(self) -> str:
+        """Always unset: the component's relevanceLanguage(CM) is the only language."""
+        return super().language
+
+    @language.setter
+    def language(self, language: Any = None) -> None:
+        raise TypeError(self._ONE_LANGUAGE)
+
+    def set_language(self, language: Any = None) -> NoReturn:
+        raise TypeError(self._ONE_LANGUAGE)
 
     @property
     def dialect(self) -> str:

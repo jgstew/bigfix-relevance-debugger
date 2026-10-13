@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.11"
 
 [options]
@@ -259,16 +259,16 @@ wheels = [
 
 [[package]]
 name = "bigfix-relevance-analyzer"
-version = "1.29.1"
+version = "1.35.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/53/f1/d3f07497987c680bf429ade310cd28602f2c5e6f079af813d940d6fca96c/bigfix_relevance_analyzer-1.29.1.tar.gz", hash = "sha256:54a82e5cbb1006f08e6610a2aed6d5f0fdc1d192954cef896adf88565956770a", size = 1366113, upload-time = "2026-10-10T18:01:53.736Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7c/2e/a5b087e74b8b742db8f0411fdea366eb6cd6657a48b7ce6544f8430b4030/bigfix_relevance_analyzer-1.35.0.tar.gz", hash = "sha256:f199b68b5dd96b59b6dc2dea490f6244283e7756fa6df18ee5935fff66b19269", size = 1420201, upload-time = "2026-10-13T15:10:12.878Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/06/bb/6043d3151a3b14eb822c16a0c20aef4a011c686b2a781b54f84ceddee72a/bigfix_relevance_analyzer-1.29.1-py3-none-any.whl", hash = "sha256:5b5c698bc1e59a1237903f906dc922a7c3580cfb25b172cbebb69e324f774b0f", size = 417828, upload-time = "2026-10-10T18:01:52.264Z" },
+    { url = "https://files.pythonhosted.org/packages/db/b3/173d2147e3bee97e0e94beb3cf4b5b63826269d4bb4ea3f677ca267b782f/bigfix_relevance_analyzer-1.35.0-py3-none-any.whl", hash = "sha256:846e95aaf6cc4346b3c2f58d0e5f6103aae8c5f1bbd25d9d80106b25bc673835", size = 436590, upload-time = "2026-10-13T15:10:11.648Z" },
 ]
 
 [[package]]
 name = "bigfix-relevance-debugger"
-version = "0.3.0"
+version = "0.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "besapi" },
@@ -288,7 +288,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "besapi", specifier = ">=4.4.3,<5" },
-    { name = "bigfix-relevance-analyzer", specifier = ">=1.29.1,<2" },
+    { name = "bigfix-relevance-analyzer", specifier = ">=1.35.0,<2" },
     { name = "bigfix-remote-client-relevance", specifier = ">=1.5.2,<2" },
     { name = "nicegui", extras = ["native"], specifier = ">=3.18.0" },
 ]

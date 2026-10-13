@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -55,3 +56,70 @@ def test_rule_catches_a_violation(tmp_path):
     )
 
     assert top_level_imports(bad) == {"nicegui", "bigfix_relevance_debugger", "<relative>"}
+
+
+def public_names(tree: ast.Module) -> set[str]:
+    """The public names a module defines at top level: defs, classes, assignments."""
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            names.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+    return {name for name in names if not name.startswith("_")}
+
+
+def exported_names(tree: ast.Module) -> set[str]:
+    """A library module's public API: its ``__all__``, else every public name."""
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and len(node.targets) == 1:
+            target, value = node.targets[0], node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            target, value = node.target, node.value
+        else:
+            continue
+        if isinstance(target, ast.Name) and target.id == "__all__":
+            return set(ast.literal_eval(value))
+    return public_names(tree)
+
+
+def library_api(root: Path) -> set[str]:
+    """Every name some module under ``root`` exports, read from source.
+
+    Not imported: some modules only import on one OS (besapi's
+    ``plugin_utilities_win``). A name outside a module's ``__all__`` is that
+    library's private business, so ours may share it.
+    """
+    return set().union(
+        *(exported_names(ast.parse(p.read_text(encoding="utf-8"))) for p in root.rglob("*.py"))
+    )
+
+
+@pytest.mark.parametrize(("module", "library"), sorted(ALLOWED.items()))
+def test_nothing_the_library_ships_is_kept_here(module, library):
+    """Once the library has it, ours goes: callers use the library's."""
+    spec = importlib.util.find_spec(library)
+    assert spec is not None and spec.submodule_search_locations
+    [root] = spec.submodule_search_locations
+    ours = public_names(ast.parse((UPSTREAM / module).read_text(encoding="utf-8")))
+
+    assert sorted(ours & library_api(Path(root))) == []
+
+
+def test_library_api_catches_a_duplicate(tmp_path):
+    (tmp_path / "pkg").mkdir()
+    (tmp_path / "pkg" / "__init__.py").write_text(
+        "__all__ = ['shipped']\ndef shipped(): ...\ndef unlisted(): ...\n", encoding="utf-8"
+    )
+    (tmp_path / "pkg" / "plain.py").write_text(
+        "async def fetch(): ...\nLIMIT: int = 3\nNAMES = ()\nclass Thing: ...\n"
+        "def _private(): ...\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "pkg" / "typed.py").write_text(
+        "__all__: list[str] = []\ndef hidden(): ...\n", encoding="utf-8"
+    )
+
+    assert library_api(tmp_path / "pkg") == {"shipped", "fetch", "LIMIT", "NAMES", "Thing"}

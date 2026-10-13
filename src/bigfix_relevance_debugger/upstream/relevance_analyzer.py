@@ -5,23 +5,17 @@ See ``upstream/__init__.py`` for the rules.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
-from functools import lru_cache
-from typing import Any
 
 from bigfix_relevance_analyzer import (
     Dialect,
-    Finding,
-    LintConfig,
     Outcome,
     Plurality,
     RelevanceAnalysis,
     analyze_relevance,
     interpret_count_results,
-    suggest,
 )
-from bigfix_relevance_analyzer.lsp import DocumentLinter, Server
 
 
 def client_platforms(analysis: RelevanceAnalysis) -> tuple[str, ...]:
@@ -150,185 +144,3 @@ def dialect_fit(text: str) -> DialectFit:
     if classified is Dialect.UNCERTAIN:
         return fit(both, "mixed")
     return fit(frozenset({Dialect.CLIENT}), "default")
-
-
-def name_key(written: str) -> str:
-    """An inspector name as written, folded for comparison: lower case, single spaces.
-
-    ``Operating\n  Sytem`` and ``operating sytem`` are the same name to
-    :func:`suggest`; this is the key for "the same name" everywhere else.
-    """
-    return " ".join(written.lower().split())
-
-
-@lru_cache(maxsize=1024)
-def _leads(name: str, dialect: Dialect | None) -> tuple[str, ...]:
-    # suggest() is a fuzzy search over every inspector, milliseconds a call,
-    # and an editor asks again about the same names on every keystroke.
-    return suggest(name, dialect=dialect)
-
-
-def span_leads(
-    statement: str, finding: Finding, *, dialect: Dialect | None
-) -> tuple[tuple[str, ...], ...]:
-    """The "did you mean" leads for each of ``finding``'s spans, in span order.
-
-    An ``unknown-inspector`` finding covers every unknown name in the
-    statement, and its :attr:`Finding.suggestions` merges all their leads, so
-    an editor can't tell which lead belongs to which underline. Each span is
-    one use of one name; this asks :func:`suggest` about the name as written
-    there (by :func:`name_key`), remembering answers across calls, so every
-    use of a name shares one tuple. Any other finding gets ``()`` per span.
-
-    ``statement`` is the text the spans index into (for :func:`lint_text`,
-    ``text.strip()``), and ``dialect`` is ``LintConfig.dialect`` as linted.
-    ``None`` is resolved the way lint resolves it: the statement's own
-    dialect unless that was only assumed, else every dialect.
-
-    Upstream: a ``suggestions`` field on ``TextSpan``, filled where lint
-    already computes each name's leads (which also saves this second search).
-    """
-    if finding.code != "unknown-inspector":
-        return tuple(() for _ in finding.spans)
-    if dialect is None:
-        report = analyze_relevance(statement)
-        dialect = None if report.dialect_assumed else report.dialect
-    return tuple(_leads(name_key(statement[s.start : s.end]), dialect) for s in finding.spans)
-
-
-class LspError(Exception):
-    """A JSON-RPC error response from the language server."""
-
-    def __init__(self, code: int, message: str) -> None:
-        super().__init__(f"{message} (code {code})")
-        self.code = code
-        self.message = message
-
-
-class StatementSession:
-    """One relevance statement held in an in-process :class:`lsp.Server`.
-
-    For an editor that is not a language client (a web page, a notebook):
-    the caller owns the text and hands it to every call, and the session
-    keeps the server's copy current, opening the document on first use and
-    sending a full-text change whenever the text differs. So a request is
-    always answered against the text it was asked about.
-
-    The document is ``URI`` with language ``bigfix-relevance``: one plain
-    statement, as a ``.rel`` file. ``dialect`` forces it, as
-    ``LintConfig.dialect`` does; ``None`` lets the server decide.
-
-    Positions are LSP's: 0-based line and UTF-16 character, which is also
-    what CodeMirror 6 counts in. Not thread-safe: one caller at a time.
-
-    Upstream: ``lsp``, beside :class:`Server`, for the playground and any
-    other embedder.
-    """
-
-    URI = "untitled:statement"
-    LANGUAGE_ID = "bigfix-relevance"
-    CAPABILITIES: Mapping[str, Any] = {
-        "textDocument": {
-            "codeAction": {
-                "codeActionLiteralSupport": {
-                    "codeActionKind": {"valueSet": ["quickfix", "source.fixAll.bigfix-relevance"]}
-                }
-            },
-            # No snippet support: plain insert text is all a minimal client handles.
-            "completion": {"completionItem": {"snippetSupport": False}},
-        },
-        # Plain {uri: [TextEdit]} edits; this session never versions edits.
-        "workspace": {"workspaceEdit": {"documentChanges": False}},
-    }
-
-    def __init__(self, *, dialect: Dialect | None = None) -> None:
-        self.dialect = dialect
-        config = LintConfig(suggest=True, dialect=dialect)
-        self._server = Server(linter=DocumentLinter(config=config))
-        self._ids = 0
-        self._text: str | None = None
-        self.version = 0
-        """Bumped on every text the server is sent; 0 before the first."""
-        self.diagnostics: list[dict[str, Any]] = []
-        """The server's diagnostics for the text it holds, however it got there
-        (:meth:`sync` or the sync inside :meth:`request`)."""
-        self._closed = False
-        self._call("initialize", {"processId": None, "capabilities": self.CAPABILITIES})
-        self._notify("initialized", {})
-
-    def sync(self, text: str) -> list[dict[str, Any]] | None:
-        """Make the server's copy ``text``. Its diagnostics if that changed it, else None.
-
-        None means "nothing new", not "no diagnostics": :attr:`diagnostics`
-        always has the latest.
-        """
-        if self._closed:
-            raise RuntimeError("StatementSession is closed")
-        if text == self._text:
-            return None
-        self.version += 1
-        if self._text is None:
-            document = {
-                "uri": self.URI,
-                "languageId": self.LANGUAGE_ID,
-                "version": self.version,
-                "text": text,
-            }
-            replies = self._notify("textDocument/didOpen", {"textDocument": document})
-        else:
-            replies = self._notify(
-                "textDocument/didChange",
-                {
-                    "textDocument": {"uri": self.URI, "version": self.version},
-                    "contentChanges": [{"text": text}],
-                },
-            )
-        self._text = text
-        self.diagnostics = next(
-            (
-                list(reply["params"]["diagnostics"])
-                for reply in replies
-                if reply.get("method") == "textDocument/publishDiagnostics"
-            ),
-            [],
-        )
-        return list(self.diagnostics)
-
-    def request(self, method: str, params: Mapping[str, Any], text: str) -> Any:
-        """``method``'s result for the document holding ``text``.
-
-        ``params`` without ``textDocument``; the session adds it. Raises
-        :class:`LspError` for an error response.
-        """
-        self.sync(text)
-        return self._call(method, {**params, "textDocument": {"uri": self.URI}})
-
-    def close(self) -> None:
-        """Close the document and shut the server down. Safe to call twice."""
-        if self._closed:
-            return
-        if self._text is not None:
-            self._notify("textDocument/didClose", {"textDocument": {"uri": self.URI}})
-        self._call("shutdown", None)
-        self._notify("exit", None)
-        self._closed = True
-
-    def _call(self, method: str, params: Mapping[str, Any] | None) -> Any:
-        self._ids += 1
-        message: dict[str, Any] = {"jsonrpc": "2.0", "id": self._ids, "method": method}
-        if params is not None:
-            message["params"] = params
-        for reply in self._server.handle(message):
-            if reply.get("id") != self._ids:
-                continue
-            if "error" in reply:
-                error = reply["error"]
-                raise LspError(error["code"], error["message"])
-            return reply.get("result")
-        raise LspError(-32603, f"no response to {method}")
-
-    def _notify(self, method: str, params: Mapping[str, Any] | None) -> list[dict[str, Any]]:
-        message: dict[str, Any] = {"jsonrpc": "2.0", "method": method}
-        if params is not None:
-            message["params"] = params
-        return self._server.handle(message)
