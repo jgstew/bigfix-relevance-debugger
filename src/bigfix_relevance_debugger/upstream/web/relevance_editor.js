@@ -107,8 +107,9 @@ export function relevanceEditor(CM, transport, options = {}) {
     provide: (field) => CM.EditorView.decorations.from(field, (value) => value.marks),
   });
 
-  // Notifications can arrive before a view exists (or between remounts);
-  // keep the latest and apply it to every view as it appears.
+  // A notification can arrive before this client's view exists; keep the
+  // latest and apply it to every view as it appears. (A host that rebuilds the
+  // client, e.g. on remount, replays or re-sends it: see the host's docs.)
   const views = new Set();
   let latest = null;
   const apply = (view, params) => {

@@ -9,12 +9,14 @@ event from it. Each test runs the real language server in-process.
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 from nicegui import ui
 from nicegui.testing.user_simulation import user_simulation
 
 from bigfix_relevance_debugger.editor import ALLOWED_REQUESTS, RelevanceEditor
+from bigfix_relevance_debugger.upstream import relevance_analyzer
 
 
 def page() -> None:
@@ -99,6 +101,56 @@ async def test_a_new_dialect_starts_a_new_session_and_republishes(user):
     assert len(notifications(calls)) == 2
 
 
+async def test_a_cancelled_publish_is_resent(user, monkeypatch):
+    # The worker thread finishes the sync even when publish() is cancelled;
+    # the browser never got those diagnostics, so the next publish sends them.
+    editor, calls = await opened(user)
+    real_sync = relevance_analyzer.StatementSession.sync
+
+    def slow_sync(self, text):
+        time.sleep(0.2)
+        return real_sync(self, text)
+
+    monkeypatch.setattr(relevance_analyzer.StatementSession, "sync", slow_sync)
+    editor.set_value("nme of operating system")
+    task = asyncio.create_task(editor.publish())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.3)  # the worker thread still finishes the sync
+
+    await editor.publish()
+
+    [(_, _, params)] = notifications(calls)
+    assert params["text"] == "nme of operating system"
+    assert params["diagnostics"]
+
+
+async def test_a_request_does_not_swallow_the_next_publish(user):
+    editor, calls = await opened(user)
+    editor.set_value("nme of operating system")
+    request(user, 1, "textDocument/hover", {"position": {"line": 0, "character": 1}})
+    await until(lambda: any(c[0] == "lspReply" for c in calls))
+
+    await editor.publish()
+
+    [(_, _, params)] = notifications(calls)
+    assert [d["code"] for d in params["diagnostics"]] == ["unknown-inspector"]
+
+
+async def test_a_mounted_browser_gets_the_diagnostics_again(user):
+    # A remounted editor starts with no diagnostics; it says so with lspReady.
+    editor, calls = await opened(user)
+    editor.set_value("nme of operating system")
+    await editor.publish()
+
+    user.find(marker="editor").trigger("lspReady")
+
+    await until(lambda: len(notifications(calls)) == 2)
+    assert notifications(calls)[0] == notifications(calls)[1]
+
+
 # --- requests from the browser ----------------------------------------------------
 
 
@@ -181,6 +233,54 @@ async def test_a_server_error_is_replied_not_raised(user):
 
 
 # --- lifecycle --------------------------------------------------------------------
+
+
+async def test_closing_during_a_dialect_switch_is_quiet(user):
+    editor, calls = await opened(user)
+    editor.set_value("name of operating system")
+    task = asyncio.create_task(editor.publish("session"))
+    await asyncio.sleep(0)  # inside the lock, awaiting a worker thread
+
+    editor.close()
+
+    await task  # no AttributeError
+    assert notifications(calls) == []
+
+
+async def test_a_request_after_close_is_answered(user):
+    # Every request settles, so the browser never waits forever.
+    editor, calls = await opened(user)
+    editor.close()
+
+    request(user, 9, "textDocument/hover", {"position": {"line": 0, "character": 0}})
+
+    await until(lambda: any(c[0] == "lspReply" for c in calls))
+    [(_, id_, result, error)] = [c for c in calls if c[0] == "lspReply"]
+    assert (id_, result) == (9, None)
+    assert error["code"] == -32800  # RequestCancelled
+
+
+async def test_close_shuts_the_server_down_without_racing_a_request(user, monkeypatch):
+    editor, _ = await opened(user)
+    editor.set_value("name of operating system")
+    session = editor._session
+    assert session is not None
+    real_request = relevance_analyzer.StatementSession.request
+    closed_while_busy: list[bool] = []
+
+    def slow_request(self, method, params, text):
+        time.sleep(0.2)
+        closed_while_busy.append(self._closed)
+        return real_request(self, method, params, text)
+
+    monkeypatch.setattr(relevance_analyzer.StatementSession, "request", slow_request)
+    request(user, 2, "textDocument/hover", {"position": {"line": 0, "character": 12}})
+    await asyncio.sleep(0.05)  # the request is in its worker thread
+
+    editor.close()
+
+    await until(lambda: session._closed)
+    assert closed_while_busy == [False]  # the shutdown waited for the request
 
 
 async def test_closed_editor_publishes_nothing(user):

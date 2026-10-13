@@ -6,7 +6,8 @@
 //
 // The transport is NiceGUI's event channel: a request is emitted as "lsp"
 // {id, method, params}; Python answers with lspReply(id, result, error) and
-// pushes server notifications with lspNotify(method, params).
+// pushes server notifications with lspNotify(method, params). On every mount
+// the component emits "lspReady", so Python re-sends what a fresh editor lacks.
 import * as CM from "nicegui-codemirror";
 import Base from "nicegui-codemirror-base/codemirror.js";
 import { relevanceEditor } from "bigfix-relevance-editor/relevance_editor.js";
@@ -26,7 +27,13 @@ export default {
           }),
         onNotification: (handler) => lsp.handlers.push(handler),
       };
-      return [...Base.methods.setupExtensions.call(this), relevanceEditor(CM, transport)];
+      const extensions = [...Base.methods.setupExtensions.call(this), relevanceEditor(CM, transport)];
+      // Anything that arrived before this client existed, then ask for a refresh.
+      for (const [method, params] of this._lastNotify || []) {
+        for (const handler of lsp.handlers) handler(method, params);
+      }
+      this.$emit("lspReady");
+      return extensions;
     },
     lspReply(id, result, error) {
       const call = this._lsp?.pending.get(id);
@@ -36,6 +43,8 @@ export default {
       else call.resolve(result);
     },
     lspNotify(method, params) {
+      // Kept (latest per method) for a client created later in this instance.
+      this._lastNotify = new Map(this._lastNotify || []).set(method, params);
       for (const handler of this._lsp?.handlers || []) handler(method, params);
     },
   },

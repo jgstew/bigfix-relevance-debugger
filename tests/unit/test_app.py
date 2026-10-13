@@ -323,6 +323,25 @@ async def test_live_analysis_publishes_diagnostics_to_the_editor(user):
     assert editor(user).decorations == []
 
 
+async def test_clicking_inside_the_debounce_still_updates_the_editor(user):
+    # Breakdown cuts the debounce short so the table is current; the editor's
+    # squiggles must catch up too.
+    await user.open("/")
+    calls = record_editor_calls(user)
+    editor(user).set_value("name of operating system")
+    await wait_for(lambda: published(calls))  # settled, so Breakdown is enabled
+    calls.clear()
+    editor(user).set_value("nme of operating sytem")
+    await asyncio.sleep(0.05)  # click within the 300 ms debounce
+
+    user.find(marker="breakdown").click()
+
+    await wait_for(lambda: published(calls))
+    [table] = user.find(marker="findings").elements
+    assert "nme" in table.rows[0]["message"]
+    assert published(calls)[-1]["text"] == "nme of operating sytem"
+
+
 async def test_the_editor_lints_in_the_dialect_the_analysis_chose(user):
     await user.open("/")
     record_editor_calls(user)

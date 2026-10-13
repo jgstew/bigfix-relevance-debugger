@@ -636,10 +636,16 @@ async def root() -> None:
         reanalyze()
         await code.publish(state.view.lint_dialect)
 
+    def refresh_editor() -> None:
+        """The editor's server catches up in the background; the page doesn't wait.
+
+        Cheap when nothing changed, so call it whenever the debounce is cut short.
+        """
+        background_tasks.create(code.publish(state.view.lint_dialect), name="editor-publish")
+
     def on_dialect_change() -> None:
-        # The page updates at once; the editor's server catches up in the background.
         reanalyze()
-        background_tasks.create(code.publish(state.view.lint_dialect), name="editor-dialect")
+        refresh_editor()
 
     debouncer = Debouncer(DEBOUNCE_S, settle)
     code.on_value_change(lambda _: debouncer.trigger())
@@ -655,6 +661,8 @@ async def root() -> None:
         view = state.view
         if view.text != (code.value or "") or view.dialect_mode != state.dialect_mode:
             reanalyze()
+        # The cancelled debounce would have updated the editor's squiggles too.
+        refresh_editor()
         return state.view
 
     def update_buttons() -> None:
