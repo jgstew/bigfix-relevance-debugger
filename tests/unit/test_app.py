@@ -287,24 +287,65 @@ async def test_live_analysis_shows_lint_finding(user):
     assert "suggestions" not in row  # the slot renders "fixes"; a string would be dead
 
 
-async def test_live_analysis_decorates_editor(user):
+def record_editor_calls(user) -> list[tuple]:
+    """The editor's run_method calls (diagnostics, replies), recorded instead of sent."""
+    calls: list[tuple] = []
+    editor(user).run_method = lambda name, *args, **_: calls.append((name, *args))  # type: ignore[method-assign]
+    return calls
+
+
+def published(calls) -> list[dict]:
+    return [c[2] for c in calls if c[:2] == ("lspNotify", "textDocument/publishDiagnostics")]
+
+
+async def wait_for(predicate, timeout: float = 2.0) -> None:
+    """The editor publishes after the debounce *and* a lint in a worker thread."""
+    for _ in range(int(timeout / 0.02)):
+        if predicate():
+            return
+        await asyncio.sleep(0.02)
+    assert predicate()
+
+
+async def test_live_analysis_publishes_diagnostics_to_the_editor(user):
     await user.open("/")
-
-    await set_text(user, "name of ) x")
-
-    [mark] = [d for d in editor(user).decorations if d["class"] == "bfrd-parse-error"]
-    assert (mark["from"], mark["to"]) == (8, 9)
-
-
-async def test_squiggles_explain_themselves_on_hover(user):
-    await user.open("/")
+    calls = record_editor_calls(user)
 
     await set_text(user, "nme of operating sytem")
 
-    titles = [d["attributes"]["title"] for d in editor(user).decorations]
-    assert len(titles) == 2
-    assert "`nme`" in titles[0]
-    assert "`operating sytem`" in titles[1] and "`operating system`" in titles[1]
+    await wait_for(lambda: published(calls))
+    [params] = published(calls)
+    assert params["text"] == "nme of operating sytem"
+    messages = [d["message"] for d in params["diagnostics"]]
+    assert len(messages) == 2
+    assert "`nme`" in messages[0] and "`operating sytem`" in messages[1]
+    # The squiggles come from the language server, not decorations.
+    assert editor(user).decorations == []
+
+
+async def test_the_editor_lints_in_the_dialect_the_analysis_chose(user):
+    await user.open("/")
+    record_editor_calls(user)
+
+    await set_text(user, "names of bes computers")
+    await wait_for(lambda: editor(user).dialect == "session")
+
+    await set_text(user, "name of operating system")
+    await wait_for(lambda: editor(user).dialect == "client")
+
+
+async def test_the_dialect_picker_reaches_the_editor_at_once(user):
+    await user.open("/")
+    calls = record_editor_calls(user)
+    await set_text(user, "now")
+    await wait_for(lambda: len(published(calls)) == 1)
+    assert editor(user).dialect == "client"
+    [picker] = user.find(marker="dialect").elements
+
+    picker.set_value("session")
+
+    await wait_for(lambda: len(published(calls)) == 2)
+    assert editor(user).dialect == "session"
 
 
 # --- fixes -----------------------------------------------------------------------

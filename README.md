@@ -6,8 +6,9 @@
 A small browser GUI for BigFix **client and session relevance**:
 
 1. **Live static analysis** while you type: parse errors with line and
-   column, dialect, type check, lint findings (hover an underline for its
-   message), one-click "did you mean" fixes and **Fix all safe issues**,
+   column, dialect, type check, lint findings from the analyzer's language
+   server (underlined with a gutter marker; hover for the message), one-click
+   "did you mean" fixes and **Fix all safe issues**,
    complexity score, evaluation cost and costly inspectors. Uses
    [`bigfix-relevance-analyzer`](https://github.com/jgstew/bigfix-relevance-analyzer).
 2. **Evaluation with real `qna`** on local, container (Docker/Podman) and

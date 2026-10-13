@@ -432,55 +432,20 @@ def test_clean_text_has_no_decorations():
     assert editor_decorations(summarize("name of operating system")) == []
 
 
-def mark(start, end, css_class, title):
-    return {
-        "kind": "mark",
-        "from": start,
-        "to": end,
-        "class": css_class,
-        "attributes": {"title": title},
-    }
-
-
-def test_parse_error_marks_the_offending_character():
-    view = summarize("name of ) x")
-    assert view.parse_error is not None
-
-    assert editor_decorations(view) == [mark(8, 9, "bfrd-parse-error", view.parse_error.message)]
-
-
-def test_parse_error_at_end_of_text_marks_the_last_character():
-    # A mark cannot be empty, and offset == len(text) has nothing after it.
-    view = summarize("name of (operating system")
-    assert view.parse_error is not None
-
-    assert editor_decorations(view) == [mark(24, 25, "bfrd-parse-error", view.parse_error.message)]
-
-
-def test_empty_text_has_nothing_to_mark():
-    assert editor_decorations(summarize("")) == []
-
-
-def test_lint_findings_are_marked_by_severity_with_the_span_message():
-    view = summarize("name of operating sytem")
-    [span] = view.findings[0].spans
-    assert span.message
-
-    assert editor_decorations(view) == [mark(8, 23, "bfrd-warning", span.message)]
-
-
-def test_a_span_without_its_own_message_shows_the_findings():
-    view = summarize("(name of operating system) + 1")
-    [finding] = view.findings
-    assert finding.spans[0].message is None
-
-    assert editor_decorations(view) == [mark(0, 30, "bfrd-error", finding.message)]
-
-
-def test_marks_follow_leading_whitespace():
-    [decoration] = editor_decorations(summarize("\n  name of operating sytem"))
-
-    assert (decoration["from"], decoration["to"]) == (11, 26)
+@pytest.mark.parametrize(
+    "text",
+    [
+        "name of ) x",  # parse error
+        "name of (operating system",  # parse error at the end
+        "name of operating sytem",  # lint warning
+        "(name of operating system) + 1",  # lint error
+        "",
+    ],
+)
+def test_errors_and_findings_are_left_to_the_language_server(text):
+    # The editor's language server underlines these, with their messages;
+    # marking them here too would draw every squiggle twice.
+    assert editor_decorations(summarize(text)) == []
 
 
 def test_highlighted_level_span_is_marked():
@@ -489,7 +454,15 @@ def test_highlighted_level_span_is_marked():
 
     decorations = editor_decorations(view, highlight=(level.start, level.end))
 
-    assert {"kind": "mark", "from": 22, "to": 32, "class": "bfrd-level"} in decorations
+    assert decorations == [{"kind": "mark", "from": 22, "to": 32, "class": "bfrd-level"}]
+
+
+def test_a_highlight_over_an_error_is_still_marked():
+    view = summarize("name of operating sytem")
+
+    assert editor_decorations(view, highlight=(8, 23)) == [
+        {"kind": "mark", "from": 8, "to": 23, "class": "bfrd-level"}
+    ]
 
 
 def test_out_of_range_or_empty_highlight_is_dropped():

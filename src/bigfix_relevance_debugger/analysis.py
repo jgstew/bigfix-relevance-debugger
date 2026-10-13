@@ -370,49 +370,29 @@ def missing_fix_reason(view: AnalysisView, name: str, suggestion: str) -> str:
     return f"{name} is no longer in the text."
 
 
-def _mark(
-    text: str, start: int, end: int, css_class: str, title: str | None = None
-) -> dict[str, object] | None:
+def _mark(text: str, start: int, end: int, css_class: str) -> dict[str, object] | None:
     """A CodeMirror mark spec, or None when the range can't be one.
 
     NiceGUI rejects an empty or inverted mark with a ValueError on assignment,
     so anything degenerate is dropped here rather than taking the editor down.
-    ``title`` becomes the browser's hover tooltip. NiceGUI applies
-    ``attributes`` unsanitized, so only ever pass ``title`` (plain text to the
-    browser, never HTML) through it.
     """
     if not 0 <= start < end <= len(text):
         return None
-    spec: dict[str, object] = {"kind": "mark", "from": start, "to": end, "class": css_class}
-    if title is not None:
-        spec["attributes"] = {"title": title}
-    return spec
+    return {"kind": "mark", "from": start, "to": end, "class": css_class}
 
 
 def editor_decorations(
     view: AnalysisView, highlight: tuple[int, int] | None = None
 ) -> list[dict[str, object]]:
-    """CodeMirror decoration specs for ``view``: parse error, lint findings, a level span.
+    """CodeMirror decoration specs for ``view``: the highlighted level span, if any.
 
-    Error and finding marks carry their message as a hover tooltip.
+    Parse errors and lint findings are not marked here: the editor's language
+    server underlines them, with their messages (see ``editor.py``).
 
     Offsets are ``str`` indices into ``view.text``, which is what NiceGUI's
-    ``codemirror.decorations`` expects. CSS classes are ``bfrd-*``; the page
-    ships the styles.
+    ``codemirror.decorations`` expects. The page ships the ``bfrd-level`` style.
     """
-    text = view.text
-    marks: list[dict[str, object] | None] = []
-    if view.parse_error is not None:
-        # An error at end of text (e.g. a missing ')') has nothing after it to
-        # mark, so mark the last character instead.
-        start = min(view.parse_error.offset, len(text) - 1)
-        marks.append(_mark(text, start, start + 1, "bfrd-parse-error", view.parse_error.message))
-    for finding in view.findings:
-        if finding.code == "parse-error":
-            continue  # already marked above
-        for span in finding.spans:
-            title = span.message or finding.message
-            marks.append(_mark(text, span.start, span.end, f"bfrd-{finding.severity}", title))
-    if highlight is not None:
-        marks.append(_mark(text, highlight[0], highlight[1], "bfrd-level"))
-    return [m for m in marks if m is not None]
+    if highlight is None:
+        return []
+    mark = _mark(view.text, highlight[0], highlight[1], "bfrd-level")
+    return [mark] if mark is not None else []

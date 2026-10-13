@@ -15,14 +15,17 @@ Entry point: `bigfix_relevance_debugger.app:main`, run via
 
 - `src/bigfix_relevance_debugger/`
   - `analysis.py`: analyzer -> frozen view-model dataclasses, plus CodeMirror
-    decoration specs. Pure and sync.
+    decoration specs (the breakdown highlight only). Pure and sync.
   - `evaluation.py`: target form -> `Target`s, inventory loading, streaming,
     session relevance (`evaluate_session`) and `run_breakdown`. Async.
   - `log_bridge.py`: library logger -> UI callback, thread-safe.
+  - `editor.py` + `relevance_codemirror.js`: the relevance editor, NiceGUI's
+    CodeMirror wired to the analyzer's language server. See below.
   - `app.py`: the page and `main()`. UI wiring only.
   - `upstream/`: code meant to be donated to the libraries, one module per
     library (`remote_client_relevance.py`, `relevance_analyzer.py`,
-    `besapi.py`). See below.
+    `besapi.py`), plus `upstream/web/relevance_editor.js` for the analyzer.
+    See below.
 - `tests/unit/`: offline. No Docker, qna, SSH or network.
 
 **Keep NiceGUI out of `analysis.py`, `evaluation.py` and `log_bridge.py`** so
@@ -82,6 +85,27 @@ uv run pyright src tests
   Sorting and filtering (`order_results`, `visible_results`) are pure
   functions in `evaluation.py`, and so is the answer summary (`AnswerTally`,
   one `add` per streamed result) and its pick (`ResultRow.has_key`).
+- **Editor intelligence comes only from the analyzer's language server.**
+  `editor.RelevanceEditor` extends `ui.codemirror`. Python owns the document:
+  an in-process `upstream.relevance_analyzer.StatementSession` (wrapping
+  `lsp.Server`) is synced from the element's `value` and answers the
+  browser's `lsp` events (`{id, method, params}`, only `ALLOWED_REQUESTS`,
+  since the page is untrusted input) with `run_method("lspReply", ...)`;
+  diagnostics go out with `run_method("lspNotify", ...)` after the debounce,
+  carrying the `text` they were computed for. Its dialect follows
+  `AnalysisView.lint_dialect`, so squiggles and the findings table agree.
+  Don't add completion, hover or lint logic here; add it to the analyzer.
+- **The browser half has no build step and one CodeMirror.**
+  `relevance_codemirror.js` `extends` NiceGUI's own component (registered as
+  the `nicegui-codemirror-base` ESM) and overrides `setupExtensions()`.
+  `upstream/web/relevance_editor.js` is the shared client meant for
+  bigfix-relevance-analyzer (analyzer#142): it imports nothing and gets
+  CodeMirror passed in (`relevanceEditor(CM, transport)`), so it only uses
+  what `nicegui-codemirror` exports (no `@codemirror/lint` or
+  `@codemirror/autocomplete`). `test_editor.py` pins the NiceGUI files this
+  relies on. JS can't run in the tests: test the Python half there (record
+  `run_method`, `trigger("lsp", ...)`) and check the browser in a real run.
+  The preview pane can report a 0x0 viewport; resize it before testing hover.
 - **The inventory is shared** with the `bigfix-remote-client-relevance` CLI:
   by default it uses that library's `find_inventory_path()` search
   (`~/.bigfix/remote_clients.toml` etc.), and first-run auto-discovery when
