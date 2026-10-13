@@ -249,12 +249,19 @@ class StatementSession:
         self._text: str | None = None
         self.version = 0
         """Bumped on every text the server is sent; 0 before the first."""
+        self.diagnostics: list[dict[str, Any]] = []
+        """The server's diagnostics for the text it holds, however it got there
+        (:meth:`sync` or the sync inside :meth:`request`)."""
         self._closed = False
         self._call("initialize", {"processId": None, "capabilities": self.CAPABILITIES})
         self._notify("initialized", {})
 
     def sync(self, text: str) -> list[dict[str, Any]] | None:
-        """Make the server's copy ``text``. Its diagnostics if that changed it, else None."""
+        """Make the server's copy ``text``. Its diagnostics if that changed it, else None.
+
+        None means "nothing new", not "no diagnostics": :attr:`diagnostics`
+        always has the latest.
+        """
         if self._closed:
             raise RuntimeError("StatementSession is closed")
         if text == self._text:
@@ -277,10 +284,15 @@ class StatementSession:
                 },
             )
         self._text = text
-        for reply in replies:
-            if reply.get("method") == "textDocument/publishDiagnostics":
-                return list(reply["params"]["diagnostics"])
-        return []
+        self.diagnostics = next(
+            (
+                list(reply["params"]["diagnostics"])
+                for reply in replies
+                if reply.get("method") == "textDocument/publishDiagnostics"
+            ),
+            [],
+        )
+        return list(self.diagnostics)
 
     def request(self, method: str, params: Mapping[str, Any], text: str) -> Any:
         """``method``'s result for the document holding ``text``.

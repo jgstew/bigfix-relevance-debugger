@@ -163,3 +163,26 @@ def test_closed_session_refuses_work():
 
     with pytest.raises(RuntimeError, match="closed"):
         session.sync("now")
+
+
+# --- the latest diagnostics -------------------------------------------------------
+
+
+def test_diagnostics_start_empty(session):
+    assert session.diagnostics == []
+
+
+def test_diagnostics_are_kept_for_the_text_the_server_holds(session):
+    session.sync("nme of operating system")
+
+    assert session.sync("nme of operating system") is None  # nothing new to report...
+    [diagnostic] = session.diagnostics  # ...but the latest are still at hand
+    assert diagnostic["code"] == "unknown-inspector"
+
+
+def test_a_requests_sync_keeps_its_diagnostics(session):
+    # request() syncs first; a caller that publishes afterwards must still be
+    # able to get that text's diagnostics.
+    session.request("textDocument/hover", {"position": at(0, 1)}, "nme of operating system")
+
+    assert [d["code"] for d in session.diagnostics] == ["unknown-inspector"]

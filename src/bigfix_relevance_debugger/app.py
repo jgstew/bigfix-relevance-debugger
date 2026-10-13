@@ -27,7 +27,7 @@ from bigfix_remote_client_relevance import (
     find_inventory_path,
     results_to_dicts,
 )
-from nicegui import ui
+from nicegui import background_tasks, ui
 from nicegui.events import GenericEventArguments, ValueChangeEventArguments
 
 from bigfix_relevance_debugger import __version__
@@ -42,6 +42,7 @@ from bigfix_relevance_debugger.analysis import (
     suggestion_fix,
     summarize,
 )
+from bigfix_relevance_debugger.editor import RelevanceEditor
 from bigfix_relevance_debugger.evaluation import (
     ARCHES,
     AUTO_ARCH,
@@ -116,9 +117,6 @@ _inventory_path: Path | None = None
 _CSS = """
 body.body--light { background: #fafafa; }
 body.body--dark { background: #121212; }
-.bfrd-parse-error { text-decoration: wavy underline red; background: rgba(255,0,0,.12); }
-.bfrd-error { text-decoration: wavy underline red; }
-.bfrd-warning { text-decoration: wavy underline orange; }
 .bfrd-level { background: rgba(255, 213, 79, .55); border-radius: 2px; }
 .bfrd-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 /* Translucent, so the picked answer reads in light and dark mode alike. */
@@ -360,7 +358,7 @@ async def root() -> None:
                 "w-72"
             )
 
-        code = ui.codemirror("", line_wrapping=True).classes("w-full h-40 border")
+        code = RelevanceEditor("", line_wrapping=True).classes("w-full h-40 border")
         code.mark("editor")
         example.on_value_change(lambda e: e.value and code.set_value(e.value))
 
@@ -633,9 +631,25 @@ async def root() -> None:
             return
         code.set_value(text)
 
-    debouncer = Debouncer(DEBOUNCE_S, reanalyze)
+    async def settle() -> None:
+        """After typing stops: the page's analysis, then the editor's squiggles."""
+        reanalyze()
+        await code.publish(state.view.lint_dialect)
+
+    def refresh_editor() -> None:
+        """The editor's server catches up in the background; the page doesn't wait.
+
+        Cheap when nothing changed, so call it whenever the debounce is cut short.
+        """
+        background_tasks.create(code.publish(state.view.lint_dialect), name="editor-publish")
+
+    def on_dialect_change() -> None:
+        reanalyze()
+        refresh_editor()
+
+    debouncer = Debouncer(DEBOUNCE_S, settle)
     code.on_value_change(lambda _: debouncer.trigger())
-    dialect_select.on_value_change(lambda _: reanalyze())
+    dialect_select.on_value_change(on_dialect_change)
 
     def current_view() -> AnalysisView:
         """The analysis of what the editor shows *now*, not 300 ms ago.
@@ -647,6 +661,8 @@ async def root() -> None:
         view = state.view
         if view.text != (code.value or "") or view.dialect_mode != state.dialect_mode:
             reanalyze()
+        # The cancelled debounce would have updated the editor's squiggles too.
+        refresh_editor()
         return state.view
 
     def update_buttons() -> None:
@@ -1088,6 +1104,7 @@ async def root() -> None:
     # same client, and its log should keep flowing.
     client.on_delete(lambda: detach(handler))
     client.on_delete(debouncer.cancel)
+    client.on_delete(code.close)
     client.on_delete(filter_debouncer.cancel)
     client.on_delete(arch_debouncer.cancel)
     client.on_delete(lambda: arch_task is not None and arch_task.cancel())
