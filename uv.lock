@@ -268,7 +268,7 @@ wheels = [
 
 [[package]]
 name = "bigfix-relevance-debugger"
-version = "0.2.2"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "besapi" },
