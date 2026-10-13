@@ -27,6 +27,21 @@ function highlighting() {
   }
 }
 
+// Tab completes; it never indents (relevance has no indentation, but NiceGUI's
+// ui.codemirror always binds indentWithTab). NiceGUI's bundle doesn't export
+// @codemirror/autocomplete, so run basicSetup's own completion keys: Enter
+// accepts the selected option, Ctrl-Space opens the list. The content element
+// has aria-activedescendant only while an option is selected, which keeps
+// Enter from inserting a newline when nothing is.
+function runKey(view, key, ctrlKey = false) {
+  return CM.runScopeHandlers(view, new KeyboardEvent("keydown", { key, ctrlKey }), "editor");
+}
+function tabCompletes(view) {
+  if (view.contentDOM.hasAttribute("aria-activedescendant")) runKey(view, "Enter");
+  else runKey(view, " ", true);
+  return true;
+}
+
 export default {
   extends: Base,
   methods: {
@@ -54,6 +69,12 @@ export default {
             return { top, left: 0, bottom: window.innerHeight, right: window.innerWidth };
           },
         }),
+        CM.Prec.high(
+          CM.keymap.of([
+            { key: "Tab", run: tabCompletes },
+            { key: "Shift-Tab", run: () => true },
+          ]),
+        ),
         ...highlighting(),
         relevanceEditor(CM, transport),
       ];

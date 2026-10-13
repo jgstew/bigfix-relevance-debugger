@@ -414,3 +414,30 @@ def test_the_host_keeps_tooltips_below_the_page_header():
     component = editor_module.Path(editor_module.__file__).with_name("relevance_codemirror.js")
     assert "CM.tooltips({" in component.read_text(encoding="utf-8")
     assert "tooltips" in bundle_exports()
+
+
+def test_tab_completes_and_never_indents():
+    # NiceGUI's ui.codemirror always binds indentWithTab; relevance has no
+    # indentation, so the host's Prec.high keymap takes Tab and Shift-Tab.
+    import bigfix_relevance_debugger.editor as editor_module
+
+    component = editor_module.Path(editor_module.__file__).with_name("relevance_codemirror.js")
+    source = component.read_text(encoding="utf-8")
+    assert '{ key: "Tab", run: tabCompletes }' in source
+    assert '{ key: "Shift-Tab", run: () => true }' in source
+    assert {"runScopeHandlers", "Prec", "keymap"} <= bundle_exports()
+
+
+def test_nicegui_keeps_the_completion_keys_tab_runs():
+    """NiceGUI's bundle doesn't export @codemirror/autocomplete, so Tab runs
+    basicSetup's own completion keys (Enter accepts, Ctrl-Space opens) and
+    reads whether an option is selected from the editor's ARIA attributes."""
+    import bigfix_relevance_debugger.editor as editor_module
+
+    dist = editor_module._NICEGUI_CODEMIRROR / "dist"
+    chunks = [p.read_text(encoding="utf-8") for p in dist.glob("*.js")]
+    autocomplete = [c for c in chunks if "cm-tooltip-autocomplete" in c]
+    assert len(autocomplete) == 1
+    assert '{key:"Ctrl-Space",run:' in autocomplete[0]
+    assert '{key:"Enter",run:' in autocomplete[0]
+    assert '"aria-activedescendant"' in autocomplete[0]
