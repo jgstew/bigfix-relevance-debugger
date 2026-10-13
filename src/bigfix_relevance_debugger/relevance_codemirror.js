@@ -15,6 +15,18 @@ import Base from "nicegui-codemirror-base/codemirror.js";
 import { relevanceEditor } from "bigfix-relevance-editor/relevance_editor.js";
 import { relevanceLanguage } from "bigfix-relevance-editor/relevance_language.js";
 
+// The VS Code grammar's rules. The element has no language prop, so this is
+// the editor's only language. Colors are optional: if this CodeMirror can't
+// build them, the editor keeps diagnostics, completion, hover and quick fixes.
+function highlighting() {
+  try {
+    return [relevanceLanguage(CM)];
+  } catch (error) {
+    console.warn("relevance highlighting unavailable:", error);
+    return [];
+  }
+}
+
 export default {
   extends: Base,
   methods: {
@@ -42,9 +54,7 @@ export default {
             return { top, left: 0, bottom: window.innerHeight, right: window.innerWidth };
           },
         }),
-        // The VS Code grammar's rules. The element has no language prop, so
-        // this is the editor's only language.
-        relevanceLanguage(CM),
+        ...highlighting(),
         relevanceEditor(CM, transport),
       ];
       // Anything that arrived before this client existed, then ask for a refresh.

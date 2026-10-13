@@ -104,9 +104,11 @@ uv run pyright src tests
   Code grammar). Both import nothing and get CodeMirror passed in, so they
   only use what `nicegui-codemirror` exports, and the analyzer tests them
   against NiceGUI's CodeMirror. Nothing editor-related lives in `upstream/`;
-  change them in the analyzer. Don't pass `language=` to `RelevanceEditor`:
-  NiceGUI would add a second language. `test_editor.py` pins the NiceGUI and
-  analyzer files this relies on. The browser half can't run in pytest:
+  change them in the analyzer. `RelevanceEditor` refuses a `language`
+  (NiceGUI would add a second one), and a failure to build the highlighter
+  costs only the colors. `test_editor.py` pins the NiceGUI and analyzer
+  files this relies on, including that NiceGUI's bundle exports each
+  module's `REQUIRED_CM`. The browser half can't run in pytest:
   test the Python half (record `run_method`, `trigger("lsp", ...)`) and
   check the browser in a real run. The preview pane can report a 0x0
   viewport; resize it before testing hover. In a real run, never click

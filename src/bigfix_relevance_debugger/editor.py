@@ -24,10 +24,9 @@ included.
 from __future__ import annotations
 
 import asyncio
-import importlib.resources
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 import bigfix_relevance_analyzer
 import nicegui
@@ -48,7 +47,7 @@ METHOD_NOT_FOUND = -32601
 REQUEST_CANCELLED = -32800
 
 _NICEGUI_CODEMIRROR = Path(nicegui.__file__).parent / "elements" / "codemirror"
-_ANALYZER_WEB = Path(str(importlib.resources.files(bigfix_relevance_analyzer) / "web"))
+_ANALYZER_WEB = Path(bigfix_relevance_analyzer.__file__).parent / "web"
 """The analyzer's browser modules. A real directory: installs are unpacked."""
 
 
@@ -63,7 +62,11 @@ class RelevanceEditor(
 ):
     """``ui.codemirror`` plus the analyzer's diagnostics, served in-process."""
 
+    _ONE_LANGUAGE = "RelevanceEditor highlights relevance itself; a language would add a second one"
+
     def __init__(self, value: str = "", *, dialect: str = "client", **kwargs: Any) -> None:
+        if "language" in kwargs:
+            raise TypeError(self._ONE_LANGUAGE)
         super().__init__(value, **kwargs)
         self._dialect = dialect
         self._session: StatementSession | None = StatementSession(dialect=Dialect(dialect))
@@ -73,6 +76,18 @@ class RelevanceEditor(
         """One server call at a time, shutdown included: the session isn't thread-safe."""
         self.on("lsp", self._on_lsp)
         self.on("lspReady", self._on_ready)
+
+    @property
+    def language(self) -> str:
+        """Always unset: the component's relevanceLanguage(CM) is the only language."""
+        return super().language
+
+    @language.setter
+    def language(self, language: Any = None) -> None:
+        raise TypeError(self._ONE_LANGUAGE)
+
+    def set_language(self, language: Any = None) -> NoReturn:
+        raise TypeError(self._ONE_LANGUAGE)
 
     @property
     def dialect(self) -> str:

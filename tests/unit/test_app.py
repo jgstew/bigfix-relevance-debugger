@@ -237,13 +237,6 @@ def editor(user):
     return element
 
 
-async def test_the_editor_has_only_the_relevance_language(user):
-    # Highlighting comes from the component's relevanceLanguage(CM); NiceGUI's
-    # language prop would add a second language beside it.
-    await user.open("/")
-    assert not editor(user).props.get("language")
-
-
 async def set_text(user, text: str) -> None:
     editor(user).set_value(text)
     # Past the 300 ms debounce.

@@ -385,9 +385,11 @@ def test_no_fix_when_the_name_is_still_there_but_not_that_lead():
     assert missing_fix_reason(view, "filez", "file") == "file no longer applies to filez."
 
 
-def test_no_fix_when_the_name_is_now_valid():
-    # A stale click after the typo was fixed by hand: the name has no fixes
-    # at all now, but it is still in the text (as written, any case or spacing).
+def test_missing_fix_reason_when_the_name_is_still_in_the_text():
+    # A direct test of missing_fix_reason's "still in the text" branch, for a
+    # name with no finding at all, written in any case and spacing. No dialect
+    # switch reaches it with analyzer 1.35: no inspector name has leads in one
+    # dialect and is valid in the other.
     view = summarize("name of Operating\n  System", "client")
     assert view.findings == ()
 
