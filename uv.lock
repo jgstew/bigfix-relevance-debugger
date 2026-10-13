@@ -7,11 +7,11 @@ exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for 
 exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
+besapi = { timestamp = "0001-01-01T00:00:00Z", span = "PT0S" }
 bigfix-relevance-analyzer = { timestamp = "0001-01-01T00:00:00Z", span = "PT0S" }
 bigfix-remote-client-relevance = { timestamp = "0001-01-01T00:00:00Z", span = "PT0S" }
-besapi = { timestamp = "0001-01-01T00:00:00Z", span = "PT0S" }
-ruff = { timestamp = "0001-01-01T00:00:00Z", span = "PT0S" }
 nicegui = { timestamp = "0001-01-01T00:00:00Z", span = "PT0S" }
+ruff = { timestamp = "0001-01-01T00:00:00Z", span = "PT0S" }
 
 [[package]]
 name = "aiofiles"
@@ -268,7 +268,7 @@ wheels = [
 
 [[package]]
 name = "bigfix-relevance-debugger"
-version = "0.2.1"
+version = "0.2.2"
 source = { editable = "." }
 dependencies = [
     { name = "besapi" },
