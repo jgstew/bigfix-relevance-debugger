@@ -12,11 +12,14 @@ import { pathToFileURL } from "node:url";
 import {
   REQUIRED_CM,
   completionResult,
+  editTransaction,
+  isQuickFix,
   markdownBlocks,
   offsetAt,
   placeDiagnostics,
   positionAt,
   relevanceEditor,
+  shouldAskImplicitly,
   workspaceEditChanges,
 } from "../../../../src/bigfix_relevance_debugger/upstream/web/relevance_editor.js";
 
@@ -90,13 +93,61 @@ test("completionResult maps the server's items, keeping its order", () => {
       ["bes filters", "bes filters: bes filter", "bes filters"],
     ],
   );
-  assert.ok(result.options[0].boost > result.options[1].boost);
-  assert.equal(result.filter, false); // the server already matched the partial word
+  assert.equal(result.filter, false); // the server already matched and ranked them
 });
 
 test("completionResult without a textEdit inserts the label at the cursor", () => {
   const result = completionResult(doc("name of "), { items: [{ label: "drive" }] }, 8);
   assert.deepEqual([result.from, result.to, result.options[0].apply], [8, 8, "drive"]);
+});
+
+// A stand-in for an EditorView: records what an option's apply() dispatches.
+const recorder = () => {
+  const dispatched = [];
+  return { dispatched, view: { dispatch: (spec) => dispatched.push(spec) } };
+};
+
+test("completionResult gives an item with its own range its own edit", () => {
+  const d = doc("names of opera");
+  const result = completionResult(d, {
+    items: [
+      { label: "operating system", textEdit: { range: span([0, 9], [0, 14]), newText: "operating system" } },
+      { label: "names of x", textEdit: { range: span([0, 0], [0, 14]), newText: "names of x" } },
+      { label: "drive" },
+    ],
+  }, 14);
+  assert.deepEqual([result.from, result.to], [9, 14]);
+  assert.equal(result.options[0].apply, "operating system"); // same range: plain text
+  for (const [option, from, insert] of [[result.options[1], 0, "names of x"], [result.options[2], 14, "drive"]]) {
+    const { dispatched, view } = recorder();
+    option.apply(view, option, result.from, result.to);
+    assert.deepEqual(dispatched[0].changes, { from, to: 14, insert }); // both end at the cursor
+    assert.deepEqual(dispatched[0].selection, { anchor: from + insert.length });
+  }
+});
+
+test("completionResult reads an InsertReplaceEdit's replace range", () => {
+  const result = completionResult(doc("name of op"), {
+    items: [
+      {
+        label: "operating system",
+        textEdit: { newText: "operating system", insert: span([0, 8], [0, 10]), replace: span([0, 8], [0, 10]) },
+      },
+    ],
+  }, 10);
+  assert.deepEqual([result.from, result.to, result.options[0].apply], [8, 10, "operating system"]);
+});
+
+test("completion asks implicitly only after a word character", () => {
+  // After a space or `(` the server lists everything, and Enter would take
+  // the first item instead of starting a new line.
+  for (const ch of ["a", "Z", "7", "_"]) assert.equal(shouldAskImplicitly(ch), true, ch);
+  for (const ch of [" ", "(", '"', ",", ""]) assert.equal(shouldAskImplicitly(ch), false, JSON.stringify(ch));
+});
+
+test("a host can add the server's trigger characters", () => {
+  assert.equal(shouldAskImplicitly('"', ['"']), true);
+  assert.equal(shouldAskImplicitly(" ", ['"']), false);
 });
 
 test("completionResult is null for nothing", () => {
@@ -146,6 +197,40 @@ test("workspaceEditChanges refuses overlapping edits", () => {
     },
   };
   assert.throws(() => workspaceEditChanges(doc("abcdef"), edit, URI), /overlap/);
+});
+
+test("editTransaction applies to the document it was computed for", () => {
+  const state = CM.EditorState.create({ doc: 'exists values of setting "x" of client' });
+  const edit = { changes: { [URI]: [{ range: span([0, 24], [0, 24]), newText: "s" }] } };
+  const spec = editTransaction(state, edit, URI, state.doc);
+  assert.equal(state.update(spec).state.doc.toString(), 'exists values of settings "x" of client');
+});
+
+test("editTransaction refuses a document that changed since", () => {
+  // Offsets computed for the old text would land in the wrong place.
+  const before = CM.EditorState.create({ doc: 'exists values of setting "x" of client' });
+  const after = before.update({ changes: { from: 0, insert: "not " } }).state;
+  const edit = { changes: { [URI]: [{ range: span([0, 24], [0, 24]), newText: "s" }] } };
+  assert.equal(editTransaction(after, edit, URI, before.doc), null);
+});
+
+test("editTransaction is null for nothing to do or overlapping edits", () => {
+  const state = CM.EditorState.create({ doc: "abcdef" });
+  assert.equal(editTransaction(state, { changes: {} }, URI, state.doc), null);
+  const overlapping = {
+    changes: { [URI]: [{ range: span([0, 0], [0, 3]), newText: "a" }, { range: span([0, 2], [0, 4]), newText: "b" }] },
+  };
+  assert.equal(editTransaction(state, overlapping, URI, state.doc), null);
+});
+
+test("isQuickFix takes plain and hierarchical quickfix kinds that carry an edit", () => {
+  const edit = { changes: {} };
+  assert.equal(isQuickFix({ kind: "quickfix", edit }), true);
+  assert.equal(isQuickFix({ kind: "quickfix.spelling", edit }), true);
+  assert.equal(isQuickFix({ edit }), true); // no kind: the server already filtered by `only`
+  assert.equal(isQuickFix({ kind: "quickfixer", edit }), false);
+  assert.equal(isQuickFix({ kind: "source.fixAll.bigfix-relevance", edit }), false);
+  assert.equal(isQuickFix({ kind: "quickfix" }), false); // a command, not an edit
 });
 
 test("an applied edit gives the fixed text", () => {

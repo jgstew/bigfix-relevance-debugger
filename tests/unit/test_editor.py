@@ -316,3 +316,25 @@ def test_the_shared_client_imports_nothing():
 
     source = (editor_module._UPSTREAM_WEB / "relevance_editor.js").read_text(encoding="utf-8")
     assert not [line for line in source.splitlines() if line.startswith("import ")]
+
+
+def test_the_host_keeps_tooltips_below_the_page_header():
+    # The shared client uses CodeMirror's default tooltip placement; the page
+    # tells CodeMirror its fixed header covers the top of the window.
+    import bigfix_relevance_debugger.editor as editor_module
+
+    component = editor_module.Path(editor_module.__file__).with_name("relevance_codemirror.js")
+    assert "CM.tooltips({" in component.read_text(encoding="utf-8")
+    bundle = editor_module._NICEGUI_CODEMIRROR / "dist" / "index.js"
+    assert " as tooltips" in bundle.read_text(encoding="utf-8")
+
+
+def test_node_loads_the_shared_client_as_a_module_on_any_version():
+    # Without "type": "module", Node before 22.7 / 20.19 reads a .js file as
+    # CommonJS and fails on `export`.
+    import json
+
+    import bigfix_relevance_debugger.editor as editor_module
+
+    package = json.loads((editor_module._UPSTREAM_WEB / "package.json").read_text(encoding="utf-8"))
+    assert package["type"] == "module"

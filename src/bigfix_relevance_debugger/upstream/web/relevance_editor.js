@@ -90,31 +90,57 @@ export function placeDiagnostics(doc, diagnostics) {
 
 // --- completion (pure) -------------------------------------------------------------
 
+/** A completion item's range: a TextEdit's, or an InsertReplaceEdit's `replace`. */
+function editRange(textEdit) {
+  return textEdit.range ?? textEdit.replace;
+}
+
+/**
+ * Whether to ask the server for completions without Ctrl-Space, given the
+ * character before the cursor: after a word character, or one of the
+ * server's `triggerCharacters`. Not after a space or `(`: there the server
+ * lists everything, and Enter would take its first item instead of a newline.
+ */
+export function shouldAskImplicitly(charBefore, triggerCharacters = []) {
+  return /\w/.test(charBefore) || triggerCharacters.includes(charBefore);
+}
+
 /**
  * A CodeMirror CompletionResult for an LSP completion result, or null.
  *
  * The server has already matched the partial word and ranked the items, so
- * the result is neither filtered nor re-sorted here (`filter: false`), and
- * it is asked again on the next keystroke. `pos` is where to insert items
- * that carry no textEdit.
+ * the result is neither filtered nor re-sorted (`filter: false` keeps their
+ * order), and it is asked again on the next keystroke. The result's range is
+ * the first item's; an item with another range (or none: it inserts at
+ * `pos`) applies its own edit.
  */
 export function completionResult(doc, result, pos) {
   const items = (result && result.items) || [];
   if (!items.length) return null;
-  const edit = items.find((item) => item.textEdit)?.textEdit;
-  const from = edit ? offsetAt(doc, edit.range.start) : pos;
-  const to = edit ? offsetAt(doc, edit.range.end) : pos;
+  const rangeOf = (item) => {
+    if (!item.textEdit) return { from: pos, to: pos };
+    const range = editRange(item.textEdit);
+    return { from: offsetAt(doc, range.start), to: offsetAt(doc, range.end) };
+  };
+  const { from, to } = rangeOf(items.find((item) => item.textEdit) || items[0]);
   return {
     from,
     to,
     filter: false,
-    options: items.map((item, index) => ({
-      label: item.label,
-      detail: item.detail,
-      apply: item.textEdit ? item.textEdit.newText : (item.insertText ?? item.label),
-      type: "property",
-      boost: Math.max(-99, 99 - index),
-    })),
+    options: items.map((item) => {
+      const insert = item.textEdit ? item.textEdit.newText : (item.insertText ?? item.label);
+      const own = rangeOf(item);
+      const apply =
+        own.from === from && own.to === to
+          ? insert
+          : (view) =>
+              view.dispatch({
+                changes: { from: own.from, to: own.to, insert },
+                selection: { anchor: own.from + insert.length },
+                userEvent: "input.complete",
+              });
+      return { label: item.label, detail: item.detail, apply, type: "property" };
+    }),
   };
 }
 
@@ -139,6 +165,28 @@ export function workspaceEditChanges(doc, edit, uri) {
     if (changes[i].from < changes[i - 1].to) throw new Error("workspace edit: overlapping edits");
   }
   return changes;
+}
+
+/**
+ * A transaction spec applying `edit` to `state`, or null: when the document
+ * is no longer `expectedDoc` (the one the edit was computed for, so its
+ * offsets would land in the wrong place), or there is nothing valid to do.
+ */
+export function editTransaction(state, edit, uri, expectedDoc) {
+  if (state.doc !== expectedDoc) return null;
+  let changes;
+  try {
+    changes = workspaceEditChanges(state.doc, edit, uri);
+  } catch {
+    return null;
+  }
+  return changes.length ? { changes, userEvent: "input", scrollIntoView: true } : null;
+}
+
+/** A code action this client can apply as a quick fix (LSP kinds match by prefix). */
+export function isQuickFix(action) {
+  const kind = action.kind;
+  return Boolean(action.edit) && (!kind || kind === "quickfix" || kind.startsWith("quickfix."));
 }
 
 // --- markdown (pure parse, safe render) ---------------------------------------------
@@ -219,9 +267,16 @@ export function renderMarkdown(markdown) {
 // --- the extension -----------------------------------------------------------------
 
 /**
- * The extensions to add to an editor. `options.uri` is the server's name for
- * the document (default "untitled:statement", what the analyzer's embedded
- * StatementSession uses): edits for other documents are ignored.
+ * The extensions to add to an editor. Options:
+ *   uri: the server's name for the document (default "untitled:statement",
+ *     what the analyzer's embedded StatementSession uses); edits for other
+ *     documents are ignored.
+ *   triggerCharacters: the server's completionProvider.triggerCharacters,
+ *     which also open completion while typing (word characters always do).
+ *   classPrefix: for the CSS classes (default "cm-bfr").
+ *
+ * Tooltips use CodeMirror's defaults: a host whose page covers part of the
+ * window (a fixed header) tells CodeMirror with `tooltips({tooltipSpace})`.
  *
  * `publishDiagnostics` params may carry `text`, the document they were
  * computed for (a host-mode extension to LSP): when it no longer matches the
@@ -230,7 +285,7 @@ export function renderMarkdown(markdown) {
 export function relevanceEditor(CM, transport, options = {}) {
   const missing = REQUIRED_CM.filter((name) => !(name in CM));
   if (missing.length) throw new Error(`relevanceEditor: CM lacks ${missing.join(", ")}`);
-  const { classPrefix = "cm-bfr", uri = "untitled:statement" } = options;
+  const { classPrefix = "cm-bfr", uri = "untitled:statement", triggerCharacters = [] } = options;
   const css = (name) => `${classPrefix}-${name}`;
 
   // Diagnostics, mapped through edits until the next publish replaces them.
@@ -299,29 +354,21 @@ export function relevanceEditor(CM, transport, options = {}) {
     }
   };
 
-  const applyEdit = (view, edit) => {
-    let changes;
-    try {
-      changes = workspaceEditChanges(view.state.doc, edit, uri);
-    } catch {
-      return false;
-    }
-    if (!changes.length) return false;
-    view.dispatch({ changes, userEvent: "input", scrollIntoView: true });
-    return true;
-  };
-
+  // Quick fixes for [from, to) in the current document, or null when the
+  // document changed while the server answered (they'd be for other text).
   const quickFixes = async (view, from, to, diagnostics) => {
     const doc = view.state.doc;
     const actions = await request("textDocument/codeAction", {
       range: { start: positionAt(doc, from), end: positionAt(doc, to) },
       context: { diagnostics: diagnostics.map((d) => d.lsp), only: ["quickfix"] },
     });
-    if (view.state.doc !== doc) return [];
-    return (actions || []).filter((a) => a.edit && (!a.kind || a.kind === "quickfix"));
+    if (view.state.doc !== doc) return null;
+    return (actions || []).filter(isQuickFix);
   };
 
-  const actionButtons = (view, actions, done) => {
+  // Buttons for `actions`, computed for `doc`: a click applies one unless
+  // the document has changed since.
+  const actionButtons = (view, actions, doc, done) => {
     const box = document.createElement("div");
     box.className = css("actions");
     for (const action of actions) {
@@ -332,7 +379,8 @@ export function relevanceEditor(CM, transport, options = {}) {
       button.addEventListener("mousedown", (event) => event.preventDefault()); // keep the editor's focus
       button.addEventListener("click", () => {
         done();
-        applyEdit(view, action.edit);
+        const spec = editTransaction(view.state, action.edit, uri, doc);
+        if (spec) view.dispatch(spec);
         view.focus();
       });
     }
@@ -384,13 +432,14 @@ export function relevanceEditor(CM, transport, options = {}) {
     const here = view.state
       .field(diagnosticField)
       .list.filter((d) => (side < 0 ? d.from < pos && pos <= d.to : d.from <= pos && pos < d.to));
-    const [info, fixes] = await Promise.all([
+    const [info, found] = await Promise.all([
       request("textDocument/hover", { position: positionAt(doc, pos) }),
       here.length
         ? quickFixes(view, Math.min(...here.map((d) => d.from)), Math.max(...here.map((d) => d.to)), here)
         : [],
     ]);
     if (view.state.doc !== doc) return null; // edited meanwhile
+    const fixes = found || [];
     const contents = info && info.contents && typeof info.contents.value === "string" ? info.contents.value : "";
     if (!here.length && !contents) return null;
     const starts = here.map((d) => d.from);
@@ -402,9 +451,6 @@ export function relevanceEditor(CM, transport, options = {}) {
     return {
       pos: starts.length ? Math.min(...starts) : pos,
       end: ends.length ? Math.max(...ends) : pos,
-      // Below the line: a page's fixed header can cover the space above an
-      // editor's first lines, and CodeMirror can't see that.
-      above: false,
       create() {
         const dom = document.createElement("div");
         dom.className = css("tooltip");
@@ -414,7 +460,7 @@ export function relevanceEditor(CM, transport, options = {}) {
           row.textContent = d.message; // plain text, never HTML
         }
         if (fixes.length) {
-          dom.appendChild(actionButtons(view, fixes, () => view.dispatch({ effects: CM.closeHoverTooltips })));
+          dom.appendChild(actionButtons(view, fixes, doc, () => view.dispatch({ effects: CM.closeHoverTooltips })));
         }
         if (contents) {
           const info = dom.appendChild(renderMarkdown(contents));
@@ -423,7 +469,7 @@ export function relevanceEditor(CM, transport, options = {}) {
         return { dom };
       },
     };
-  });
+  }, { hideOnChange: true }); // its text and fixes are for the document as it was
 
   // Mod-. : the quick fixes at the cursor, as a small menu.
   const setMenu = CM.StateEffect.define();
@@ -438,16 +484,21 @@ export function relevanceEditor(CM, transport, options = {}) {
         menu
           ? {
               pos: menu.pos,
-              above: false,
               create(view) {
                 const close = () => view.dispatch({ effects: setMenu.of(null) });
                 const dom = menu.actions.length
-                  ? actionButtons(view, menu.actions, close)
+                  ? actionButtons(view, menu.actions, menu.doc, close)
                   : Object.assign(document.createElement("div"), {
                       className: css("empty"),
                       textContent: "No quick fixes here",
                     });
                 dom.classList.add(css("menu"));
+                // Close when focus moves somewhere other than the menu or the editor.
+                dom.addEventListener("focusout", (event) => {
+                  const next = event.relatedTarget;
+                  if (next && (dom.contains(next) || view.dom.contains(next))) return;
+                  queueMicrotask(() => view.state.field(menuField) && close());
+                });
                 dom.addEventListener("keydown", (event) => {
                   const buttons = [...dom.querySelectorAll("button")];
                   const index = buttons.indexOf(document.activeElement);
@@ -473,15 +524,28 @@ export function relevanceEditor(CM, transport, options = {}) {
       ),
   });
   const openMenu = (view) => {
+    const doc = view.state.doc;
     const { from, to } = view.state.selection.main;
     const here = view.state.field(diagnosticField).list.filter((d) => d.from <= to && from <= d.to);
     const lo = Math.min(from, ...here.map((d) => d.from));
     const hi = Math.max(to, ...here.map((d) => d.to));
     quickFixes(view, lo, hi, here).then((actions) => {
-      if (view.state.selection.main.from === from) view.dispatch({ effects: setMenu.of({ pos: from, actions }) });
+      // Stale (edited meanwhile) or moved: say nothing rather than "no fixes".
+      if (actions === null || view.state.doc !== doc || view.state.selection.main.from !== from) return;
+      view.dispatch({ effects: setMenu.of({ pos: from, actions, doc }) });
     });
     return true;
   };
+  // The empty menu has nothing to focus: close it when the editor loses focus.
+  const blurCloses = CM.EditorView.domEventHandlers({
+    blur(event, view) {
+      if (!view.state.field(menuField) || view.dom.contains(event.relatedTarget)) return false;
+      const menu = document.querySelector(`.${css("menu")}`);
+      if (menu && menu.contains(event.relatedTarget)) return false;
+      queueMicrotask(() => view.state.field(menuField) && view.dispatch({ effects: setMenu.of(null) }));
+      return false;
+    },
+  });
   const keys = CM.Prec.high(
     CM.keymap.of([
       { key: "Mod-.", run: openMenu },
@@ -500,7 +564,7 @@ export function relevanceEditor(CM, transport, options = {}) {
   const completionSource = async (context) => {
     if (!context.explicit) {
       const before = context.state.doc.sliceString(Math.max(0, context.pos - 1), context.pos);
-      if (!/[\w (]/.test(before)) return null;
+      if (!shouldAskImplicitly(before, triggerCharacters)) return null;
     }
     const doc = context.state.doc;
     const result = await request("textDocument/completion", { position: positionAt(doc, context.pos) });
@@ -543,5 +607,5 @@ export function relevanceEditor(CM, transport, options = {}) {
   }
   const theme = CM.EditorView.baseTheme(themeSpec);
 
-  return [diagnosticField, tracker, gutter, hover, menuField, keys, completion, theme];
+  return [diagnosticField, tracker, gutter, hover, menuField, keys, blurCloses, completion, theme];
 }
