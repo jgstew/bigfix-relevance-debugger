@@ -1070,6 +1070,48 @@ async def test_evaluate_uses_the_current_editor_text(user, monkeypatch):
     assert seen == ["version of client"]
 
 
+async def test_enter_in_the_editor_evaluates(user, monkeypatch):
+    seen: list[str] = []
+
+    async def stream(text, targets, opts, **upstream):
+        seen.append(text)
+        yield ClientRelevanceResult(host="local", transport="local", client_relevance=text)
+
+    monkeypatch.setattr(app_module, "stream_results", stream)
+    await user.open("/")
+    await set_text(user, "name of operating system")
+    user.find(marker="target-local").click()
+
+    editor(user).set_value("version of client")
+    user.find(marker="editor").trigger("submit")
+    await asyncio.sleep(0.1)
+
+    assert seen == ["version of client"]
+
+
+async def test_enter_while_running_starts_nothing(user, monkeypatch):
+    release = asyncio.Event()
+    seen: list[str] = []
+
+    async def stream(text, targets, opts, **upstream):
+        seen.append(text)
+        await release.wait()
+        yield ClientRelevanceResult(host="local", transport="local", client_relevance=text)
+
+    monkeypatch.setattr(app_module, "stream_results", stream)
+    await user.open("/")
+    await set_text(user, "name of operating system")
+    user.find(marker="target-local").click()
+
+    user.find(marker="evaluate").click()
+    await asyncio.sleep(0.1)
+    user.find(marker="editor").trigger("submit")
+    await asyncio.sleep(0.1)
+    release.set()
+
+    assert seen == ["name of operating system"]
+
+
 async def test_first_run_discovery_does_not_hold_up_an_explicit_target(monkeypatch):
     release = threading.Event()
     called: list[int] = []

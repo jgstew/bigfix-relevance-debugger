@@ -8,7 +8,9 @@ A small browser GUI for BigFix **client and session relevance**:
 1. **An editor backed by the analyzer's language server**, the same one the
    VS Code extension uses: syntax highlighting with the VS Code grammar's
    rules (keywords, operators, strings, numbers and comments), inspector
-   completion while you type (or Ctrl-Space), hover descriptions of
+   completion while you type (or Ctrl-Space or Tab; Tab or Enter takes the
+   selected suggestion), Enter (no suggestion list open) to **Evaluate**
+   instead of a newline, hover descriptions of
    inspectors, casts and operators, lint findings underlined with a gutter
    marker, and quick fixes from the hover or Mod-. (Cmd-. on macOS),
    including "Replace `x` with `y`" for a misspelled inspector.
@@ -218,12 +220,12 @@ a specific target, select only that one.
    that image, the qna column says so ("fell back from ..."). Click a row's
    chevron to see every answer, the answer types and the raw qna output. The
    first run shows download and image-prep progress in the activity log.
-4. Type `name of op`: completion offers `operating system` first; Enter
-   takes it. Hover `operating system` for what it is and where it exists.
-   Keywords, operators, strings and numbers are colored as you type.
-   Type a typo, e.g. `name of operating sytem`. The text gets a wavy
-   underline and a lint finding appears with suggestions. Hover the
-   underline for the message and a **Replace** button per suggestion (Mod-.
+4. Type `name of op`: completion offers `operating system` first; Tab or
+   Enter takes it, and Enter again evaluates. Hover `operating system` for
+   what it is and where it exists. Keywords, operators, strings and numbers
+   are colored as you type. Type a typo, e.g. `name of operating sytem`.
+   The text gets a wavy underline and a lint finding appears with
+   suggestions. Hover the underline for the message and a **Replace** button per suggestion (Mod-.
    lists the same fixes), or click **operating system** in the findings to
    fix it. For a statement the
    analyzer can fix safely, e.g. `exists values of setting "x" of client`,

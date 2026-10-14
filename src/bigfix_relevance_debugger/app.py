@@ -1092,6 +1092,13 @@ async def root() -> None:
         ui.download.content(payload, "relevance-results.json", "application/json")
 
     evaluate_button.on_click(evaluate)
+
+    def submit() -> None:
+        # Enter in the editor is the Evaluate button, which is disabled while running.
+        if not state.running:
+            evaluate()
+
+    code.on_submit(submit)
     breakdown_button.on_click(breakdown)
     cancel_button.on_click(cancel)
     export_button.on_click(export)
