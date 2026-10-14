@@ -13,6 +13,8 @@ Messages, over NiceGUI's event channel:
   :data:`ALLOWED_REQUESTS`;
 - browser -> Python: ``lspReady`` when the browser editor (re)mounts, so
   Python re-sends the diagnostics it has;
+- browser -> Python: ``submit`` when the user presses Enter (or Shift- or
+  Mod-Enter) with no completion list open; the editor never inserts a newline;
 - Python -> browser: ``lspReply(id, result, error)``, for every request, and
   ``lspNotify(method, params)``, for ``publishDiagnostics`` with the ``text``
   they were computed for, so the browser can drop stale ones.
@@ -26,14 +28,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NoReturn, Self
 
 import bigfix_relevance_analyzer
 import nicegui
 from bigfix_relevance_analyzer import Dialect
 from bigfix_relevance_analyzer.lsp import LspError, StatementSession
 from nicegui import background_tasks, ui
-from nicegui.events import GenericEventArguments
+from nicegui.events import GenericEventArguments, Handler
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +78,11 @@ class RelevanceEditor(
         """One server call at a time, shutdown included: the session isn't thread-safe."""
         self.on("lsp", self._on_lsp)
         self.on("lspReady", self._on_ready)
+
+    def on_submit(self, handler: Handler[GenericEventArguments]) -> Self:
+        """Call ``handler`` when the user presses Enter (no completion list open)."""
+        self.on("submit", handler)
+        return self
 
     @property
     def language(self) -> str:

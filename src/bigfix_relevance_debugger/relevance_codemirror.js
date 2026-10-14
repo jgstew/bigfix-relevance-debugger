@@ -27,6 +27,26 @@ function highlighting() {
   }
 }
 
+// Relevance is one statement: Tab completes and never indents (NiceGUI's
+// ui.codemirror always binds indentWithTab), and Enter evaluates and never
+// inserts a newline. NiceGUI's bundle doesn't export @codemirror/autocomplete,
+// so Tab runs basicSetup's own completion keys: Enter accepts the selected
+// option, Ctrl-Space opens the list. The content element has
+// aria-activedescendant only while the list is open with an option selected.
+function completionOpen(view) {
+  return view.contentDOM.hasAttribute("aria-activedescendant");
+}
+function runKey(view, key, ctrlKey = false) {
+  return CM.runScopeHandlers(view, new KeyboardEvent("keydown", { key, ctrlKey }), "editor");
+}
+function tabCompletes(view) {
+  // If autocomplete declines the Enter (within its interactionDelay of the
+  // list opening), the host's own Enter swallows it: no newline, no submit.
+  if (completionOpen(view)) runKey(view, "Enter");
+  else runKey(view, " ", true);
+  return true;
+}
+
 export default {
   extends: Base,
   methods: {
@@ -42,6 +62,10 @@ export default {
           }),
         onNotification: (handler) => lsp.handlers.push(handler),
       };
+      const submit = (view) => {
+        if (!completionOpen(view)) this.$emit("submit");
+        return true;
+      };
       const extensions = [
         ...Base.methods.setupExtensions.call(this),
         // The page's fixed header (NiceGUI's ui.header, a q-header) covers the
@@ -54,6 +78,17 @@ export default {
             return { top, left: 0, bottom: window.innerHeight, right: window.innerWidth };
           },
         }),
+        CM.Prec.high(
+          CM.keymap.of([
+            { key: "Tab", run: tabCompletes },
+            { key: "Shift-Tab", run: () => true },
+            // Every key basicSetup binds to a newline. Autocomplete's Enter is
+            // Prec.highest, so an open list has already had its chance to accept.
+            { key: "Enter", shift: submit, run: submit },
+            { key: "Mod-Enter", run: submit },
+            { mac: "Ctrl-o", run: () => true },
+          ]),
+        ),
         ...highlighting(),
         relevanceEditor(CM, transport),
       ];
