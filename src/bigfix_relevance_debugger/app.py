@@ -95,7 +95,7 @@ T = TypeVar("T")
 
 TITLE = "BigFix Relevance Debugger"
 LOGO = Path(__file__).with_name("logo.svg")
-"""bigfix-relevance-analyzer's light logo (docs/images/logo.svg): favicon and header."""
+"""bigfix-relevance-analyzer's light logo (docs/images/logo.svg): favicon, header and Dock icon."""
 DEBOUNCE_S = 0.3
 FILTER_DEBOUNCE_S = 0.2
 """Each filter change resends the results table, so wait for typing to pause."""
@@ -1476,6 +1476,9 @@ def main(argv: list[str] | None = None) -> None:
     }
     if native:
         kwargs["window_size"] = WINDOW_SIZE
+        # The favicon doesn't reach the macOS Dock, which shows Python's rocket
+        # unless pywebview is given an icon (Windows uses the favicon).
+        nicegui_app.native.start_args["icon"] = str(LOGO)
     if args.port is not None:
         kwargs["port"] = args.port
     nicegui_app.on_shutdown(close_session_clients)
