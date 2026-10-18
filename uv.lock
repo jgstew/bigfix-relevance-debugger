@@ -10,8 +10,6 @@ exclude-newer-span = "P7D"
 besapi = { timestamp = "0001-01-01T00:00:00Z", span = "PT0S" }
 bigfix-relevance-analyzer = { timestamp = "0001-01-01T00:00:00Z", span = "PT0S" }
 bigfix-remote-client-relevance = { timestamp = "0001-01-01T00:00:00Z", span = "PT0S" }
-nicegui = { timestamp = "0001-01-01T00:00:00Z", span = "PT0S" }
-ruff = { timestamp = "0001-01-01T00:00:00Z", span = "PT0S" }
 
 [[package]]
 name = "aiofiles"

@@ -48,10 +48,7 @@ def test_dependencies_have_a_seven_day_cooldown():
 # Temporary exemptions, each until its pinned floor is 7 days old: the
 # cooldown came in after these floors were raised to releases from that week.
 # Remove the entry (here and in pyproject.toml) once its date has passed.
-TEMPORARY = {
-    "nicegui": datetime.date(2026, 10, 14),  # nicegui[native]>=3.18.0, out 2026-10-07
-    "ruff": datetime.date(2026, 10, 16),  # ruff>=0.17.0, out 2026-10-09
-}
+TEMPORARY: dict[str, datetime.date] = {}
 
 
 def test_jgstew_packages_and_only_they_skip_the_cooldown():
