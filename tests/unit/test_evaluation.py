@@ -1310,7 +1310,7 @@ def test_summary_when_filtered_says_showing_n_of_m_and_the_query():
     rows = [row("a", ["debian"]), row("b"), row("c", error="boom")]
 
     assert results_summary(rows, 1, " debian ") == (
-        'Showing 1 of 3 results: hosts with an answer or error containing "debian"'
+        'Showing 1 of 3 results: systems with an answer or error containing "debian"'
     )
 
 
@@ -2103,6 +2103,18 @@ def test_tally_limit_hides_the_rarest_answers_and_counts_them():
     assert [r.label for r in shown] == [*common, NO_ANSWERS]
 
 
+def test_tally_rows_are_reused_until_the_next_add():
+    # The page asks after every result; a big session answer set made each
+    # ask rebuild and sort every distinct answer.
+    tally = tallied(server_row([f"c{i}" for i in range(100)]), row("a", ["c1"]))
+
+    first = tally.rows(10)
+    assert tally.rows(10) is first
+    tally.add(row("b", ["c2"]))
+    assert tally.rows(10) is not first
+    assert counts(tally, 3) == [("c1", 2), ("c2", 2), ("c0", 1)]
+
+
 def test_tally_shows_an_empty_string_answer_as_quotes():
     assert counts(tallied(row("a", [""]))) == [('""', 1)]
 
@@ -2111,6 +2123,30 @@ def test_tally_counts_each_deployment_as_one_system():
     tally = tallied(server_row(["x", "y"]), row("a", ["x"]))
 
     assert counts(tally) == [("x", 2), ("y", 1)]
+    assert tally.systems == 2
+
+
+def test_tally_leaves_out_the_no_server_config_row():
+    # It says how to add a server; it isn't a system that answered.
+    config = ResultRow.from_session(
+        evaluation.SessionEvaluation(
+            "q", evaluation.SESSION_HOST_UNKNOWN, error="No server", error_kind="config"
+        )
+    )
+    tally = tallied(config, row("a", ["x"]))
+
+    assert counts(tally) == [("x", 1)]
+    assert tally.systems == 1
+    assert config.tally_keys == ()
+
+
+def test_tally_counts_a_session_error_as_a_system():
+    failed = ResultRow.from_session(
+        evaluation.SessionEvaluation("q", "bigfix.example.com", error="no", error_kind="tls")
+    )
+    tally = tallied(failed, row("a", ["x"]))
+
+    assert counts(tally) == [("x", 1), ("error: tls", 1)]
     assert tally.systems == 2
 
 
@@ -2262,13 +2298,13 @@ def test_summary_with_pick_says_which_answer():
 
     assert (
         results_summary(PICK_FLEET, 4, "", debian)
-        == 'Showing 4 of 6 results: hosts answering "Linux Debian 11"'
+        == 'Showing 4 of 6 results: systems answering "Linux Debian 11"'
     )
     assert results_summary(PICK_FLEET, 2, "", TallyRow("empty", "", 1).key).endswith(
-        "hosts with no answers"
+        "systems with no answers"
     )
     assert results_summary(PICK_FLEET, 1, "", TallyRow("error", "transport", 1).key).endswith(
-        "hosts with an error (transport)"
+        "systems with an error (transport)"
     )
 
 
@@ -2276,14 +2312,14 @@ def test_summary_with_pick_and_query():
     debian = TallyRow("answer", "Linux Debian 11", 1).key
 
     assert results_summary(PICK_FLEET, 1, " extra ", debian) == (
-        'Showing 1 of 6 results: hosts answering "Linux Debian 11" '
+        'Showing 1 of 6 results: systems answering "Linux Debian 11" '
         'and an answer or error containing "extra"'
     )
 
 
 def test_summary_query_only_is_unchanged():
     assert results_summary(PICK_FLEET, 3, "debian") == (
-        'Showing 3 of 6 results: hosts with an answer or error containing "debian"'
+        'Showing 3 of 6 results: systems with an answer or error containing "debian"'
     )
 
 

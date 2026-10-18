@@ -1690,7 +1690,7 @@ async def test_search_summary_says_showing_n_of_m(user, monkeypatch):
     await search(user, "debian")
 
     await user.should_see(
-        'Showing 3 of 5 results: hosts with an answer or error containing "debian"'
+        'Showing 3 of 5 results: systems with an answer or error containing "debian"'
     )
 
 
@@ -2136,6 +2136,9 @@ async def test_no_server_still_shows_when_both_was_picked(user, monkeypatch):
     await user.should_see("2 / 2")
     rows = results_table(user).rows
     assert [(r["dialect"], r["status"]) for r in rows] == [("session", "config"), ("client", "ok")]
+    # The config row says how to add a server; it isn't a second system.
+    assert answer_rows(user) == [("a", 1)]
+    await user.should_not_see(marker="answers-section")
 
 
 async def test_no_server_still_shows_when_session_is_all_that_runs(user, monkeypatch):
@@ -2557,7 +2560,7 @@ async def test_pick_summary_line(user, monkeypatch):
 
     await pick(user, "Linux Debian 11")
 
-    assert summary_text(user) == 'Showing 3 of 5 results: hosts answering "Linux Debian 11"'
+    assert summary_text(user) == 'Showing 3 of 5 results: systems answering "Linux Debian 11"'
 
 
 async def test_pick_does_not_auto_expand(user, monkeypatch):

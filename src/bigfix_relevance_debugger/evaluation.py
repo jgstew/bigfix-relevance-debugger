@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import functools
+import heapq
 import logging
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
@@ -1157,9 +1158,9 @@ def results_summary(
     showing = f"Showing {shown} of {_plural(len(rows), 'result')}"
     if pick is not None:
         also = f' and an answer or error containing "{needle}"' if needle else ""
-        return f"{showing}: hosts {pick_phrase(pick)}{also}"
+        return f"{showing}: systems {pick_phrase(pick)}{also}"
     if needle:
-        return f'{showing}: hosts with an answer or error containing "{needle}"'
+        return f'{showing}: systems with an answer or error containing "{needle}"'
     answered = sum(1 for r in rows if r.ok and r.answers)
     empty = sum(1 for r in rows if r.ok and not r.answers)
     errors = len(rows) - answered - empty
@@ -1216,7 +1217,7 @@ def pick_label(key: str) -> str:
 
 
 def pick_phrase(key: str) -> str:
-    """How the results summary describes the hosts a pick keeps."""
+    """How the results summary describes the systems a pick keeps."""
     kind, value = _split_key(key)
     if kind == EMPTY:
         return "with no answers"
@@ -1226,6 +1227,8 @@ def pick_phrase(key: str) -> str:
 
 
 def _row_keys(row: ResultRow) -> list[str]:
+    if row.dialect == "session" and row.status == "config":
+        return []  # says how to add a server; no system answered
     if not row.ok:
         return [TallyRow(ERROR, row.status, 0).key]
     if not row.answers:
@@ -1239,18 +1242,31 @@ class AnswerTally:
     A system is a ``ResultRow.group``: a client host by ``display_host``, so
     one listing several qna versions counts once per answer, and one whose
     versions disagree counts under each; a BigFix deployment's session result
-    is one system too, apart from that root server's own client result.
+    is one system too, apart from that root server's own client result. The
+    ``config`` row (no BigFix server) isn't a system, so it isn't counted.
     """
 
     def __init__(self) -> None:
         # key -> groups, in arrival order (the last tie-break).
         self._hosts: dict[str, dict[tuple[str, str], None]] = {}
         self._systems: dict[tuple[str, str], None] = {}
+        # Per key, what rows() sorts on that never changes: (kind, value, casefold).
+        self._parts: dict[str, tuple[str, str, str]] = {}
+        # The last rows(), by limit; any add changes it.
+        self._rows: dict[int, tuple[list[TallyRow], int]] = {}
 
     def add(self, row: ResultRow) -> None:
+        if not row.tally_keys:
+            return
+        self._rows.clear()
         self._systems[row.group] = None
         for key in row.tally_keys:
-            self._hosts.setdefault(key, {})[row.group] = None
+            hosts = self._hosts.get(key)
+            if hosts is None:
+                hosts = self._hosts[key] = {}
+                kind, value = _split_key(key)
+                self._parts[key] = kind, value, value.casefold()
+            hosts[row.group] = None
 
     @property
     def systems(self) -> int:
@@ -1262,16 +1278,23 @@ class AnswerTally:
         Answers by systems, highest first, then text ignoring case, then
         arrival; then no answers; then errors by kind. Empty and error rows
         are never cut and always go last: they aren't answers.
+
+        Reused until the next ``add``: the page asks after every result, and
+        one session result can bring thousands of distinct answers, so this
+        picks the top ``limit`` rather than sorting them all.
         """
-        arrival = {key: i for i, key in enumerate(self._hosts)}
-        by_kind: dict[str, list[TallyRow]] = {kind: [] for kind in _TALLY_KINDS}
-        for key, hosts in self._hosts.items():
-            kind, value = _split_key(key)
-            by_kind[kind].append(TallyRow(kind, value, len(hosts)))
-        for kind_rows in by_kind.values():
-            kind_rows.sort(key=lambda r: (-r.systems, r.value.casefold(), arrival[r.key]))
+        cached = self._rows.get(limit)
+        if cached is not None:
+            return cached
+        by_kind: dict[str, list[tuple[int, str, int, str]]] = {kind: [] for kind in _TALLY_KINDS}
+        for arrival, (key, hosts) in enumerate(self._hosts.items()):
+            kind, _, folded = self._parts[key]
+            by_kind[kind].append((-len(hosts), folded, arrival, key))
         answers = by_kind[ANSWER]
-        return answers[:limit] + by_kind[EMPTY] + by_kind[ERROR], max(0, len(answers) - limit)
+        top = heapq.nsmallest(limit, answers) + sorted(by_kind[EMPTY]) + sorted(by_kind[ERROR])
+        shown = [TallyRow(*self._parts[key][:2], -negative) for negative, _, _, key in top]
+        result = self._rows[limit] = shown, max(0, len(answers) - limit)
+        return result
 
 
 def tally_table_row(row: TallyRow, total_systems: int, pick: str | None) -> Cells:
