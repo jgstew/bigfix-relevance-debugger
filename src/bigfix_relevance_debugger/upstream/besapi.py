@@ -135,8 +135,23 @@ def session_relevance_result(conn: Any, relevance: str, **kwargs: Any) -> Sessio
     try:
         return parse_query_result(relevance, response.text)
     except ValueError as exc:
-        status = getattr(getattr(response, "request", None), "status_code", None)
-        raise ValueError(f"HTTP {status}: {exc}") from exc
+        raise ValueError(f"HTTP {_status(response)}: {exc}") from exc
+
+
+def _status(response: Any) -> int | None:
+    """The HTTP status of a ``RESTResult`` (its ``request`` is the ``requests`` response)."""
+    return getattr(getattr(response, "request", None), "status_code", None)
+
+
+def _is_explorer_answer(response: Any) -> bool:
+    """Whether ``response`` is Explorer's answer to the probe: 200 with ``"result": [1]``."""
+    if _status(response) != 200:
+        return False
+    try:
+        answer = json.loads(response.text)
+    except ValueError:
+        return False
+    return isinstance(answer, dict) and answer.get("result") == [1]
 
 
 def forget_query_encoding(conn: Any = None) -> None:
@@ -155,9 +170,13 @@ def explorer_answers_query(conn: Any, **kwargs: Any) -> bool:
     """Whether BigFix Explorer answers ``/api/query`` on ``conn``'s root server.
 
     Probes with an ``application/json+relevance`` query of ``1``: only Explorer
-    answers that with 200 (Web Reports alone gives 503). Anything else,
-    including an exception, is False. Cached per connection and root server for
-    ``EXPLORER_RECHECK_SECONDS``. ``kwargs`` go to the probe's request.
+    answers that with 200 and ``{"result": [1], ...}`` (Web Reports alone gives
+    503). Anything else is False: a 200 that isn't Explorer's answer (e.g. a
+    proxy's login page), another status, or an exception. An HTTP answer is
+    cached per connection and root server for ``EXPLORER_RECHECK_SECONDS``
+    (including one raised as ``requests.HTTPError``); any other exception is
+    not, so a network blip doesn't stick. ``kwargs`` go to the
+    probe's request.
 
     Upstream: a cached ``BESConnection`` method.
     """
@@ -173,15 +192,28 @@ def explorer_answers_query(conn: Any, **kwargs: Any) -> bool:
         response = conn.post(
             "query", data=json.dumps({"relevance": "1"}), headers=headers, **kwargs
         )
-        status = getattr(getattr(response, "request", None), "status_code", None)
-        explorer = status == 200
-        _logger.debug("query encoding probe of %s: HTTP %s", root, status)
-    except Exception:  # an older server, auth, network: assume Web Reports
+    except Exception as exc:  # network, or raise_for_status: assume Web Reports
         _logger.debug("query encoding probe of %s failed", root, exc_info=True)
+        # requests.HTTPError carries the server's answer: cache it like one.
+        # Anything else (a timeout, a reset) is asked again next time.
+        response = getattr(exc, "response", None)
+        if response is None:
+            return False
         explorer = False
+    else:
+        explorer = _is_explorer_answer(response)
+    _logger.debug(
+        "query encoding probe of %s: HTTP %s, explorer=%s",
+        root,
+        getattr(response, "status_code", None) or _status(response),
+        explorer,
+    )
     with _probe_lock:
         if id(conn) not in _probed:
-            weakref.finalize(conn, _probed.pop, id(conn), None)
+            try:
+                weakref.finalize(conn, _probed.pop, id(conn), None)
+            except TypeError:  # no weakref support: no way to drop the entry, so don't cache
+                return explorer
         _probed[id(conn)] = (root, explorer, now)
     return explorer
 

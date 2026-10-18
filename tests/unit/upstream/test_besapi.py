@@ -139,9 +139,12 @@ class QueryServer:
     def __eq__(self, other: object) -> bool:
         return isinstance(other, QueryServer) and other.rootserver == self.rootserver
 
-    def __init__(self, state: str, probe_status: int | None = None) -> None:
+    def __init__(
+        self, state: str, probe_status: int | None = None, probe_body: str | None = None
+    ) -> None:
         self.state = state
         self.probe_status = probe_status
+        self.probe_body = probe_body
         self.rootserver = "https://root.example:52311"
         self.posts: list[tuple[str, object, dict]] = []
 
@@ -159,7 +162,9 @@ class QueryServer:
         if _is_probe(kwargs):
             assert json.loads(data) == {"relevance": "1"}
             status = self.probe_status or (200 if self.state == "explorer" else 503)
-            return _response('{"result":[1]}' if status == 200 else "unavailable", status)
+            if self.probe_body is not None:
+                return _response(self.probe_body, status)
+            return _response(EXPLORER_PROBE_ANSWER if status == 200 else "unavailable", status)
         return _response(self._answer(self.evaluated(data)))
 
     def evaluated(self, data) -> str:
@@ -177,6 +182,12 @@ class QueryServer:
             f"<Answer type='string'>{xml_escape(text)}</Answer>"
             "</Result></Query></BESAPI>"
         )
+
+
+# Explorer's answer to the probe, recorded from a live root server (2026-10-18).
+EXPLORER_PROBE_ANSWER = (
+    '{"result":[1],"count":1,"plural":false,"type":"integer","evaltime_ms":0.04}'
+)
 
 
 def _is_probe(kwargs: dict) -> bool:
@@ -324,6 +335,85 @@ def test_a_probe_that_raises_means_encode_twice(caplog):
 
     assert result.answers == ('("x%22y")',)
     assert "probe" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "body", ["<html>Sign in</html>", '{"result":[]}', '{"error":"no"}', "[1]", ""]
+)
+def test_a_200_probe_without_explorers_answer_means_encode_twice(body):
+    # e.g. a proxy's login page: encoding once would let Web Reports decode
+    # ("%2541") into ("%41") without any error.
+    conn = QueryServer("web_reports", probe_status=200, probe_body=body)
+
+    result = session_relevance_result(conn, '("%2541")')
+
+    assert result.answers == ('("%2541")',)
+    assert conn.queries == [{"relevance": quote('("%2541")', safe=":+")}]
+
+
+def test_a_probe_that_raises_is_not_cached():
+    conn = QueryServer("explorer")
+    real_post = conn.post
+    fail = [True]
+
+    def post(path, data, **kwargs):
+        if _is_probe(kwargs) and fail[0]:
+            conn.posts.append((path, data, kwargs))
+            fail[0] = False
+            raise TimeoutError("read timed out")
+        return real_post(path, data, **kwargs)
+
+    conn.post = post  # type: ignore[method-assign]
+
+    session_relevance_result(conn, '("x%22y")')
+    result = session_relevance_result(conn, '("x%22y")')
+
+    assert len(conn.probes) == 2
+    assert result.answers == ('("x%22y")',)
+
+
+def test_an_http_error_from_raise_for_status_is_cached():
+    # BESConnection(raise_for_status=True) raises requests.HTTPError for the
+    # 503: that is the server's answer, not a network blip.
+    conn = QueryServer("web_reports")
+    real_post = conn.post
+
+    def post(path, data, **kwargs):
+        response = real_post(path, data, **kwargs)
+        if response.request.status_code >= 400:
+            error = OSError("503 Server Error")
+            error.response = response.request  # type: ignore[attr-defined]
+            raise error
+        return response
+
+    conn.post = post  # type: ignore[method-assign]
+
+    session_relevance_result(conn, '("x%22y")')
+    result = session_relevance_result(conn, '("x%22y")')
+
+    assert len(conn.probes) == 1
+    assert result.answers == ('("x%22y")',)
+
+
+def test_a_connection_without_weakref_support_still_works():
+    class SlotConnection:
+        __slots__ = ("server",)
+
+        def __init__(self) -> None:
+            self.server = QueryServer("explorer")
+
+        @property
+        def rootserver(self) -> str:
+            return self.server.rootserver
+
+        def post(self, path, data, **kwargs):
+            return self.server.post(path, data, **kwargs)
+
+    conn = SlotConnection()
+
+    assert session_relevance_result(conn, '("x%22y")').answers == ('("x%22y")',)
+    assert session_relevance_result(conn, '("x%22y")').answers == ('("x%22y")',)
+    assert len(conn.server.probes) == 2  # not cached: no way to drop the entry later
 
 
 def test_probe_is_cached_per_connection(monkeypatch):
