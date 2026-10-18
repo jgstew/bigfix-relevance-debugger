@@ -73,6 +73,7 @@ def captured_run(monkeypatch):
     monkeypatch.setattr(app_module, "_log_level", logging.INFO)
     # Native mode is available unless a test says otherwise.
     monkeypatch.setattr(app_module, "native_window_problem", lambda: None)
+    monkeypatch.setattr(app_module.nicegui_app.native, "start_args", {})
     return calls
 
 
@@ -92,6 +93,13 @@ def test_main_uses_the_logo_as_favicon(captured_run):
     [call] = captured_run
     assert call["favicon"] == app_module.LOGO
     assert app_module.LOGO.is_file()
+
+
+def test_native_window_uses_the_logo_as_app_icon(captured_run):
+    # pywebview's icon sets the macOS Dock icon, which is Python's otherwise.
+    main([])
+
+    assert app_module.nicegui_app.native.start_args["icon"] == str(app_module.LOGO)
 
 
 def test_main_defaults_to_a_native_window(captured_run):
@@ -137,7 +145,8 @@ def test_native_unavailable_falls_back_to_a_browser_tab(captured_run, monkeypatc
 
 def test_main_closes_the_session_clients_on_shutdown(captured_run, monkeypatch):
     handlers: list = []
-    monkeypatch.setattr(app_module, "nicegui_app", SimpleNamespace(on_shutdown=handlers.append))
+    fake_app = SimpleNamespace(on_shutdown=handlers.append, native=SimpleNamespace(start_args={}))
+    monkeypatch.setattr(app_module, "nicegui_app", fake_app)
 
     main([])
 
