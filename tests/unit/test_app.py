@@ -1690,7 +1690,7 @@ async def test_search_summary_says_showing_n_of_m(user, monkeypatch):
     await search(user, "debian")
 
     await user.should_see(
-        'Showing 3 of 5 results: hosts with an answer or error containing "debian"'
+        'Showing 3 of 5 results: systems with an answer or error containing "debian"'
     )
 
 
@@ -2136,6 +2136,9 @@ async def test_no_server_still_shows_when_both_was_picked(user, monkeypatch):
     await user.should_see("2 / 2")
     rows = results_table(user).rows
     assert [(r["dialect"], r["status"]) for r in rows] == [("session", "config"), ("client", "ok")]
+    # The config row says how to add a server; it isn't a second system.
+    assert answer_rows(user) == [("a", 1)]
+    await user.should_not_see(marker="answers-section")
 
 
 async def test_no_server_still_shows_when_session_is_all_that_runs(user, monkeypatch):
@@ -2402,7 +2405,7 @@ async def test_clear_removes_the_answer_summary(user, monkeypatch):
     assert answers_table(user).rows == []
 
 
-async def test_answer_summary_ignores_session_results(user, monkeypatch):
+async def test_answer_summary_counts_session_results(user, monkeypatch):
     monkeypatch.setattr(app_module, "stream_session", fake_session([]))
     monkeypatch.setattr(
         app_module, "stream_results", stream_of(result("a", ["x"]), result("b", ["y"]))
@@ -2415,9 +2418,23 @@ async def test_answer_summary_ignores_session_results(user, monkeypatch):
     user.find(marker="evaluate").click()
 
     await user.should_see("3 / 3")
-    assert answer_rows(user) == [("x", 1), ("y", 1)]
+    assert answer_rows(user) == [("35", 1), ("x", 1), ("y", 1)]
     [title] = user.find(marker="answers-title").elements
-    assert "2 systems" in title.text
+    assert "3 systems" in title.text
+
+
+async def test_answer_summary_shows_for_session_only_relevance(user, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(app_module, "stream_session", fake_session(calls, "prod", "test"))
+    monkeypatch.setattr(app_module, "expected_session_results", lambda *a, **k: 2)
+    await user.open("/")
+    await set_text(user, "number of bes computers")
+
+    user.find(marker="evaluate").click()
+
+    await user.should_see("2 / 2")
+    assert answer_rows(user) == [("35", 2)]
+    await user.should_see(marker="answers-section")
 
 
 async def test_each_result_is_tallied_once(user, monkeypatch):
@@ -2543,7 +2560,7 @@ async def test_pick_summary_line(user, monkeypatch):
 
     await pick(user, "Linux Debian 11")
 
-    assert summary_text(user) == 'Showing 3 of 5 results: hosts answering "Linux Debian 11"'
+    assert summary_text(user) == 'Showing 3 of 5 results: systems answering "Linux Debian 11"'
 
 
 async def test_pick_does_not_auto_expand(user, monkeypatch):
