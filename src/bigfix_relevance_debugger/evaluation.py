@@ -12,13 +12,12 @@ import asyncio
 import dataclasses
 import functools
 import logging
-import threading
-import time
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
-from contextlib import aclosing
+from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 from bigfix_remote_client_relevance import (
     ClientRelevanceResult,
@@ -32,9 +31,16 @@ from bigfix_remote_client_relevance import (
 from bigfix_remote_client_relevance.bootstrap.targets import host_arch, normalize_arch
 from bigfix_remote_client_relevance.discovery import ImageSource, default_image_source
 from bigfix_remote_client_relevance.render import display_host
+from bigfix_remote_session_relevance import (
+    AsyncSessionRelevanceClient,
+    Config,
+    ConfigError,
+    SessionRelevanceResult,
+    TrustStore,
+    load_config,
+)
 
 from bigfix_relevance_debugger.analysis import AnalysisView, LevelView
-from bigfix_relevance_debugger.upstream.besapi import session_relevance_result
 from bigfix_relevance_debugger.upstream.relevance_analyzer import summarize_count_results
 from bigfix_relevance_debugger.upstream.remote_client_relevance import (
     SUPPORTED_ARCHS,
@@ -309,7 +315,7 @@ def inventory_table_row(key: int, target: Target) -> Cells:
 # --- target preview -------------------------------------------------------------------
 
 SESSION_TARGET = "BigFix server"
-"""How the target count names the root server session relevance runs on."""
+"""How the target count names a deployment session relevance runs on."""
 
 
 def waits_for_inventory(form: TargetForm, *, pending: bool) -> bool:
@@ -339,7 +345,16 @@ class TargetPreview:
     """Why nothing would run (the ``TargetFormError`` message)."""
     unresolved_images: tuple[str, ...] = ()
     session: bool = False
-    """Session relevance runs on the root server too (or only, with no systems)."""
+    """Session relevance runs on the BigFix servers too (or only, with no systems)."""
+    session_servers: int = 1
+    """Session results the run yields: one per configured deployment."""
+
+    @property
+    def session_text(self) -> str:
+        """``"BigFix server"`` for one, ``"2 BigFix servers"`` for several."""
+        if self.session_servers == 1:
+            return SESSION_TARGET
+        return _plural(self.session_servers, SESSION_TARGET)
 
     @property
     def text(self) -> str:
@@ -347,11 +362,11 @@ class TargetPreview:
         if self.systems is None:
             text = "finding inventory …"
         elif self.session and self.systems == 0:
-            return SESSION_TARGET
+            return self.session_text
         else:
             bound = "" if self.exact else "≥ "
             text = f"{bound}{_plural(self.systems, 'system')}"
-        return f"{text} + {SESSION_TARGET}" if self.session else text
+        return f"{text} + {self.session_text}" if self.session else text
 
     @property
     def detail(self) -> str:
@@ -368,7 +383,8 @@ class TargetPreview:
         if self.unresolved_images:
             parts.append(f"arches of {', '.join(self.unresolved_images)} not looked up yet")
         if self.session:
-            parts.append(f"session relevance on the {SESSION_TARGET}")
+            on = "the " if self.session_servers == 1 else ""
+            parts.append(f"session relevance on {on}{self.session_text}")
         return "; ".join(parts)
 
 
@@ -381,6 +397,7 @@ def preview_targets(
     inventory_pending: bool,
     client: bool = True,
     session: bool = False,
+    session_servers: int = 1,
 ) -> TargetPreview:
     """What Evaluate would target right now, by its own rules.
 
@@ -388,19 +405,22 @@ def preview_targets(
     the run. ``client=False`` (session relevance only) needs no targets; with
     ``session``, having none selected isn't a problem either (the run goes
     ahead as session only), but a selected target with a bad field still is.
+    ``session_servers`` is ``expected_session_results()``, as progress uses.
     """
     if not client:
-        return TargetPreview(systems=0, session=session)
+        return TargetPreview(systems=0, session=session, session_servers=session_servers)
     if inventory_pending and waits_for_inventory(form, pending=True):
-        return TargetPreview(systems=None, session=session)
+        return TargetPreview(systems=None, session=session, session_servers=session_servers)
     try:
         targets = build_targets(form, inventory, image_arches)
     except NoTargetsError as exc:
         if session:
-            return TargetPreview(systems=0, session=True)
+            return TargetPreview(systems=0, session=True, session_servers=session_servers)
         return TargetPreview(systems=0, problem=str(exc))
     except TargetFormError as exc:
-        return TargetPreview(systems=0, problem=str(exc), session=session)
+        return TargetPreview(
+            systems=0, problem=str(exc), session=session, session_servers=session_servers
+        )
 
     unresolved: tuple[str, ...] = ()
     if form.container and AUTO_ARCH in form.container_arches:
@@ -418,6 +438,7 @@ def preview_targets(
         sources=tuple((name, n) for name, n in sources if n),
         unresolved_images=unresolved,
         session=session,
+        session_servers=session_servers,
     )
 
 
@@ -493,117 +514,21 @@ async def stream_results(
 # --- session relevance ----------------------------------------------------------------
 
 SESSION_CONNECT_TIMEOUT_S = 5.0
-"""Connect timeout for session queries; besapi's default waits 90 s for a dead server."""
+"""Connect timeout for session queries, so a dead server fails fast; the read
+timeout is the run's own."""
 SESSION_HOST_UNKNOWN = "BigFix server"
-"""The session row's host before a connection says which server it is."""
+"""The session row's host when no connection says which server it is."""
 
-_NO_BESAPI_CONFIG = (
-    "No BigFix server is configured for session relevance. Set BES_ROOT_SERVER, "
-    "BES_USER_NAME and BES_PASSWORD, or add them to a [besapi] section in "
-    "~/.besapi.conf (also read: /etc/besapi.conf, ~/besapi.conf, ./besapi.conf). "
-    "On a root server its own credentials are used."
+NO_SESSION_CONFIG = (
+    "No BigFix server is configured for session relevance. Run "
+    "`uvx bigfix-remote-session-relevance --setup`, or set BES_ROOT_SERVER, "
+    "BES_USER_NAME and BES_PASSWORD, or add them to a [besapi] section in ~/.besapi.conf."
 )
-
-
-class SessionConfigError(Exception):
-    """besapi found no credentials anywhere it looks."""
-
-
-def _besapi_connection() -> Any:
-    """besapi's plugin connection: root server credentials, then env vars, then config files.
-
-    Looked up on each call (not imported by name) so it can be replaced.
-    """
-    from besapi import plugin_utilities
-
-    return plugin_utilities.get_besapi_connection(None)
-
-
-def _server_host(conn: Any) -> str:
-    root = str(getattr(conn, "rootserver", "") or "")
-    return root.split("://", 1)[-1].rsplit(":", 1)[0] or SESSION_HOST_UNKNOWN
-
-
-class SessionConnector:
-    """One besapi connection, made on first use and reused; blocking, so call from a thread.
-
-    Connecting happens under a lock, so concurrent first runs make one login.
-    Queries run outside it: a slow query, or one a cancelled run left going in
-    its thread, must not hold up the next run or another page. They share the
-    connection's ``requests.Session``, whose connection pool and cookie jar are
-    thread-safe; besapi's ``post`` only stamps ``last_connected``. A failed
-    query drops the connection it used (not a newer one), so the next run
-    connects afresh.
-    """
-
-    def __init__(self, factory: Callable[[], Any] | None = None) -> None:
-        self._factory = factory
-        self._lock = threading.Lock()
-        self._conn: Any = None
-        self.host = SESSION_HOST_UNKNOWN
-
-    def _connect(self) -> Any:
-        conn = (self._factory or _besapi_connection)()
-        if conn is None:
-            raise SessionConfigError(_NO_BESAPI_CONFIG)
-        self.host = _server_host(conn)
-        return conn
-
-    def _connection(self) -> Any:
-        with self._lock:
-            if self._conn is None:
-                self._conn = self._connect()
-            return self._conn
-
-    def _drop(self, conn: Any) -> None:
-        with self._lock:
-            # Another run may already have reconnected; keep that one.
-            if self._conn is conn:
-                self._conn = None
-
-    def query(self, relevance: str, timeout_s: float) -> SessionEvaluation:
-        started = time.monotonic()
-
-        def failed(kind: str, error: str) -> SessionEvaluation:
-            return SessionEvaluation(
-                relevance, self.host, error=error, error_kind=kind, elapsed_ms=_ms(started)
-            )
-
-        try:
-            conn = self._connection()
-        except SessionConfigError as exc:
-            return failed("config", str(exc))
-        except Exception as exc:  # bad credentials, no route, ...
-            logger.debug("besapi connection failed", exc_info=True)
-            return failed("connection", f"{type(exc).__name__}: {exc}")
-        try:
-            result = session_relevance_result(
-                conn, relevance, timeout=(SESSION_CONNECT_TIMEOUT_S, timeout_s)
-            )
-        except Exception as exc:  # network, HTTP, a non-XML answer
-            logger.debug("session query failed", exc_info=True)
-            self._drop(conn)
-            return failed("connection", f"{type(exc).__name__}: {exc}")
-        return SessionEvaluation(
-            relevance,
-            self.host,
-            answers=result.answers,
-            answer_types=result.answer_types,
-            plural=result.plural,
-            evaluation_time=result.evaluation_time,
-            error=result.error,
-            error_kind=None if result.ok else "relevance",
-            elapsed_ms=_ms(started),
-        )
-
-
-def _ms(started: float) -> int:
-    return int((time.monotonic() - started) * 1000)
 
 
 @dataclass(frozen=True)
 class SessionEvaluation:
-    """One session relevance query on the root server, ready to show."""
+    """One deployment's answer to a session relevance query, ready to show."""
 
     session_relevance: str
     host: str
@@ -614,40 +539,246 @@ class SessionEvaluation:
     """The server's own evaluation time, e.g. ``"0.31ms"``."""
     error: str | None = None
     error_kind: str | None = None
-    """``"relevance"`` (the server rejected it), ``"config"`` (no credentials
-    anywhere) or ``"connection"`` (login, network or HTTP failure)."""
+    """The library's ``ResultError.kind`` (``"session_relevance"``,
+    ``"authentication"``, ``"connection"``, ``"tls"``, ...), or this app's
+    ``"config"``: nothing configured, or the config file is broken."""
     elapsed_ms: int | None = None
     """Wall time of the query, including connecting when it had to."""
+    connection: str | None = None
+    """The configured connection that answered: which deployment this is."""
+    backend: str | None = None
+    """``rest``, ``explorer``, ``webreports`` or ``saas``."""
+    deployment_id: str | None = None
 
     @property
     def ok(self) -> bool:
         return self.error is None
 
 
-_default_connector: SessionConnector | None = None
+def _config_problem(session_relevance: str, message: str) -> SessionEvaluation:
+    return SessionEvaluation(
+        session_relevance, SESSION_HOST_UNKNOWN, error=message, error_kind="config"
+    )
 
 
-def default_connector() -> SessionConnector:
-    """The process's connector, so every page and run shares one login."""
-    global _default_connector
-    if _default_connector is None:
-        _default_connector = SessionConnector()
-    return _default_connector
+def _server_host(server: str | None) -> str:
+    """``https://h:52311`` -> ``h``; the library may also hand back a bare ``h:52311``."""
+    if not server:
+        return SESSION_HOST_UNKNOWN
+    try:
+        host = urlsplit(server if "://" in server else f"//{server}").hostname
+    except ValueError:
+        host = None
+    return host or SESSION_HOST_UNKNOWN
 
 
-async def evaluate_session(
+def session_evaluation(result: SessionRelevanceResult) -> SessionEvaluation:
+    """The library's result as the app shows it."""
+    error = result.error
+    return SessionEvaluation(
+        result.session_relevance,
+        _server_host(result.server),
+        answers=tuple(result.answer_strings),
+        # One type for the whole result, e.g. "( integer, string )".
+        answer_types=(result.type,) if result.type else (),
+        plural=result.plural,
+        evaluation_time=(
+            None if result.evaluation_time_ms is None else f"{result.evaluation_time_ms:g}ms"
+        ),
+        error=None if error is None else error.message,
+        error_kind=None if error is None else error.kind,
+        elapsed_ms=None if result.elapsed_ms is None else round(result.elapsed_ms),
+        connection=result.connection,
+        backend=result.backend,
+        deployment_id=result.deployment_id,
+    )
+
+
+def session_config(config: Config, opts: EvalOptions) -> Config:
+    """``config`` with this run's timeouts on every connection, as the library's CLI does."""
+    return dataclasses.replace(
+        config,
+        connections=tuple(
+            dataclasses.replace(
+                c, connect_timeout=SESSION_CONNECT_TIMEOUT_S, read_timeout=opts.timeout_s
+            )
+            for c in config.connections
+        ),
+    )
+
+
+def default_session_client(
+    opts: EvalOptions, *, load: Callable[[], Config] = load_config, **client_kwargs: Any
+) -> AsyncSessionRelevanceClient:
+    """A client over the library's own config lookup. Raises ``ConfigError``.
+
+    Never prompts (a missing password is an ``authentication`` result) and
+    trusts a self-signed certificate on first use, pinning it and logging a
+    WARNING with its fingerprint; pins are shared with the library's CLI.
+    """
+    client_kwargs.setdefault("prompt", None)
+    if "trust" not in client_kwargs:
+        client_kwargs["trust"] = TrustStore()
+    return AsyncSessionRelevanceClient(session_config(load(), opts), **client_kwargs)
+
+
+SessionClientFactory = Callable[[EvalOptions], AsyncSessionRelevanceClient]
+
+
+class SessionClients:
+    """The process's session relevance client, shared by every page and run.
+
+    Shared because BigFix SaaS signs in per client (and failed sign-ins lock
+    the account), and deployment discovery is per client. Built on first use,
+    rebuilt when the timeout changes, and retried on the next run after the
+    config failed to load or had nothing in it, so running ``--setup`` needs
+    no restart. A replaced client is closed once no stream is using it. No
+    threads: everything runs on the event loop.
+    """
+
+    def __init__(self, factory: SessionClientFactory | None = None) -> None:
+        self._factory = factory
+        self._client: AsyncSessionRelevanceClient | None = None
+        self._timeout_s: float | None = None
+        self._users: dict[AsyncSessionRelevanceClient, int] = {}
+        self._retired: set[AsyncSessionRelevanceClient] = set()
+        self._problem: str | None = None
+        """Why the last build gave no client, until one succeeds."""
+
+    def _build(self, opts: EvalOptions) -> AsyncSessionRelevanceClient | str:
+        """The current client for ``opts``, building it if needed; else what's wrong."""
+        if self._client is not None and self._timeout_s == opts.timeout_s:
+            return self._client
+        # Looked up on each call (not bound at import) so tests can replace it.
+        factory = self._factory or default_session_client
+        try:
+            client = factory(opts)
+        except ConfigError as exc:
+            self._problem = str(exc)
+            return self._problem
+        self._retire(self._client)
+        if not client.connections:
+            self._client, self._timeout_s = None, None
+            self._retire(client)
+            self._problem = NO_SESSION_CONFIG
+            return self._problem
+        self._client, self._timeout_s, self._problem = client, opts.timeout_s, None
+        return client
+
+    def _retire(self, client: AsyncSessionRelevanceClient | None) -> None:
+        if client is None:
+            return
+        if self._users.get(client):
+            self._retired.add(client)
+        else:
+            _close_soon(client)
+
+    def expected(self, opts: EvalOptions | None = None) -> int:
+        """Session results a run yields: one per deployment, or the one ``config`` row.
+
+        Builds the client if there is none yet, but doesn't retry a config
+        that failed: that's for the next run.
+        """
+        client = self._client
+        if client is None:
+            if self._problem is not None:
+                return 1
+            built = self._build(opts or EvalOptions())
+            if isinstance(built, str):
+                return 1
+            client = built
+        count = client.result_count()
+        return len(client.connections) if count is None else count
+
+    @asynccontextmanager
+    async def lease(self, opts: EvalOptions) -> AsyncIterator[AsyncSessionRelevanceClient | str]:
+        """The client to run on, kept open until the block ends; else what's wrong."""
+        built = self._build(opts)
+        if isinstance(built, str):
+            yield built
+            return
+        self._users[built] = self._users.get(built, 0) + 1
+        try:
+            yield built
+        finally:
+            self._users[built] -= 1
+            if not self._users[built]:
+                del self._users[built]
+                if built in self._retired:
+                    self._retired.discard(built)
+                    await built.aclose()
+
+    async def aclose(self) -> None:
+        """Close every client, in use or not: the app is stopping."""
+        clients = {*self._retired, *self._users}
+        if self._client is not None:
+            clients.add(self._client)
+        self._client, self._timeout_s = None, None
+        self._retired.clear()
+        await asyncio.gather(*(c.aclose() for c in clients), return_exceptions=True)
+
+
+def _close_soon(client: AsyncSessionRelevanceClient) -> None:
+    """Close a client nobody uses; ``aclose`` is async, but building is not."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # No loop (a sync caller): it never opened a connection on one either.
+        return
+    task = loop.create_task(client.aclose())
+    _closing.add(task)
+    task.add_done_callback(_closing.discard)
+
+
+_closing: set[asyncio.Task[None]] = set()
+_session_clients: SessionClients | None = None
+
+
+def session_clients() -> SessionClients:
+    """The process's clients, so every page and run shares one sign-in."""
+    global _session_clients
+    if _session_clients is None:
+        _session_clients = SessionClients()
+    return _session_clients
+
+
+async def close_session_clients() -> None:
+    """Close the process's clients (at app shutdown), so httpx connections close cleanly."""
+    global _session_clients
+    clients, _session_clients = _session_clients, None
+    if clients is not None:
+        await clients.aclose()
+
+
+def expected_session_results(
+    clients: SessionClients | None = None, opts: EvalOptions | None = None
+) -> int:
+    """How many session results a run yields, for the target count and progress.
+
+    ``result_count()`` once deployment ids are known, else the connection
+    count (the run corrects it), and 1 for the ``config`` row.
+    """
+    return (clients or session_clients()).expected(opts)
+
+
+async def stream_session(
     session_relevance: str,
     opts: EvalOptions,
     *,
-    connector: SessionConnector | None = None,
-) -> SessionEvaluation:
-    """Evaluate on the root server through besapi. Failures come back in the result.
-
-    Cancelling stops the wait, not the request: it runs to its timeout in its
-    worker thread.
-    """
-    connector = connector or default_connector()
-    return await asyncio.to_thread(connector.query, session_relevance, opts.timeout_s)
+    clients: SessionClients | None = None,
+) -> AsyncIterator[SessionEvaluation]:
+    """One result per deployment, as each answers; one ``config`` result when
+    nothing is configured. Failures come back as results. Leaving early (or
+    cancelling the consumer) cancels the queries still running."""
+    clients = clients or session_clients()
+    async with clients.lease(opts) as client:
+        if isinstance(client, str):
+            yield _config_problem(session_relevance, client)
+            return
+        stream = client.evaluate_stream(session_relevance)
+        async with aclosing(stream):
+            async for result in stream:
+                yield session_evaluation(result)
 
 
 def session_row_wanted(ev: SessionEvaluation, *, optional: bool) -> bool:
@@ -665,6 +796,9 @@ def session_result_to_dict(ev: SessionEvaluation) -> dict[str, Any]:
     return {
         "dialect": "session",
         "host": ev.host,
+        "connection": ev.connection,
+        "backend": ev.backend,
+        "deployment_id": ev.deployment_id,
         "session_relevance": ev.session_relevance,
         "answers": list(ev.answers),
         "answer_types": list(ev.answer_types),
@@ -695,13 +829,15 @@ class ResultRow:
     error: str | None
     raw_qna_output: str
     dialect: str = "client"
-    """``"client"`` (qna on a target) or ``"session"`` (the root server)."""
+    """``"client"`` (qna on a target) or ``"session"`` (a BigFix server)."""
     detail_text: str = ""
     """The expanded row's run details: qna version, or the server's evaluation."""
 
     @classmethod
     def from_session(cls, ev: SessionEvaluation) -> ResultRow:
         details = []
+        if ev.backend:
+            details.append(f"via {ev.backend}")
         if ev.evaluation_time:
             details.append(f"evaluated in {ev.evaluation_time} on the server")
         if ev.plural is not None:
@@ -710,7 +846,8 @@ class ResultRow:
             status="ok" if ev.ok else (ev.error_kind or "error"),
             ok=ev.ok,
             host=ev.host,
-            display_host=ev.host,
+            # The connection says which deployment answered; rows group by it.
+            display_host=ev.connection or ev.host,
             answers=ev.answers,
             answer_types_text=", ".join(dict.fromkeys(ev.answer_types)),
             qna_version_text="",

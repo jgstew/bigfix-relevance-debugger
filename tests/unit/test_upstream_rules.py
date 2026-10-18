@@ -14,7 +14,6 @@ UPSTREAM = Path(__file__).parents[2] / "src" / "bigfix_relevance_debugger" / "up
 ALLOWED = {
     "remote_client_relevance.py": "bigfix_remote_client_relevance",
     "relevance_analyzer.py": "bigfix_relevance_analyzer",
-    "besapi.py": "besapi",
 }
 
 
@@ -88,8 +87,7 @@ def exported_names(tree: ast.Module) -> set[str]:
 def library_api(root: Path) -> set[str]:
     """Every name some module under ``root`` exports, read from source.
 
-    Not imported: some modules only import on one OS (besapi's
-    ``plugin_utilities_win``). A name outside a module's ``__all__`` is that
+    Not imported: a library module may import only on one OS. A name outside a module's ``__all__`` is that
     library's private business, so ours may share it.
     """
     return set().union(

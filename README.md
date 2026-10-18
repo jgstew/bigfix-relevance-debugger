@@ -24,9 +24,11 @@ A small browser GUI for BigFix **client and session relevance**:
 2. **Evaluation with real `qna`** on local, container (Docker/Podman) and
    SSH targets, with results streaming in as each target finishes. Uses
    [`bigfix-remote-client-relevance`](https://github.com/jgstew/bigfix-remote-client-relevance).
-   **Session relevance** runs on your BigFix root server through
-   [`besapi`](https://github.com/jgstew/besapi). The app works out which
-   dialect the expression is in and runs client, session, or both.
+   **Session relevance** runs on every BigFix deployment you've configured,
+   through its REST API, BigFix Explorer, Web Reports or BigFix SaaS, using
+   [`bigfix-remote-session-relevance`](https://github.com/jgstew/bigfix-remote-session-relevance).
+   The app works out which dialect the expression is in and runs client,
+   session, or both.
 3. A **per-level breakdown**, like the Fixlet Debugger's graphical breakdown.
    It runs one count probe per level of the expression on the chosen endpoint
    and shows how many objects each level produced, so you can see
@@ -95,7 +97,7 @@ opens a browser tab instead. For a native window, add a toolkit, e.g.
 ## Client or session relevance
 
 Evaluate looks at the expression and runs it as **client relevance** (qna on
-the targets), **session relevance** (the root server), or **both**. Session
+the targets), **session relevance** (your BigFix servers), or **both**. Session
 results are listed first. The **Dialect** picker shows what it decided and
 why, e.g. `auto: only session relevance has bes computers`:
 
@@ -111,16 +113,22 @@ Pick **Client**, **Session** or **Both** in the picker to override it. A
 session-only run doesn't need any targets selected. **Breakdown** runs client
 relevance only for now.
 
-### Connecting to the root server
+### Connecting to your BigFix servers
 
-Session relevance uses besapi's own connection lookup (the one its server
-plugins use), so there's nothing to configure in this app:
+Session relevance uses `bigfix-remote-session-relevance`'s own connection
+lookup, shared with its CLI, so there's nothing to configure in this app:
 
-1. on a root server, that server's own credentials;
-2. the `BES_ROOT_SERVER`, `BES_USER_NAME` and `BES_PASSWORD` environment
-   variables;
-3. a `[besapi]` section in `/etc/besapi.conf`, `~/besapi.conf`,
-   `~/.besapi.conf` or `./besapi.conf` (a later file overrides an earlier one):
+1. `~/.bigfix/.remote_session_connections.toml` (or the file `BFRSR_CONFIG`
+   names). It holds any number of connections, to the REST API, BigFix
+   Explorer, Web Reports or BigFix SaaS; the easiest way to write it is
+
+   ```bash
+   uvx bigfix-remote-session-relevance --setup
+   ```
+
+2. only if that file doesn't exist: the `BES_ROOT_SERVER`, `BES_USER_NAME`
+   and `BES_PASSWORD` environment variables, then a `[besapi]` section in
+   `~/.besapi.conf`, as one REST API connection:
 
    ```ini
    [besapi]
@@ -129,15 +137,43 @@ plugins use), so there's nothing to configure in this app:
    BES_PASSWORD = <PASSWORD>
    ```
 
-The app connects on the first session run, not at startup, and reuses that
-login. If nothing is configured, the client evaluation still runs. When auto
-added session relevance only because the expression is valid in either
-dialect (`now`), that is noted in the activity log, not shown as an error
-row. When you asked for session relevance (a session-only expression, or
-**Session** / **Both** in the picker), the session row says so and lists
-where it looked. Queries are read-only (`/api/query`); the server's own
-evaluation time shows in the expanded row. besapi doesn't verify the server's
-TLS certificate by default.
+3. on a root server, that server's own REST API credentials are added as one
+   more connection (`local-root-server`). Reading them needs root or
+   Administrator. Opt out with `BFRSR_LOCAL_ROOT_SERVER=0`, or
+   `local_root_server = false` under `[defaults]` in the TOML file.
+
+Versions before 0.5.0 of this app also read `/etc/besapi.conf`,
+`~/besapi.conf` and `./besapi.conf`; those aren't read any more. Run
+`--setup`, or move the `[besapi]` section to `~/.besapi.conf`.
+
+Every enabled connection runs, and each **deployment** gets one row, labeled
+with the connection that answered. Connections that reach the same deployment
+(say its REST API and its Explorer) count once: the library tries them in
+order (Explorer, REST API, Web Reports) and fails over to the next if one
+can't answer. The expanded row says which one did (`via rest`), with the
+server's own evaluation time. Without a reachable Explorer, the REST API
+reports that time in whole milliseconds, so it often reads `0ms`.
+
+The app builds its connections on the first session run (or when the target
+count first needs them), not at startup, and reuses them. If nothing is
+configured, the client evaluation still runs. When auto added session
+relevance only because the expression is valid in either dialect (`now`),
+that is noted in the activity log, not shown as an error row. When you asked
+for session relevance (a session-only expression, or **Session** / **Both**
+in the picker), the session row says so and says what to set up. A config
+you add while the app is running is picked up on the next run. Queries are
+read-only (relevance queries through each interface's query API). Passwords are never prompted for; a connection without
+one shows an `authentication` row.
+
+TLS certificates are verified. A server with a certificate no CA vouches for
+(the usual self-signed root server) is trusted on first use: the certificate
+is pinned in `~/.bigfix/.remote_session_known_certs.toml` (shared with the
+library's CLI, so a certificate you already trusted there is trusted here
+too) and the activity log shows a WARNING with its SHA-256 fingerprint. Check
+it against the server. If a pinned certificate later changes, that
+connection shows a `tls` error and doesn't fail over; to accept the new
+certificate, remove its entry from that file (or run the CLI's
+`--forget-cert <host:port>`).
 
 ## Inventory (shared with `bigfix-remote-client-relevance`)
 
@@ -182,7 +218,8 @@ reads:
   count then turns exact (e.g. `2 systems` for `debian:11`).
 - `finding inventory …` while first-run auto-discovery is still going.
 - `12 systems + BigFix server` when session relevance runs too, and
-  `BigFix server` when only session relevance runs.
+  `BigFix server` when only session relevance runs; `2 BigFix servers` with
+  two deployments configured.
 - `0 systems`, with a warning icon, when nothing would run. The panel then
   opens itself and says why. It also opens when a run stops on a target or
   option problem, but it never closes itself.
@@ -241,10 +278,10 @@ a specific target, select only that one.
    again. The first level that fails is highlighted with an arrow, and its
    error ("Singular expression refers to nonexistent object") is shown
    inline.
-7. Session relevance (needs a root server configured, see above): type
+7. Session relevance (needs a BigFix server configured, see above): type
    `names of bes computers`. The picker says `auto: only session relevance
-   has bes computers`. Click **Evaluate**: one row from the root server, no
-   targets needed. Then type `now`, which is valid in either dialect: the
+   has bes computers`. Click **Evaluate**: one row per deployment, each
+   labeled with its connection, no targets needed. Then type `now`, which is valid in either dialect: the
    session row lists first, then the client rows.
 8. Optional: put the inventory hosts back, add a second image
    (`debian:11, ubuntu:24.04`) or both arches, evaluate
@@ -273,7 +310,7 @@ Then come one `(no answers)` row and one row per error kind
 answer, however many qna versions it ran, so plural answers' shares can add
 up to more than 100%. It shows the 50 most common answers and says how many
 more there are. It covers the whole run, whatever the filter hides, and
-leaves the session result out (that's one server, not a fleet). With a
+leaves the session results out (those are servers, not a fleet). With a
 single system it's hidden, since it would only repeat that system's row.
 
 **Click a row in Answers** to show only the systems it counted. They keep all
@@ -281,8 +318,8 @@ their rows, and a removable `Only: ...` chip says what's picked. Click the row
 again, or the chip's ✕, to show everything. It combines with the filter box,
 stays across Evaluate like the filter, and **Clear** drops it.
 
-The results table has one row per result, best first: the session result
-(marked `session`) at the top, then hosts with the most answers, then hosts that answered nothing, then errors (in red).
+The results table has one row per result, best first: the session results
+(marked `session`, one per deployment) at the top, then hosts with the most answers, then hosts that answered nothing, then errors (in red).
 A host listing several qna versions in the inventory gets one row per
 version, kept together and told apart by the qna column. The line above the
 table counts them, e.g. `5 results: 3 with answers, 1 empty, 1 error`.
@@ -324,6 +361,6 @@ of the built wheel through `uvx` on Linux, macOS and Windows.
 
 Unit tests need no Docker, qna, network or BigFix server: evaluation runs
 the real orchestrator against an injected fake transport, session relevance
-runs against a fake besapi connection with responses recorded from a real
-server, and the page is tested with NiceGUI's simulated user. See [AGENTS.md](AGENTS.md) for layout and
+runs the real library against fake servers (`httpx.MockTransport`) answering
+with responses recorded from a real one, and the page is tested with NiceGUI's simulated user. See [AGENTS.md](AGENTS.md) for layout and
 conventions.

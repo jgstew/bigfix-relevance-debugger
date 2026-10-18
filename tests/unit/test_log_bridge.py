@@ -9,24 +9,63 @@ import threading
 import pytest
 
 from bigfix_relevance_debugger.log_bridge import (
-    LIBRARY_LOGGER,
+    LIBRARY_LOGGERS,
     CallbackHandler,
     attach,
     detach,
 )
 
+LIBRARY_LOGGER, SESSION_LOGGER = LIBRARY_LOGGERS
+
 
 @pytest.fixture
 def library_logger():
-    logger = logging.getLogger(LIBRARY_LOGGER)
-    saved = logger.level, list(logger.handlers)
-    yield logger
-    logger.setLevel(saved[0])
-    logger.handlers[:] = saved[1]
+    loggers = [logging.getLogger(name) for name in LIBRARY_LOGGERS]
+    saved = [(logger.level, list(logger.handlers)) for logger in loggers]
+    yield loggers[0]
+    for logger, (level, handlers) in zip(loggers, saved, strict=True):
+        logger.setLevel(level)
+        logger.handlers[:] = handlers
 
 
-def test_library_logger_name():
-    assert LIBRARY_LOGGER == "bigfix_remote_client_relevance"
+def test_library_logger_names():
+    assert LIBRARY_LOGGERS == ("bigfix_remote_client_relevance", "bigfix_remote_session_relevance")
+
+
+def test_attach_forwards_session_library_records(library_logger):
+    # Certificate pins, failover and recorded deployment ids.
+    lines: list[str] = []
+    handler = attach(lines.append, logging.INFO)
+    try:
+        logging.getLogger(f"{SESSION_LOGGER}.trust").warning("pinned certificate")
+        logging.getLogger(f"{SESSION_LOGGER}.client").debug("noisy detail")
+    finally:
+        detach(handler)
+
+    [line] = lines
+    assert "pinned certificate" in line
+
+
+def test_attach_lowers_the_session_library_level_too(library_logger):
+    session = logging.getLogger(SESSION_LOGGER)
+    session.setLevel(logging.NOTSET)
+
+    handler = attach(lambda _: None, logging.DEBUG)
+    try:
+        assert session.isEnabledFor(logging.DEBUG)
+    finally:
+        detach(handler)
+
+
+def test_detach_stops_forwarding_from_both_libraries(library_logger):
+    lines: list[str] = []
+    handler = attach(lines.append, logging.INFO)
+    detach(handler)
+
+    for name in LIBRARY_LOGGERS:
+        logging.getLogger(name).info("after detach")
+
+    assert lines == []
 
 
 def test_handler_forwards_formatted_records():

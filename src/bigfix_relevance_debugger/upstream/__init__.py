@@ -1,8 +1,8 @@
 """Code written to be donated to the libraries this app builds on.
 
 One module per library: ``remote_client_relevance`` for
-bigfix-remote-client-relevance, ``relevance_analyzer`` for
-bigfix-relevance-analyzer, ``besapi`` for besapi. Rules that keep a move a copy-paste:
+bigfix-remote-client-relevance and ``relevance_analyzer`` for
+bigfix-relevance-analyzer. Rules that keep a move a copy-paste:
 
 * Import only the stdlib and *that* library's public API (its package
   ``__init__`` or a submodule's ``__all__``) -- never this app's modules,

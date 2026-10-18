@@ -2,7 +2,8 @@
 
 Live static analysis via ``bigfix-relevance-analyzer``, client relevance
 evaluated with real ``qna`` via ``bigfix-remote-client-relevance``, session
-relevance on a root server via ``besapi``, and a per-level breakdown that
+relevance on every configured BigFix deployment via
+``bigfix-remote-session-relevance``, and a per-level breakdown that
 shows where an expression goes empty on a given endpoint.
 """
 

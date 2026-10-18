@@ -27,6 +27,7 @@ from bigfix_remote_client_relevance import (
     find_inventory_path,
     results_to_dicts,
 )
+from nicegui import app as nicegui_app
 from nicegui import background_tasks, ui
 from nicegui.events import GenericEventArguments, ValueChangeEventArguments
 
@@ -60,7 +61,8 @@ from bigfix_relevance_debugger.evaluation import (
     breakdown_qna_note,
     build_targets,
     choose_breakdown_target,
-    evaluate_session,
+    close_session_clients,
+    expected_session_results,
     inventory_table_row,
     load_inventory_targets,
     pick_label,
@@ -73,6 +75,7 @@ from bigfix_relevance_debugger.evaluation import (
     session_result_to_dict,
     session_row_wanted,
     stream_results,
+    stream_session,
     tally_table_row,
     total_work,
     visible_results,
@@ -706,6 +709,7 @@ async def root() -> None:
     # --- target count -----------------------------------------------------------
 
     def current_preview() -> TargetPreview:
+        session = SESSION in state.view.run_dialects
         return preview_targets(
             state.form,
             inventory.targets,
@@ -713,7 +717,9 @@ async def root() -> None:
             qna_spec=EvalOptions(qna_version=state.qna_version or "").qna_spec,
             inventory_pending=not state.inventory_ready,
             client=CLIENT in state.view.run_dialects,
-            session=SESSION in state.view.run_dialects,
+            session=session,
+            # Only asked when session relevance runs: it reads the config.
+            session_servers=expected_session_results() if session else 1,
         )
 
     def refresh_targets() -> TargetPreview:
@@ -865,7 +871,10 @@ async def root() -> None:
             if collected is None:
                 return
             targets, opts = collected
-            total = (total_work(targets, opts) if targets else 0) + int(session)
+            # Deployments not discovered yet count as one per connection; the
+            # session task corrects the total once it knows.
+            session_expected = expected_session_results(opts=opts) if session else 0
+            total = (total_work(targets, opts) if targets else 0) + session_expected
             done = 0
             state.results = []
             state.session_results = []
@@ -881,11 +890,14 @@ async def root() -> None:
             progress.set_value(0)
             progress_label.set_text(f"0 / {total}")
 
+            def show_progress() -> None:
+                progress.set_value(done / total if total else 1)
+                progress_label.set_text(f"{done} / {total}")
+
             def tick() -> None:
                 nonlocal done
                 done += 1
-                progress.set_value(done / total if total else 1)
-                progress_label.set_text(f"{done} / {total}")
+                show_progress()
 
             def arrived(row: ResultRow) -> None:
                 state.table_rows.append(results_table_row(len(state.rows), row))
@@ -899,22 +911,30 @@ async def root() -> None:
             session_optional = view.session_optional and bool(targets)
 
             async def run_session() -> None:
-                ev = await evaluate_session(text, opts)
-                if not session_row_wanted(ev, optional=session_optional):
-                    activity.push(
-                        "session relevance skipped: no BigFix server is configured. "
-                        "Pick Session or Both in the Dialect picker to see where it looked."
+                nonlocal total
+                seen = 0
+                # One result per deployment, as each answers.
+                async for ev in stream_session(text, opts):
+                    seen += 1
+                    if not session_row_wanted(ev, optional=session_optional):
+                        activity.push(
+                            "session relevance skipped: no BigFix server is configured. "
+                            "Pick Session or Both in the Dialect picker to see where it looked."
+                        )
+                        tick()
+                        continue
+                    state.session_results.append(ev)
+                    outcome = (
+                        f"{len(ev.answers)} answer(s)" if ev.ok else f"{ev.error_kind}: {ev.error}"
                     )
-                    tick()
-                    return
-                state.session_results.append(ev)
-                outcome = (
-                    f"{len(ev.answers)} answer(s)" if ev.ok else f"{ev.error_kind}: {ev.error}"
-                )
-                activity.push(f"session relevance on {ev.host}: {outcome}")
-                arrived(ResultRow.from_session(ev))
+                    where = f"{ev.connection} ({ev.backend})" if ev.connection else ev.host
+                    activity.push(f"session relevance on {where}: {outcome}")
+                    arrived(ResultRow.from_session(ev))
+                if seen != session_expected:
+                    total += seen - session_expected
+                    show_progress()
 
-            # The root server answers alongside qna, so a slow one holds up nothing.
+            # The BigFix servers answer alongside qna, so a slow one holds up nothing.
             session_task = asyncio.create_task(run_session()) if session else None
             try:
                 if targets:
@@ -1370,4 +1390,5 @@ def main(argv: list[str] | None = None) -> None:
         kwargs["window_size"] = WINDOW_SIZE
     if args.port is not None:
         kwargs["port"] = args.port
+    nicegui_app.on_shutdown(close_session_clients)
     ui.run(root, **kwargs)
