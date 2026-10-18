@@ -95,11 +95,35 @@ def test_main_uses_the_logo_as_favicon(captured_run):
     assert app_module.LOGO.is_file()
 
 
-def test_native_window_uses_the_logo_as_app_icon(captured_run):
-    # pywebview's icon sets the macOS Dock icon, which is Python's otherwise.
+@pytest.mark.parametrize(
+    ("platform", "suffix"),
+    [
+        # pywebview's icon sets the macOS Dock icon, which is Python's otherwise.
+        ("darwin", ".svg"),
+        # pywebview's Windows backend reads only an .ico; the SVG crashes it.
+        ("win32", ".ico"),
+        ("linux", ".png"),
+    ],
+)
+def test_native_window_icon_suits_the_platform(captured_run, monkeypatch, platform, suffix):
+    monkeypatch.setattr(app_module.sys, "platform", platform)
+
     main([])
 
-    assert app_module.nicegui_app.native.start_args["icon"] == str(app_module.LOGO)
+    icon = Path(app_module.nicegui_app.native.start_args["icon"])
+    assert icon.suffix == suffix
+    assert icon.is_file()
+
+
+def test_windows_icon_is_a_bmp_framed_ico():
+    # .NET's System.Drawing.Icon can't be relied on for PNG-compressed frames.
+    data = app_module.WINDOW_ICONS["win32"].read_bytes()
+    assert data[:4] == b"\x00\x00\x01\x00"
+    count = int.from_bytes(data[4:6], "little")
+    offsets = [
+        int.from_bytes(data[6 + 16 * i + 12 : 6 + 16 * i + 16], "little") for i in range(count)
+    ]
+    assert count and all(data[o : o + 4] != b"\x89PNG" for o in offsets)
 
 
 def test_main_defaults_to_a_native_window(captured_run):
