@@ -84,7 +84,7 @@ jobs:
       # The smoke job tests these exact bytes on every OS, rather than each
       # runner building its own, and tag_and_release.yaml publishes them.
       # overwrite: a "Re-run all jobs" builds again in the same run.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-dist
           path: dist/
