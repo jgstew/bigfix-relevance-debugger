@@ -911,11 +911,16 @@ async def root() -> None:
             session_optional = view.session_optional and bool(targets)
 
             async def run_session() -> None:
-                nonlocal total
+                nonlocal total, session_expected
                 seen = 0
                 # One result per deployment, as each answers.
                 async for ev in stream_session(text, opts):
                     seen += 1
+                    if seen > session_expected:
+                        # More deployments than counted: grow the total now,
+                        # so progress never reads past it.
+                        total += 1
+                        session_expected = seen
                     if not session_row_wanted(ev, optional=session_optional):
                         activity.push(
                             "session relevance skipped: no BigFix server is configured. "
@@ -930,8 +935,9 @@ async def root() -> None:
                     where = f"{ev.connection} ({ev.backend})" if ev.connection else ev.host
                     activity.push(f"session relevance on {where}: {outcome}")
                     arrived(ResultRow.from_session(ev))
-                if seen != session_expected:
-                    total += seen - session_expected
+                if seen < session_expected:
+                    # Fewer: connections to one deployment counted once.
+                    total -= session_expected - seen
                     show_progress()
 
             # The BigFix servers answer alongside qna, so a slow one holds up nothing.

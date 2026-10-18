@@ -583,7 +583,7 @@ def session_evaluation(result: SessionRelevanceResult) -> SessionEvaluation:
         answer_types=(result.type,) if result.type else (),
         plural=result.plural,
         evaluation_time=(
-            None if result.evaluation_time_ms is None else f"{result.evaluation_time_ms:g}ms"
+            None if result.evaluation_time_ms is None else _ms_text(result.evaluation_time_ms)
         ),
         error=None if error is None else error.message,
         error_kind=None if error is None else error.kind,
@@ -592,6 +592,11 @@ def session_evaluation(result: SessionRelevanceResult) -> SessionEvaluation:
         backend=result.backend,
         deployment_id=result.deployment_id,
     )
+
+
+def _ms_text(ms: float) -> str:
+    """``0.049`` -> ``"0.049ms"``, ``4.0`` -> ``"4ms"``; never scientific notation."""
+    return f"{ms:.3f}".rstrip("0").rstrip(".") + "ms"
 
 
 def session_config(config: Config, opts: EvalOptions) -> Config:
@@ -656,6 +661,10 @@ class SessionClients:
         except ConfigError as exc:
             self._problem = str(exc)
             return self._problem
+        except OSError as exc:  # e.g. ~/.bigfix unreadable
+            logger.debug("session config could not be read", exc_info=True)
+            self._problem = f"{type(exc).__name__}: {exc}"
+            return self._problem
         self._retire(self._client)
         if not client.connections:
             self._client, self._timeout_s = None, None
@@ -664,6 +673,12 @@ class SessionClients:
             return self._problem
         self._client, self._timeout_s, self._problem = client, opts.timeout_s, None
         return client
+
+    def discard(self, client: AsyncSessionRelevanceClient) -> None:
+        """Stop handing out ``client`` (its config turned out bad); the next run rebuilds."""
+        if self._client is client:
+            self._client, self._timeout_s = None, None
+            self._retire(client)
 
     def _retire(self, client: AsyncSessionRelevanceClient | None) -> None:
         if client is None:
@@ -776,9 +791,15 @@ async def stream_session(
             yield _config_problem(session_relevance, client)
             return
         stream = client.evaluate_stream(session_relevance)
-        async with aclosing(stream):
-            async for result in stream:
-                yield session_evaluation(result)
+        try:
+            async with aclosing(stream):
+                async for result in stream:
+                    yield session_evaluation(result)
+        except ConfigError as exc:
+            # Some mistakes surface only when the library builds a connection
+            # (e.g. a BES_ROOT_SERVER with a path): a config row, not a crash.
+            clients.discard(client)
+            yield _config_problem(session_relevance, str(exc))
 
 
 def session_row_wanted(ev: SessionEvaluation, *, optional: bool) -> bool:

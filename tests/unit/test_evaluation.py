@@ -1473,6 +1473,35 @@ async def test_session_without_a_password_never_prompts():
     assert router.queries == []
 
 
+async def test_a_config_mistake_found_while_querying_is_a_config_result():
+    # The BES_* fallback isn't validated when loaded; a bad server surfaces
+    # only when the library builds its backends. The next run rebuilds.
+    bad = rest_conn("bad", "https://bigfix.example.com:52311/some/path")
+    clients = session_clients(
+        loads=[Config(connections=(bad,)), Config(connections=(rest_conn("prod"),))]
+    )
+
+    first = await collect_session("now", clients=clients)
+    second = await collect_session("now", clients=clients)
+
+    [ev] = first
+    assert ev.error_kind == "config"
+    assert ev.error is not None and "path" in ev.error
+    assert [ev.ok for ev in second] == [True]
+    assert len(clients.built) == 2
+    assert clients.built[0]._backends == {}  # closed
+
+
+async def test_an_unreadable_config_is_a_config_result():
+    clients = session_clients(loads=[PermissionError("~/.bigfix: permission denied")])
+
+    [ev] = await collect_session("now", clients=clients)
+
+    assert ev.error_kind == "config"
+    assert ev.error is not None and "permission denied" in ev.error
+    assert expected_session_results(session_clients(loads=[OSError("nope")])) == 1
+
+
 async def test_session_client_is_built_once_and_reused():
     clients = session_clients(rest_conn("prod"))
 
@@ -1704,6 +1733,20 @@ def test_session_evaluation_maps_every_field():
 )
 def test_session_evaluation_host_is_the_server_host(server, host):
     assert session_evaluation(session_result(server=server)).host == host
+
+
+@pytest.mark.parametrize(
+    ("ms", "text"),
+    [
+        (0, "0ms"),
+        (0.049, "0.049ms"),
+        (0.31, "0.31ms"),
+        (4.0, "4ms"),
+        (1234567.8, "1234567.8ms"),
+    ],
+)
+def test_session_evaluation_time_reads_plainly(ms, text):
+    assert session_evaluation(session_result(evaluation_time_ms=ms)).evaluation_time == text
 
 
 def test_session_evaluation_of_an_error():

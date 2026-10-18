@@ -1983,6 +1983,29 @@ async def test_progress_total_is_corrected_when_fewer_deployments_answer(user, m
     assert progress.value == 1
 
 
+async def test_progress_total_grows_when_more_deployments_answer(user, monkeypatch):
+    # The count came from an older client; this run found one more deployment.
+    gate = asyncio.Event()
+
+    async def two_then_wait(text, opts, **upstream):
+        for name in ("prod", "lab"):
+            yield SessionEvaluation(text, SERVER, connection=name, backend="rest")
+        await gate.wait()
+
+    monkeypatch.setattr(app_module, "stream_session", two_then_wait)
+    await user.open("/")
+    await set_text(user, "number of bes computers")
+
+    user.find(marker="evaluate").click()
+
+    try:
+        await user.should_see("2 / 2")
+        [progress] = user.find(ui.linear_progress).elements
+        assert progress.value == 1
+    finally:
+        gate.set()
+
+
 async def test_session_only_count_says_how_many_bigfix_servers(user, monkeypatch):
     monkeypatch.setattr(app_module, "expected_session_results", lambda *a, **k: 2)
     await user.open("/")
