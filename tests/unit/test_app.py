@@ -12,9 +12,16 @@ import json
 import logging
 import threading
 from collections.abc import AsyncIterator
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-from bigfix_remote_client_relevance import ClientRelevanceResult, InventoryError, Target
+from bigfix_remote_client_relevance import (
+    BigFixRelevanceError,
+    ClientRelevanceResult,
+    InventoryError,
+    Target,
+)
 from nicegui import ui
 from nicegui.testing.user_download import UserDownload
 from nicegui.testing.user_simulation import user_simulation
@@ -128,6 +135,15 @@ def test_native_unavailable_falls_back_to_a_browser_tab(captured_run, monkeypatc
     assert "browser" in caplog.text
 
 
+def test_main_closes_the_session_clients_on_shutdown(captured_run, monkeypatch):
+    handlers: list = []
+    monkeypatch.setattr(app_module, "nicegui_app", SimpleNamespace(on_shutdown=handlers.append))
+
+    main([])
+
+    assert handlers == [app_module.close_session_clients]
+
+
 def test_main_verbose_sets_debug(captured_run):
     main(["-v"])
 
@@ -231,6 +247,28 @@ async def test_debouncer_supports_async_callbacks():
 def no_inventory(monkeypatch):
     monkeypatch.setattr(app_module, "find_inventory_path", lambda: None)
     monkeypatch.setattr(app_module, "find_or_discover_inventory", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def app_started(monkeypatch):
+    """Make ``ui.notify`` fail where it fails in a real browser.
+
+    The simulated user swaps ``ui.notify`` for a recorder that never looks
+    up the current slot, and NiceGUI gives a slot-less task a pseudo client
+    until the app is started. A served page has neither: ``ui.notify`` from a
+    task with an empty slot stack raises. Do the real lookup, as started.
+    """
+    from nicegui import app as nicegui_app
+    from nicegui.testing.user_notify import UserNotify
+
+    monkeypatch.setattr(type(nicegui_app), "is_started", property(lambda self: True))
+    record = UserNotify.__call__
+
+    def notify_like_nicegui(self, message, **kwargs):
+        ui.context.client  # noqa: B018 - what ui.notify does first; raises without a slot
+        return record(self, message, **kwargs)
+
+    monkeypatch.setattr(UserNotify, "__call__", notify_like_nicegui)
 
 
 @pytest.fixture
@@ -834,16 +872,151 @@ async def test_breakdown_picks_the_target_matching_the_expressions_platform(monk
     assert seen["target"] is windows
 
 
-async def test_inventory_can_select_none(inventory_user):
+async def test_selecting_no_hosts_runs_on_all_of_them(inventory_user, monkeypatch):
+    # Nothing picked means the default, every configured host, not nothing.
+    streamed: list[list[Target]] = []
+
+    async def fake_stream(text, targets, opts, **upstream):
+        streamed.append(list(targets))
+        for _ in ():
+            yield
+
+    monkeypatch.setattr(app_module, "stream_results", fake_stream)
     await inventory_user.open("/")
     await inventory_user.should_see(marker="inventory")
 
     await deselect(inventory_user, 0, 1)
 
     assert selected_ids(inventory_user) == []
-    await count_reads(inventory_user, "0 systems")
+    await count_reads(inventory_user, "2 systems")
+    assert hidden_element(inventory_user, "inventory-count").text == (
+        "none selected: Evaluate runs on all 2"
+    )
+    # Ticking a target makes "nothing picked" mean no hosts after all.
+    inventory_user.find(marker="target-local").click()
+    await count_reads(inventory_user, "1 system")
+    assert hidden_element(inventory_user, "inventory-count").text == "0 of 2 selected"
+    inventory_user.find(marker="target-local").click()
+    await count_reads(inventory_user, "2 systems")
     inventory_user.find(marker="evaluate").click()
-    await notified(inventory_user, "Pick at least one target")
+    await inventory_user.should_see("0 / 2")
+    assert streamed == [TWO_HOSTS]
+
+
+# --- auto-discovery when no client targets are configured -------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_discovery_tried_yet(monkeypatch):
+    monkeypatch.setattr(app_module, "_discovery_tried", set())
+
+
+@pytest.fixture
+async def empty_inventory_user(monkeypatch, tmp_path):
+    """An inventory file with no hosts yet, e.g. the placeholder discovery leaves."""
+    path = tmp_path / "remote_clients.toml"
+    path.write_text("# no hosts yet\n", encoding="utf-8")
+    monkeypatch.setattr(app_module, "_inventory_path", path)
+    async with user_simulation(root=app_module.root) as simulated:
+        simulated.inventory_path = path  # type: ignore[attr-defined]
+        yield simulated
+
+
+def fake_discovery(calls: list[Path], hosts: str = ""):
+    def discover_into(path):
+        calls.append(path)
+        if hosts:
+            path.write_text(hosts, encoding="utf-8")
+        return path
+
+    return discover_into
+
+
+async def test_evaluate_discovers_targets_when_none_are_configured(
+    empty_inventory_user, monkeypatch
+):
+    user = empty_inventory_user
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        app_module, "discover_into", fake_discovery(calls, '[hosts.local]\ntransport = "local"\n')
+    )
+    streamed: list[list[Target]] = []
+
+    async def fake_stream(text, targets, opts, **upstream):
+        streamed.append(list(targets))
+        yield ClientRelevanceResult(host="local", transport="local", client_relevance=text)
+
+    monkeypatch.setattr(app_module, "stream_results", fake_stream)
+    await user.open("/")
+    await set_text(user, "name of operating system")
+    await count_reads(user, "auto-discovery")
+    assert toggle(user).props["icon"] == "dns"  # not a problem: Evaluate handles it
+
+    user.find(marker="evaluate").click()
+
+    await user.should_see("1 / 1")
+    assert calls == [user.inventory_path]
+    [targets] = streamed
+    assert [t.kind for t in targets] == ["local"]
+    await count_reads(user, "1 system")
+
+
+async def test_discovery_that_finds_nothing_says_so_and_is_not_repeated(
+    empty_inventory_user, monkeypatch
+):
+    user = empty_inventory_user
+    calls: list[Path] = []
+    monkeypatch.setattr(app_module, "discover_into", fake_discovery(calls))
+    await user.open("/")
+    await set_text(user, "name of operating system")
+    await count_reads(user, "auto-discovery")
+
+    user.find(marker="evaluate").click()
+    await notified(user, "auto-discovery found none")
+    await count_reads(user, "0 systems")
+    user.find(marker="evaluate").click()
+    await asyncio.sleep(0.2)
+
+    assert calls == [user.inventory_path]
+    assert side_panel(user).value is True
+
+
+async def test_both_dialects_run_what_is_configured_without_discovery(
+    empty_inventory_user, monkeypatch
+):
+    # Discovery is for client-only relevance; `now` runs on the BigFix servers.
+    user = empty_inventory_user
+    calls: list[Path] = []
+    monkeypatch.setattr(app_module, "discover_into", fake_discovery(calls))
+    sessions: list[str] = []
+    monkeypatch.setattr(app_module, "stream_session", fake_session(sessions))
+    await user.open("/")
+    await set_text(user, "now")
+    await count_reads(user, "BigFix server")
+
+    user.find(marker="evaluate").click()
+
+    await user.should_see("1 / 1")
+    await notified(user, "session relevance only")
+    assert calls == []
+    assert sessions == ["now"]
+
+
+async def test_a_broken_inventory_is_never_discovered_into(no_inventory, monkeypatch, tmp_path):
+    bad = tmp_path / "remote_clients.toml"
+    bad.write_text("= nope", encoding="utf-8")
+    monkeypatch.setattr(app_module, "_inventory_path", bad)
+    calls: list[Path] = []
+    monkeypatch.setattr(app_module, "discover_into", fake_discovery(calls))
+
+    async with user_simulation(root=app_module.root) as user:
+        await user.open("/")
+        await set_text(user, "name of operating system")
+        await count_reads(user, "0 systems")
+        user.find(marker="evaluate").click()
+        await notified(user, "Pick at least one target")
+
+    assert calls == []
 
 
 async def test_container_auto_arch_evaluates_every_published_arch(user, monkeypatch):
@@ -1722,20 +1895,67 @@ async def test_the_filter_waits_for_typing_to_pause(user, monkeypatch):
     assert result_hosts(user) == ["deb", "multi", "multi"]
 
 
+# --- notifications from a run (a real browser) -------------------------------------------
+
+
+async def test_a_run_can_notify_in_a_real_browser(user, monkeypatch):
+    async def failing_stream(text, targets, opts, **upstream):
+        raise BigFixRelevanceError("qna went away")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(app_module, "stream_results", failing_stream)
+    await user.open("/")
+    await set_text(user, "name of operating system")
+    user.find(marker="target-local").click()
+
+    user.find(marker="evaluate").click()
+
+    await notified(user, "qna went away")
+
+
+async def test_the_session_task_can_notify_in_a_real_browser(user, monkeypatch):
+    # The session task is a task of its own inside the run.
+    async def stream_session(text, opts, **upstream):
+        ui.notify("from the session task")
+        yield SessionEvaluation(text, SERVER, answers=("1",))
+
+    monkeypatch.setattr(app_module, "stream_session", stream_session)
+    await user.open("/")
+    await set_text(user, "number of bes computers")
+
+    user.find(marker="evaluate").click()
+
+    await notified(user, "from the session task")
+
+
 # --- session relevance (issue 7) ---------------------------------------------------------
 
 SERVER = "bigfix.example.com"
 
 
-def fake_session(calls: list[str], **fields):
-    """An evaluate_session stand-in answering every query the same way."""
+def fake_session(calls: list[str], *connections: str, **fields):
+    """A stream_session stand-in: one result per named connection (else one, unnamed)."""
     fields = {"answers": ("35",), "answer_types": ("integer",), "plural": False} | fields
 
-    async def evaluate_session(text, opts, **upstream):
+    async def stream_session(text, opts, **upstream):
         calls.append(text)
-        return SessionEvaluation(text, SERVER, elapsed_ms=5, **fields)
+        for name in connections or (None,):
+            yield SessionEvaluation(
+                text,
+                SERVER,
+                elapsed_ms=5,
+                connection=name,
+                backend="rest" if name else None,
+                **fields,
+            )
 
-    return evaluate_session
+    return stream_session
+
+
+@pytest.fixture(autouse=True)
+def _one_session_server(monkeypatch):
+    """The target count asks how many deployments there are; one unless a test says."""
+    monkeypatch.setattr(app_module, "expected_session_results", lambda *args, **kwargs: 1)
 
 
 def dialect_reason(user) -> str:
@@ -1756,7 +1976,7 @@ async def test_dialect_picker_defaults_to_auto_and_says_why(user):
 
 async def test_session_only_evaluate_needs_no_client_targets(user, monkeypatch):
     calls: list[str] = []
-    monkeypatch.setattr(app_module, "evaluate_session", fake_session(calls))
+    monkeypatch.setattr(app_module, "stream_session", fake_session(calls))
 
     async def no_stream(*args, **kwargs):
         raise AssertionError("client relevance must not run")
@@ -1778,7 +1998,7 @@ async def test_session_only_evaluate_needs_no_client_targets(user, monkeypatch):
 
 async def test_both_dialects_list_the_session_result_first(user, monkeypatch):
     calls: list[str] = []
-    monkeypatch.setattr(app_module, "evaluate_session", fake_session(calls))
+    monkeypatch.setattr(app_module, "stream_session", fake_session(calls))
     monkeypatch.setattr(app_module, "stream_results", stream_of(result("local", ["a", "b"])))
     await user.open("/")
     await set_text(user, "now")
@@ -1794,7 +2014,7 @@ async def test_both_dialects_list_the_session_result_first(user, monkeypatch):
 
 async def test_dialect_override_runs_only_what_was_picked(user, monkeypatch):
     calls: list[str] = []
-    monkeypatch.setattr(app_module, "evaluate_session", fake_session(calls))
+    monkeypatch.setattr(app_module, "stream_session", fake_session(calls))
     monkeypatch.setattr(app_module, "stream_results", stream_of(result("local", ["a"])))
     await user.open("/")
     await set_text(user, "now")
@@ -1812,7 +2032,7 @@ async def test_dialect_override_runs_only_what_was_picked(user, monkeypatch):
 
 async def test_both_without_client_targets_still_runs_session_and_says_so(user, monkeypatch):
     calls: list[str] = []
-    monkeypatch.setattr(app_module, "evaluate_session", fake_session(calls))
+    monkeypatch.setattr(app_module, "stream_session", fake_session(calls))
     await user.open("/")
     await set_text(user, "now")
 
@@ -1826,7 +2046,7 @@ async def test_both_without_client_targets_still_runs_session_and_says_so(user, 
 async def test_both_with_a_bad_target_field_warns_and_runs_nothing(user, monkeypatch):
     calls: list[str] = []
     streamed: list[list[Target]] = []
-    monkeypatch.setattr(app_module, "evaluate_session", fake_session(calls))
+    monkeypatch.setattr(app_module, "stream_session", fake_session(calls))
 
     async def fake_stream(text, targets, opts, **upstream):
         streamed.append(targets)
@@ -1852,7 +2072,7 @@ async def test_session_error_shows_as_an_error_row(user, monkeypatch):
     calls: list[str] = []
     monkeypatch.setattr(
         app_module,
-        "evaluate_session",
+        "stream_session",
         fake_session(
             calls, answers=(), error="No BigFix server is configured", error_kind="config"
         ),
@@ -1876,7 +2096,7 @@ async def test_no_server_hides_the_session_row_auto_added(user, monkeypatch):
     # `now` runs both only because it's valid in either; most users have no
     # root server, and a red row on every such run would be noise.
     calls: list[str] = []
-    monkeypatch.setattr(app_module, "evaluate_session", fake_session(calls, **NO_SERVER))
+    monkeypatch.setattr(app_module, "stream_session", fake_session(calls, **NO_SERVER))
     monkeypatch.setattr(app_module, "stream_results", stream_of(result("local", ["a"])))
     await user.open("/")
     await set_text(user, "now")
@@ -1888,11 +2108,13 @@ async def test_no_server_hides_the_session_row_auto_added(user, monkeypatch):
     await user.should_see("session relevance skipped")
     assert calls == ["now"]
     assert [r["dialect"] for r in results_table(user).rows] == ["client"]
+    # Not an error row, but worth a word on how to add one.
+    await notified(user, "No BigFix server is configured")
 
 
 async def test_no_server_still_shows_when_both_was_picked(user, monkeypatch):
     calls: list[str] = []
-    monkeypatch.setattr(app_module, "evaluate_session", fake_session(calls, **NO_SERVER))
+    monkeypatch.setattr(app_module, "stream_session", fake_session(calls, **NO_SERVER))
     monkeypatch.setattr(app_module, "stream_results", stream_of(result("local", ["a"])))
     await user.open("/")
     await set_text(user, "now")
@@ -1911,7 +2133,7 @@ async def test_no_server_still_shows_when_session_is_all_that_runs(user, monkeyp
     # Auto picked both, but with no client targets the session row is the
     # whole result, so hiding it would leave nothing to say what happened.
     calls: list[str] = []
-    monkeypatch.setattr(app_module, "evaluate_session", fake_session(calls, **NO_SERVER))
+    monkeypatch.setattr(app_module, "stream_session", fake_session(calls, **NO_SERVER))
     await user.open("/")
     await set_text(user, "now")
 
@@ -1920,6 +2142,75 @@ async def test_no_server_still_shows_when_session_is_all_that_runs(user, monkeyp
     await user.should_see("1 / 1")
     [row] = results_table(user).rows
     assert row["status"] == "config"
+
+
+async def test_each_deployment_gets_a_session_row_above_the_client_rows(user, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(app_module, "stream_session", fake_session(calls, "prod", "lab"))
+    monkeypatch.setattr(app_module, "expected_session_results", lambda *a, **k: 2)
+    monkeypatch.setattr(app_module, "stream_results", stream_of(result("local", ["a", "b"])))
+    await user.open("/")
+    await set_text(user, "now")
+    user.find(marker="target-local").click()
+
+    user.find(marker="evaluate").click()
+
+    # Progress counts each deployment.
+    await user.should_see("3 / 3")
+    rows = results_table(user).rows
+    assert [(r["dialect"], r["host"]) for r in rows] == [
+        ("session", "lab"),
+        ("session", "prod"),
+        ("client", "local"),
+    ]
+    await user.should_see("session relevance on prod (rest)")  # in the activity log
+
+
+async def test_progress_total_is_corrected_when_fewer_deployments_answer(user, monkeypatch):
+    # Before the first run the deployments aren't known yet, so the total is
+    # the connection count; two connections to one deployment give one result.
+    monkeypatch.setattr(app_module, "stream_session", fake_session([], "prod"))
+    monkeypatch.setattr(app_module, "expected_session_results", lambda *a, **k: 2)
+    await user.open("/")
+    await set_text(user, "number of bes computers")
+
+    user.find(marker="evaluate").click()
+
+    await user.should_see("1 / 1")
+    [progress] = user.find(ui.linear_progress).elements
+    assert progress.value == 1
+
+
+async def test_progress_total_grows_when_more_deployments_answer(user, monkeypatch):
+    # The count came from an older client; this run found one more deployment.
+    gate = asyncio.Event()
+
+    async def two_then_wait(text, opts, **upstream):
+        for name in ("prod", "lab"):
+            yield SessionEvaluation(text, SERVER, connection=name, backend="rest")
+        await gate.wait()
+
+    monkeypatch.setattr(app_module, "stream_session", two_then_wait)
+    await user.open("/")
+    await set_text(user, "number of bes computers")
+
+    user.find(marker="evaluate").click()
+
+    try:
+        await user.should_see("2 / 2")
+        [progress] = user.find(ui.linear_progress).elements
+        assert progress.value == 1
+    finally:
+        gate.set()
+
+
+async def test_session_only_count_says_how_many_bigfix_servers(user, monkeypatch):
+    monkeypatch.setattr(app_module, "expected_session_results", lambda *a, **k: 2)
+    await user.open("/")
+
+    await set_text(user, "number of bes computers")
+
+    await count_reads(user, "2 BigFix servers")
 
 
 async def test_session_only_expression_cannot_break_down(user):
@@ -1937,7 +2228,7 @@ async def test_export_lists_session_results_first(user, monkeypatch):
     monkeypatch.setattr(
         UserDownload, "content", lambda self, payload, *a, **k: exported.append(payload)
     )
-    monkeypatch.setattr(app_module, "evaluate_session", fake_session([]))
+    monkeypatch.setattr(app_module, "stream_session", fake_session([]))
     monkeypatch.setattr(app_module, "stream_results", stream_of(result("local", ["a"])))
     await user.open("/")
     await set_text(user, "now")
@@ -1955,7 +2246,7 @@ async def test_export_lists_session_results_first(user, monkeypatch):
 
 
 async def test_clear_removes_session_results_too(user, monkeypatch):
-    monkeypatch.setattr(app_module, "evaluate_session", fake_session([]))
+    monkeypatch.setattr(app_module, "stream_session", fake_session([]))
     await user.open("/")
     await set_text(user, "number of bes computers")
     user.find(marker="evaluate").click()
@@ -2103,7 +2394,7 @@ async def test_clear_removes_the_answer_summary(user, monkeypatch):
 
 
 async def test_answer_summary_ignores_session_results(user, monkeypatch):
-    monkeypatch.setattr(app_module, "evaluate_session", fake_session([]))
+    monkeypatch.setattr(app_module, "stream_session", fake_session([]))
     monkeypatch.setattr(
         app_module, "stream_results", stream_of(result("a", ["x"]), result("b", ["y"]))
     )

@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bigfix-relevance-debugger"
-version = "0.4.3"
-description = "A browser GUI for BigFix client and session relevance: live static analysis, evaluation with qna and besapi, and a per-level breakdown."
+version = "0.5.0"
+description = "A browser GUI for BigFix client and session relevance: live static analysis, evaluation with qna and the REST API / BigFix Explorer / Web Reports, and a per-level breakdown."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -13,7 +13,7 @@ authors = [
     { name = "JGStew", email = "admin@jgstew.com" },
 ]
 requires-python = ">=3.11"
-keywords = ["bigfix", "qna", "client-relevance", "session-relevance", "besapi", "relevance", "debugger", "nicegui"]
+keywords = ["bigfix", "qna", "client-relevance", "session-relevance", "rest-api", "bigfix-explorer", "web-reports", "relevance", "debugger", "nicegui"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: System Administrators",
@@ -28,9 +28,9 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-    "besapi>=4.4.3,<5",
     "bigfix-relevance-analyzer>=1.35.0,<2",
     "bigfix-remote-client-relevance>=1.5.2,<2",
+    "bigfix-remote-session-relevance>=0.5.0,<1",
     "nicegui[native]>=3.18.0",
 ]
 
@@ -70,7 +70,7 @@ exclude-newer = "7 days"
 # Any temporary exemption for another package goes here too, with its end
 # date; tests/unit/test_repo_config.py keeps this list in step and fails once
 # a temporary entry is past its date.
-exclude-newer-package = { besapi = "0 days", bigfix-relevance-analyzer = "0 days", bigfix-remote-client-relevance = "0 days" }
+exclude-newer-package = { bigfix-relevance-analyzer = "0 days", bigfix-remote-client-relevance = "0 days", bigfix-remote-session-relevance = "0 days" }
 # relative `exclude-newer` durations need a recent uv
 required-version = ">=0.12"
 

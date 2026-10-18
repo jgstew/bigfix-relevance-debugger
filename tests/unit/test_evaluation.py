@@ -8,14 +8,24 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import threading
+import json
+import logging
 import time
 from pathlib import Path
-from types import SimpleNamespace
-from urllib.parse import parse_qs
+from typing import Any
 
+import httpx
 import pytest
 from bigfix_remote_client_relevance import ClientRelevanceResult, ResolvedQna, Target
+from bigfix_remote_session_relevance import (
+    AsyncSessionRelevanceClient,
+    Config,
+    ConfigError,
+    ConnectionConfig,
+    ResultError,
+    SessionRelevanceResult,
+    TrustStore,
+)
 
 from bigfix_relevance_debugger import evaluation
 from bigfix_relevance_debugger.analysis import summarize
@@ -31,7 +41,8 @@ from bigfix_relevance_debugger.evaluation import (
     NoTargetsError,
     ProbeView,
     ResultRow,
-    SessionConnector,
+    SessionClients,
+    SessionEvaluation,
     TallyRow,
     TargetForm,
     TargetFormError,
@@ -40,9 +51,12 @@ from bigfix_relevance_debugger.evaluation import (
     breakdown_qna_note,
     build_targets,
     choose_breakdown_target,
-    evaluate_session,
+    close_session_clients,
+    default_session_client,
+    expected_session_results,
     inventory_table_row,
     load_inventory_targets,
+    needs_discovery,
     order_results,
     pick_label,
     pick_phrase,
@@ -52,9 +66,11 @@ from bigfix_relevance_debugger.evaluation import (
     results_summary,
     results_table_row,
     run_breakdown,
+    session_evaluation,
     session_result_to_dict,
     session_row_wanted,
     stream_results,
+    stream_session,
     tally_table_row,
     total_work,
     visible_results,
@@ -358,6 +374,58 @@ def test_a_bad_target_field_is_rejected_as_a_form_error(form, message):
 def test_nothing_selected_is_rejected():
     with pytest.raises(NoTargetsError, match="target"):
         build_targets(TargetForm())
+
+
+@pytest.mark.parametrize("selected", [[], None])
+def test_nothing_selected_runs_on_the_whole_inventory(selected):
+    inventory = [Target(kind="ssh", name="a"), Target(kind="ssh", name="b")]
+
+    targets = build_targets(TargetForm(inventory_selected=selected), inventory)
+
+    assert targets == inventory
+
+
+def test_a_ticked_target_with_no_hosts_selected_runs_only_that():
+    inventory = [Target(kind="ssh", name="a")]
+
+    targets = build_targets(TargetForm(local=True, inventory_selected=[]), inventory)
+
+    assert [t.kind for t in targets] == ["local"]
+
+
+@pytest.mark.parametrize(
+    ("form", "inventory", "discoverable", "session", "wanted"),
+    [
+        (TargetForm(), [], True, False, True),
+        # Something to run already, or a host list that can't take discovery.
+        (TargetForm(), [Target(kind="ssh", name="a")], True, False, False),
+        (TargetForm(local=True), [], True, False, False),
+        (TargetForm(), [], False, False, False),
+        # Both dialects run what is configured; only a client-only run discovers.
+        (TargetForm(), [], True, True, False),
+    ],
+)
+def test_needs_discovery(form, inventory, discoverable, session, wanted):
+    assert needs_discovery(form, inventory, discoverable=discoverable, session=session) is wanted
+
+
+def test_an_empty_inventory_file_can_take_discovery(tmp_path):
+    empty = tmp_path / "remote_clients.toml"
+    empty.write_text("# no hosts yet\n", encoding="utf-8")
+
+    load = load_inventory_targets(empty)
+
+    assert load.targets == []
+    assert load.error is not None and "no [hosts.*]" in load.error
+    assert load.empty
+
+
+def test_a_broken_inventory_file_cannot_take_discovery(tmp_path):
+    broken = tmp_path / "remote_clients.toml"
+    broken.write_text("= nope", encoding="utf-8")
+
+    assert not load_inventory_targets(broken).empty
+    assert load_inventory_targets(None).empty
 
 
 def test_no_targets_is_a_target_form_error():
@@ -1250,234 +1318,624 @@ def test_summary_of_nothing_is_empty():
     assert results_summary([], 0, "") == ""
 
 
-# --- session relevance (issue 7) ------------------------------------------------------
+# --- session relevance (issues 7 and 25) ------------------------------------------------
 
-FIXTURES = Path(__file__).parent / "upstream" / "fixtures" / "besapi"
-
-
-class FakeBESConnection:
-    """Stands in for besapi's BESConnection: answers every query with ``xml``."""
-
-    rootserver = "https://bigfix.example.com:52311"
-
-    def __init__(self, xml=None, raises=None):
-        self.xml = xml if xml is not None else (FIXTURES / "plural.xml").read_text()
-        self.raises = raises
-        self.calls = []
-
-    def post(self, path, data, **kwargs):
-        assert path == "query"
-        (relevance,) = parse_qs(data)["relevance"]
-        self.calls.append((relevance, kwargs))
-        if self.raises is not None:
-            raise self.raises
-        return SimpleNamespace(text=self.xml, request=SimpleNamespace(status_code=200))
+SESSION_FIXTURES = Path(__file__).parent / "fixtures" / "session_rest"
+SERVER_URL = "https://bigfix.example.com:52311"
 
 
-class CountingFactory:
-    def __init__(self, *results):
-        self.results = list(results)
-        self.calls = 0
-
-    def __call__(self):
-        self.calls += 1
-        result = self.results.pop(0) if len(self.results) > 1 else self.results[0]
-        if isinstance(result, BaseException):
-            raise result
-        return result
+def rest_body(name):
+    return json.loads((SESSION_FIXTURES / f"{name}.json").read_text())
 
 
-async def test_session_evaluation_answers_with_server_details():
-    conn = FakeBESConnection()
-    connector = SessionConnector(CountingFactory(conn))
+def rest_conn(name, server=SERVER_URL, *, deployment_id: str | None = "", **fields):
+    """A REST connection; its deployment id defaults to one of its own (no discovery)."""
+    fields.setdefault("username", "api")
+    fields.setdefault("password", "pw")
+    return ConnectionConfig(
+        name=name,
+        backend="rest",
+        server=server,
+        deployment_id=(f"dep-{name}" if deployment_id == "" else deployment_id),
+        **fields,
+    )
 
-    ev = await evaluate_session("(1;2;3)", EvalOptions(timeout_s=12), connector=connector)
+
+class Router:
+    """Fake root servers behind ``httpx.MockTransport``, one answer per connection.
+
+    ``answers[name]`` is a response body (a dict, sent as JSON), an
+    ``httpx.Response``, an exception to raise, or an async callable taking the
+    relevance. Discovery's deployment-id query gets the captured answer.
+    """
+
+    def __init__(self, **answers: Any):
+        self.answers: dict[str, Any] = answers
+        self.queries: list[tuple[str, str]] = []
+
+    def transport(self, conn):
+        async def handle(request):
+            relevance = json.loads(request.content)["relevance"]
+            self.queries.append((conn.name, relevance))
+            if relevance == "sha256 of gather url of bes license":
+                return httpx.Response(200, json=rest_body("deployment_id"))
+            answer: Any = self.answers.get(conn.name, rest_body("plural_tuples"))
+            if inspect.iscoroutinefunction(answer):
+                answer = await answer(relevance)
+            if isinstance(answer, BaseException):
+                raise answer
+            if isinstance(answer, httpx.Response):
+                return answer
+            return httpx.Response(200, json=answer)
+
+        return httpx.MockTransport(handle)
+
+
+def session_clients(*conns, router=None, loads=None):
+    """``SessionClients`` over the real default factory, with a fake config and server.
+
+    ``loads`` replaces ``load_config``: configs (or exceptions to raise) to
+    hand out in turn, the last one repeating. By default it returns ``conns``.
+    """
+    router = router or Router()
+    built: list[AsyncSessionRelevanceClient] = []
+    pending: list[Config | Exception] = list(loads or [Config(connections=conns)])
+
+    def load() -> Config:
+        item = pending.pop(0) if len(pending) > 1 else pending[0]
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    def factory(opts):
+        client = default_session_client(
+            opts, load=load, transport_factory=router.transport, trust=None
+        )
+        built.append(client)
+        return client
+
+    clients = SessionClients(factory)
+    clients.built = built  # type: ignore[attr-defined]
+    return clients
+
+
+async def collect_session(text, opts=None, *, clients):
+    return [ev async for ev in stream_session(text, opts or EvalOptions(), clients=clients)]
+
+
+async def test_session_streams_one_result_per_deployment_as_each_answers():
+    async def slow(relevance):
+        await asyncio.sleep(0.05)
+        return rest_body("plural_tuples")
+
+    clients = session_clients(
+        rest_conn("prod"),
+        rest_conn("lab", "https://lab.example.com:52311"),
+        router=Router(prod=slow),
+    )
+
+    evs = await collect_session('(1, "a")', clients=clients)
+
+    assert [ev.connection for ev in evs] == ["lab", "prod"]  # completion order
+    assert [ev.host for ev in evs] == ["lab.example.com", "bigfix.example.com"]
+    assert {ev.backend for ev in evs} == {"rest"}
+    assert [ev.deployment_id for ev in evs] == ["dep-lab", "dep-prod"]
+    assert all(ev.session_relevance == '(1, "a")' for ev in evs)
+
+
+async def test_connections_to_one_deployment_give_one_result():
+    clients = session_clients(
+        rest_conn("root", deployment_id="same"),
+        rest_conn("root-again", deployment_id="same"),
+    )
+
+    evs = await collect_session("now", clients=clients)
+
+    assert len(evs) == 1
+
+
+async def test_session_answers_render_the_way_qna_does():
+    [ev] = await collect_session("x", clients=session_clients(rest_conn("prod")))
 
     assert ev.ok
-    assert ev.host == "bigfix.example.com"
-    assert ev.answers == ("1", "2", "3")
-    assert ev.answer_types == ("integer", "integer", "integer")
+    assert ev.answers == ("1, a", "2, b")
+    assert ev.answer_types == ("( integer, string )",)
     assert ev.plural is True
-    assert ev.evaluation_time == "0.39ms"
+    # Forwarded to BigFix Explorer, which reports fractions of a millisecond.
+    assert ev.evaluation_time == "0.049ms"
     assert ev.elapsed_ms is not None and ev.elapsed_ms >= 0
-    # A short connect timeout, and the run's own timeout for the answer,
-    # instead of besapi's (90, 600) default.
-    assert conn.calls == [("(1;2;3)", {"timeout": (SESSION_CONNECT_TIMEOUT_S, 12.0)})]
 
 
-async def test_session_connection_is_made_once_and_reused():
-    factory = CountingFactory(FakeBESConnection())
-    connector = SessionConnector(factory)
+async def test_session_empty_plural_answer():
+    clients = session_clients(rest_conn("prod"), router=Router(prod=rest_body("empty_plural")))
 
-    await evaluate_session("now", EvalOptions(), connector=connector)
-    await evaluate_session("now", EvalOptions(), connector=connector)
+    [ev] = await collect_session("x", clients=clients)
 
-    assert factory.calls == 1
+    assert ev.ok
+    assert ev.answers == ()
+    assert ev.plural is True
+    assert ev.evaluation_time == "0ms"
 
 
 async def test_session_relevance_error_is_a_result_not_a_raise():
-    conn = FakeBESConnection((FIXTURES / "error.xml").read_text())
+    clients = session_clients(rest_conn("prod"), router=Router(prod=rest_body("error_unknown")))
 
-    ev = await evaluate_session(
-        "nme of bes computers", EvalOptions(), connector=SessionConnector(CountingFactory(conn))
-    )
+    [ev] = await collect_session("foo bar baz", clients=clients)
 
     assert not ev.ok
-    assert ev.error_kind == "relevance"
-    assert ev.error == 'The operator "nme" is not defined.'
+    assert ev.error_kind == "session_relevance"
+    assert ev.error == 'The operator "foo bar baz" is not defined.'
+    assert ev.connection == "prod"
 
 
-async def test_session_without_any_besapi_config_says_where_it_looked():
-    ev = await evaluate_session("now", EvalOptions(), connector=SessionConnector(lambda: None))
+async def test_session_without_any_config_is_one_config_result():
+    [ev] = await collect_session("now", clients=session_clients())
 
     assert not ev.ok
     assert ev.error_kind == "config"
     assert ev.host == SESSION_HOST_UNKNOWN
     assert ev.error is not None
-    assert "BES_ROOT_SERVER" in ev.error
-    assert "~/.besapi.conf" in ev.error
+    for where in ("--setup", "BES_ROOT_SERVER", "BES_USER_NAME", "BES_PASSWORD", "~/.besapi.conf"):
+        assert where in ev.error
+    # besapi's other files are no longer read, so they aren't suggested.
+    assert "/etc/besapi.conf" not in ev.error
 
 
-async def test_session_login_failure_is_reported_and_retried_next_time():
-    factory = CountingFactory(ConnectionError("connection refused"), FakeBESConnection())
-    connector = SessionConnector(factory)
+async def test_disabled_connections_count_as_none_configured():
+    [ev] = await collect_session("now", clients=session_clients(rest_conn("off", enabled=False)))
 
-    first = await evaluate_session("now", EvalOptions(), connector=connector)
-    second = await evaluate_session("now", EvalOptions(), connector=connector)
-
-    assert first.error_kind == "connection"
-    assert first.error is not None and "connection refused" in first.error
-    assert second.ok
-    assert factory.calls == 2
+    assert ev.error_kind == "config"
 
 
-async def test_session_query_failure_drops_the_connection():
-    broken = FakeBESConnection(raises=TimeoutError("read timed out"))
-    factory = CountingFactory(broken, FakeBESConnection())
-    connector = SessionConnector(factory)
+async def test_session_with_a_broken_config_file_says_why(tmp_path, monkeypatch):
+    broken = tmp_path / "connections.toml"
+    broken.write_text("[[connections]\n", encoding="utf-8")
+    monkeypatch.setenv("BFRSR_CONFIG", str(broken))
+    clients = SessionClients(lambda opts: default_session_client(opts, trust=None))
 
-    first = await evaluate_session("now", EvalOptions(), connector=connector)
-    second = await evaluate_session("now", EvalOptions(), connector=connector)
+    [ev] = await collect_session("now", clients=clients)
 
-    assert first.error_kind == "connection"
-    assert first.host == "bigfix.example.com"
-    assert second.ok
-    assert factory.calls == 2
+    assert ev.error_kind == "config"
+    assert ev.error is not None and str(broken) in ev.error
 
 
-class BlockingBESConnection(FakeBESConnection):
-    """Holds a query for ``relevance`` until ``release`` is set, then answers or raises."""
+@pytest.mark.parametrize(
+    ("answer", "kind"),
+    [
+        (httpx.ConnectError("connection refused"), "connection"),
+        (httpx.Response(401, text="HTTP 401: Unauthorized"), "authentication"),
+    ],
+)
+async def test_session_failures_are_results(answer, kind):
+    clients = session_clients(rest_conn("prod"), router=Router(prod=answer))
 
-    def __init__(self, relevance, raises=None, fails=()):
-        super().__init__()
-        self.blocking = relevance
-        self.blocked_raises = raises
-        self.fails = fails
-        self.entered = threading.Event()
-        self.release = threading.Event()
+    [ev] = await collect_session("now", clients=clients)
 
-    def post(self, path, data, **kwargs):
-        (relevance,) = parse_qs(data)["relevance"]
-        if relevance == self.blocking:
-            self.entered.set()
-            assert self.release.wait(5), "test never released the query"
-            if self.blocked_raises is not None:
-                raise self.blocked_raises
-        if relevance in self.fails:
-            raise TimeoutError("read timed out")
-        return super().post(path, data, **kwargs)
+    assert ev.error_kind == kind
+    assert ev.connection == "prod"
+    assert ev.host == "bigfix.example.com"
 
 
-def query_in_thread(connector, relevance):
-    """Run a blocking ``connector.query`` on a thread; returns (thread, results list)."""
-    results: list = []
-    thread = threading.Thread(target=lambda: results.append(connector.query(relevance, 30)))
-    thread.start()
-    return thread, results
+async def test_session_without_a_password_never_prompts():
+    router = Router()
+    clients = session_clients(rest_conn("prod", password=None), router=router)
+
+    [ev] = await collect_session("now", clients=clients)
+
+    assert ev.error_kind == "authentication"
+    assert ev.error is not None and "no password" in ev.error
+    assert router.queries == []
 
 
-def test_a_slow_session_query_does_not_hold_up_the_next_one():
-    # A cancelled run's query keeps going in its thread; the next run (or
-    # another page sharing the connector) must not wait for it to finish.
-    conn = BlockingBESConnection("slow")
-    connector = SessionConnector(CountingFactory(conn))
-    slow, _ = query_in_thread(connector, "slow")
-    try:
-        assert conn.entered.wait(5)
+async def test_a_config_mistake_found_while_querying_is_a_config_result():
+    # The BES_* fallback isn't validated when loaded; a bad server surfaces
+    # only when the library builds its backends. The next run rebuilds.
+    bad = rest_conn("bad", "https://bigfix.example.com:52311/some/path")
+    clients = session_clients(
+        loads=[Config(connections=(bad,)), Config(connections=(rest_conn("prod"),))]
+    )
 
-        fast, results = query_in_thread(connector, "now")
-        fast.join(2)
+    first = await collect_session("now", clients=clients)
+    second = await collect_session("now", clients=clients)
 
-        assert not fast.is_alive(), "the second query waited for the first"
-        [ev] = results
-        assert ev.ok
-        assert ev.elapsed_ms is not None and ev.elapsed_ms < 1000
-    finally:
-        conn.release.set()
-        slow.join(5)
+    [ev] = first
+    assert ev.error_kind == "config"
+    assert ev.error is not None and "path" in ev.error
+    assert [ev.ok for ev in second] == [True]
+    assert len(clients.built) == 2
+    assert clients.built[0]._backends == {}  # closed
 
 
-def test_a_failed_query_does_not_drop_a_newer_connection():
-    # Query "a" is in flight on the first connection when "b" fails on it and
-    # "c" reconnects. When "a" then fails too, the newer connection stays.
-    first = BlockingBESConnection("a", raises=TimeoutError("read timed out"), fails=("b",))
-    second = FakeBESConnection()
-    factory = CountingFactory(first, second)
-    connector = SessionConnector(factory)
-    a, a_results = query_in_thread(connector, "a")
-    try:
-        assert first.entered.wait(5)
-        assert connector.query("b", 30).error_kind == "connection"
-        assert connector.query("c", 30).ok
-    finally:
-        first.release.set()
-        a.join(5)
+async def test_an_unreadable_config_is_a_config_result():
+    clients = session_clients(loads=[PermissionError("~/.bigfix: permission denied")])
 
-    [a_ev] = a_results
-    assert a_ev.error_kind == "connection"
-    assert connector.query("d", 30).ok
-    assert factory.calls == 2
-    assert [call[0] for call in second.calls] == ["c", "d"]
+    [ev] = await collect_session("now", clients=clients)
+
+    assert ev.error_kind == "config"
+    assert ev.error is not None and "permission denied" in ev.error
+    assert expected_session_results(session_clients(loads=[OSError("nope")])) == 1
 
 
-async def test_session_default_connector_uses_besapi_plugin_connection(monkeypatch):
-    # conftest makes the real one fail loudly; this checks it is the one used.
-    from besapi import plugin_utilities
+async def test_session_client_is_built_once_and_reused():
+    clients = session_clients(rest_conn("prod"))
 
-    calls = []
+    await collect_session("now", clients=clients)
+    await collect_session("now", clients=clients)
 
-    def fake_get_besapi_connection(args=None):
-        calls.append(args)
-        return FakeBESConnection()
-
-    monkeypatch.setattr(plugin_utilities, "get_besapi_connection", fake_get_besapi_connection)
-
-    ev = await evaluate_session("(1;2;3)", EvalOptions())
-
-    assert ev.ok
-    assert calls == [None]
+    assert len(clients.built) == 1
 
 
-def session_row(xml="plural.xml", factory=None):
-    conn = FakeBESConnection((FIXTURES / xml).read_text())
-    connector = SessionConnector(factory or CountingFactory(conn))
-    ev = asyncio.run(evaluate_session("x", EvalOptions(), connector=connector))
-    return ResultRow.from_session(ev)
+async def test_each_timeout_gets_its_own_client_and_keeps_it():
+    # Two pages with different timeouts take turns: neither evicts the other's
+    # client, which would sign in again (SaaS) and forget discovered ids.
+    clients = session_clients(rest_conn("prod"))
+
+    for timeout_s in (30, 12, 30, 12):
+        await collect_session("now", EvalOptions(timeout_s=timeout_s), clients=clients)
+
+    thirty, twelve = clients.built
+    assert [c.read_timeout for c in thirty.connections] == [30.0]
+    assert [c.read_timeout for c in twelve.connections] == [12.0]
+    assert thirty._backends and twelve._backends  # neither closed
+
+
+async def test_the_least_recently_used_client_is_closed_past_the_limit(monkeypatch):
+    monkeypatch.setattr(evaluation, "SESSION_CLIENTS_KEPT", 2)
+    clients = session_clients(rest_conn("prod"))
+
+    for timeout_s in (10, 20, 10, 30):
+        await collect_session("now", EvalOptions(timeout_s=timeout_s), clients=clients)
+    await asyncio.sleep(0)
+
+    ten, twenty, thirty = clients.built
+    assert twenty._backends == {}  # least recently used: closed
+    assert ten._backends and thirty._backends
+
+
+async def test_session_client_is_rebuilt_after_a_config_failure():
+    # The user ran --setup after the first run; no restart needed.
+    clients = session_clients(
+        loads=[ConfigError("cannot parse"), Config(connections=(rest_conn("prod"),))]
+    )
+
+    first = await collect_session("now", clients=clients)
+    second = await collect_session("now", clients=clients)
+
+    assert [ev.error_kind for ev in first] == ["config"]
+    assert [ev.ok for ev in second] == [True]
+
+
+async def test_session_client_is_rebuilt_after_nothing_was_configured():
+    clients = session_clients(loads=[Config(), Config(connections=(rest_conn("prod"),))])
+
+    first = await collect_session("now", clients=clients)
+    second = await collect_session("now", clients=clients)
+
+    assert [ev.error_kind for ev in first] == ["config"]
+    assert [ev.ok for ev in second] == [True]
+
+
+def test_session_timeouts_reach_every_connection():
+    config = Config(connections=(rest_conn("a"), rest_conn("b", connect_timeout=60)))
+
+    client = default_session_client(EvalOptions(timeout_s=12), load=lambda: config, trust=None)
+
+    assert [(c.connect_timeout, c.read_timeout) for c in client.connections] == [
+        (SESSION_CONNECT_TIMEOUT_S, 12.0),
+        (SESSION_CONNECT_TIMEOUT_S, 12.0),
+    ]
+
+
+def test_default_session_client_never_prompts_and_trusts_on_first_use():
+    config = Config(connections=(rest_conn("a"),))
+
+    client = default_session_client(EvalOptions(), load=lambda: config)
+
+    assert client._prompt is None
+    assert isinstance(client._trust, TrustStore)
+    assert client._trust.callback is None
+    assert client._trust.trust_on_first_use
+
+
+async def test_leaving_the_stream_early_cancels_the_other_queries():
+    cancelled = asyncio.Event()
+
+    async def hang(relevance):
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    clients = session_clients(rest_conn("fast"), rest_conn("hung"), router=Router(hung=hang))
+
+    stream = stream_session("now", EvalOptions(), clients=clients)
+    first = await anext(stream)
+    await stream.aclose()
+
+    assert first.connection == "fast"
+    await asyncio.wait_for(cancelled.wait(), 2)
+
+
+async def test_an_evicted_client_waits_for_streams_still_using_it(monkeypatch):
+    # Evicted while a page's run is still reading from it: closed only after.
+    monkeypatch.setattr(evaluation, "SESSION_CLIENTS_KEPT", 1)
+    release = asyncio.Event()
+
+    async def held(relevance):
+        if relevance == "now":  # only the first run's query
+            await release.wait()
+        return rest_body("plural_tuples")
+
+    clients = session_clients(rest_conn("prod"), router=Router(prod=held))
+    first_run = asyncio.create_task(
+        collect_session("now", EvalOptions(timeout_s=30), clients=clients)
+    )
+    while not clients.built:
+        await asyncio.sleep(0)
+    await asyncio.sleep(0.01)
+
+    await collect_session("other", EvalOptions(timeout_s=12), clients=clients)
+    await asyncio.sleep(0)
+    assert clients.built[0]._backends  # still open: the first run uses it
+
+    release.set()
+    evs = await first_run
+
+    assert all(ev.ok for ev in evs)
+    assert clients.built[0]._backends == {}  # closed once its stream ended
+
+
+class RaisingClient:
+    """A client whose stream yields ``before`` results, then raises ``exc``."""
+
+    def __init__(self, exc, before=0):
+        self.exc = exc
+        self.before = before
+        self.connections = (rest_conn("prod"), rest_conn("lab"))
+        self.closed = False
+
+    def result_count(self):
+        return 2
+
+    async def evaluate_stream(self, session_relevance):
+        for _ in range(self.before):
+            yield session_result(connection="prod")
+        raise self.exc
+
+    async def aclose(self):
+        self.closed = True
+
+
+@pytest.mark.parametrize("before", [0, 1])
+async def test_an_unexpected_stream_failure_is_a_result(before, caplog):
+    client = RaisingClient(
+        OSError("cannot write ~/.bigfix/.remote_session_known_certs.toml"), before
+    )
+    clients = SessionClients(lambda opts: client)  # type: ignore[arg-type, return-value]
+
+    with caplog.at_level(logging.DEBUG, logger=evaluation.__name__):
+        evs = await collect_session("now", clients=clients)
+
+    *answered, failed = evs
+    assert [ev.connection for ev in answered] == ["prod"] * before
+    assert failed.error_kind == "error"
+    assert failed.error is not None
+    assert "OSError" in failed.error and "known_certs" in failed.error
+    assert failed.host == SESSION_HOST_UNKNOWN
+    assert "session relevance stream failed" in caplog.text
+    assert caplog.records[-1].exc_info is not None
+    # Kept: the failure may be passing (a file write), and rebuilding would
+    # sign in again and forget discovered deployment ids.
+    await collect_session("now", clients=clients)
+    assert not client.closed
+
+
+async def test_cancelling_a_session_stream_is_not_turned_into_a_result():
+    started = asyncio.Event()
+
+    class Hanging(RaisingClient):
+        async def evaluate_stream(self, session_relevance):
+            started.set()
+            await asyncio.sleep(30)
+            yield session_result()  # pragma: no cover
+
+    clients = SessionClients(lambda opts: Hanging(None))  # type: ignore[arg-type, return-value]
+    task = asyncio.create_task(collect_session("now", clients=clients))
+    await started.wait()
+
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_session_clients_aclose_closes_the_client():
+    clients = session_clients(rest_conn("prod"))
+    await collect_session("now", clients=clients)
+
+    await clients.aclose()
+
+    assert clients.built[0]._backends == {}
+
+
+async def test_close_session_clients_closes_the_process_clients(monkeypatch):
+    clients = session_clients(rest_conn("prod"))
+    await collect_session("now", clients=clients)
+    monkeypatch.setattr(evaluation, "_session_clients", clients)
+
+    await close_session_clients()
+
+    assert clients.built[0]._backends == {}
+    assert evaluation._session_clients is None
+
+
+async def test_close_session_clients_without_any_is_a_no_op():
+    await close_session_clients()
+
+    assert evaluation._session_clients is None
+
+
+async def test_expected_session_results_counts_deployments():
+    clients = session_clients(
+        rest_conn("a", deployment_id="one"),
+        rest_conn("b", deployment_id="one"),
+        rest_conn("c", deployment_id="two"),
+    )
+
+    assert expected_session_results(clients) == 2
+
+
+async def test_expected_session_results_before_discovery_counts_connections():
+    clients = session_clients(
+        rest_conn("a", deployment_id=None),
+        rest_conn("b", "https://other.example.com:52311", deployment_id=None),
+    )
+
+    assert expected_session_results(clients) == 2
+    evs = await collect_session("now", clients=clients)
+
+    # Both report the captured deployment id: one deployment after all.
+    assert len(evs) == 1
+    assert expected_session_results(clients) == 1
+
+
+def test_expected_session_results_with_nothing_configured_is_the_config_row():
+    assert expected_session_results(session_clients()) == 1
+
+
+def test_expected_session_results_with_a_broken_config_is_the_config_row():
+    assert expected_session_results(session_clients(loads=[ConfigError("bad")])) == 1
+
+
+def test_the_default_session_clients_use_default_session_client(monkeypatch):
+    # conftest makes the real factory fail loudly; this checks it is the one used.
+    built = []
+
+    def fake(opts):
+        built.append(opts)
+        return default_session_client(
+            opts, load=lambda: Config(connections=(rest_conn("prod"),)), trust=None
+        )
+
+    monkeypatch.setattr(evaluation, "default_session_client", fake)
+
+    assert expected_session_results() == 1
+    assert built == [EvalOptions()]
+
+
+def session_result(**fields):
+    fields.setdefault("connection", "prod")
+    fields.setdefault("backend", "rest")
+    fields.setdefault("server", SERVER_URL)
+    fields.setdefault("deployment_id", "dep-prod")
+    fields.setdefault("elapsed_ms", 12.4)
+    error = fields.pop("error", None)
+    if error is not None:
+        return SessionRelevanceResult.failure("x", error, **fields)
+    fields.setdefault("type", "( integer, string )")
+    fields.setdefault("plural", True)
+    fields.setdefault("evaluation_time_ms", 0.47)
+    values = fields.pop("values", [[1, "a"], [2, "b"]])
+    return SessionRelevanceResult.from_values("x", values, **fields)
+
+
+def test_session_evaluation_maps_every_field():
+    ev = session_evaluation(session_result())
+
+    assert ev == SessionEvaluation(
+        "x",
+        "bigfix.example.com",
+        answers=("1, a", "2, b"),
+        answer_types=("( integer, string )",),
+        plural=True,
+        evaluation_time="0.47ms",
+        elapsed_ms=12,
+        connection="prod",
+        backend="rest",
+        deployment_id="dep-prod",
+    )
+
+
+@pytest.mark.parametrize(
+    ("server", "host"),
+    [
+        ("https://bigfix.example.com:52311", "bigfix.example.com"),
+        ("https://bigfix.example.com", "bigfix.example.com"),
+        ("bigfix.example.com:52311", "bigfix.example.com"),
+        ("https://[2001:db8::1]:52311", "2001:db8::1"),
+        (None, SESSION_HOST_UNKNOWN),
+        ("", SESSION_HOST_UNKNOWN),
+    ],
+)
+def test_session_evaluation_host_is_the_server_host(server, host):
+    assert session_evaluation(session_result(server=server)).host == host
+
+
+@pytest.mark.parametrize(
+    ("ms", "text"),
+    [
+        (0, "0ms"),
+        (0.049, "0.049ms"),
+        (0.31, "0.31ms"),
+        (4.0, "4ms"),
+        (1234567.8, "1234567.8ms"),
+    ],
+)
+def test_session_evaluation_time_reads_plainly(ms, text):
+    assert session_evaluation(session_result(evaluation_time_ms=ms)).evaluation_time == text
+
+
+def test_session_evaluation_of_an_error():
+    error = ResultError(kind="tls", message="certificate changed", backend="rest")
+
+    ev = session_evaluation(session_result(error=error))
+
+    assert not ev.ok
+    assert ev.error == "certificate changed"
+    assert ev.error_kind == "tls"
+    assert ev.answers == ()
+    assert ev.answer_types == ()
+    assert ev.evaluation_time is None
+
+
+def session_row(**fields):
+    return ResultRow.from_session(session_evaluation(session_result(**fields)))
 
 
 def test_session_result_row():
-    r = session_row("tuples.xml")
+    r = session_row()
 
     assert r.dialect == "session"
     assert r.ok
     assert r.status == "ok"
     assert r.host == "bigfix.example.com"
-    assert r.display_host == "bigfix.example.com"
+    assert r.display_host == "prod"  # the connection: which deployment answered
     assert r.answers == ("1, a", "2, b")
     assert r.answer_types_text == "( integer, string )"
     assert r.platform_text == "session"
     assert r.qna_version_text == ""
+    assert "via rest" in r.detail_text
     assert "0.47ms" in r.detail_text
+    assert "plural" in r.detail_text
+
+
+def test_session_row_without_a_connection_shows_the_host():
+    r = ResultRow.from_session(
+        SessionEvaluation("x", SESSION_HOST_UNKNOWN, error="e", error_kind="config")
+    )
+
+    assert r.display_host == SESSION_HOST_UNKNOWN
+
+
+def test_session_rows_group_by_connection():
+    rows = [
+        session_row(connection="prod"),
+        session_row(connection="lab"),
+        session_row(connection="prod"),
+    ]
+
+    assert [r.group for r in rows] == [("session", "prod"), ("session", "lab"), ("session", "prod")]
 
 
 def test_client_result_row_is_client_dialect():
@@ -1485,10 +1943,12 @@ def test_client_result_row_is_client_dialect():
 
 
 def test_session_error_row():
-    r = session_row("error.xml")
+    r = session_row(
+        error=ResultError(kind="session_relevance", message='The operator "nme" is not defined.')
+    )
 
     assert not r.ok
-    assert r.status == "relevance"
+    assert r.status == "session_relevance"
     assert r.error == 'The operator "nme" is not defined.'
 
 
@@ -1500,7 +1960,7 @@ def test_session_error_row():
         ("config", True, False),
         # A server is configured but unreachable: worth knowing either way.
         ("connection", True, True),
-        ("relevance", True, True),
+        ("session_relevance", True, True),
         # Session was asked for, so say why it didn't run.
         ("config", False, True),
     ],
@@ -1514,14 +1974,15 @@ def test_session_row_wanted(error_kind, optional, wanted):
 
 
 def test_session_rows_list_first_even_when_they_fail():
-    rows = [row("three", "abc"), session_row("error.xml"), row("one", "a")]
+    failed = session_row(error=ResultError(kind="session_relevance", message="nope"))
+    rows = [row("three", "abc"), failed, row("one", "a")]
 
     assert order_results(rows)[0] == 1
 
 
 def test_session_and_client_rows_for_one_host_stay_apart():
     # A root server can also be an inventory host (fastquery or ssh to it).
-    rows = [row("bigfix.example.com", "a", transport="local"), session_row()]
+    rows = [row("bigfix.example.com", "a", transport="local"), session_row(connection=None)]
 
     order = order_results(rows)
 
@@ -1531,22 +1992,23 @@ def test_session_and_client_rows_for_one_host_stay_apart():
 
 
 def test_session_result_dict_for_export():
-    conn = FakeBESConnection((FIXTURES / "tuples.xml").read_text())
-    ev = asyncio.run(
-        evaluate_session("q", EvalOptions(), connector=SessionConnector(CountingFactory(conn)))
-    )
+    d = session_result_to_dict(session_evaluation(session_result()))
 
-    d = session_result_to_dict(ev)
-
-    assert d["dialect"] == "session"
-    assert d["host"] == "bigfix.example.com"
-    assert d["session_relevance"] == "q"
-    assert d["answers"] == ["1, a", "2, b"]
-    assert d["answer_types"] == ["( integer, string )", "( integer, string )"]
-    assert d["plural"] is True
-    assert d["evaluation_time"] == "0.47ms"
-    assert d["error"] is None
-    assert d["error_kind"] is None
+    assert d == {
+        "dialect": "session",
+        "host": "bigfix.example.com",
+        "connection": "prod",
+        "backend": "rest",
+        "deployment_id": "dep-prod",
+        "session_relevance": "x",
+        "answers": ["1, a", "2, b"],
+        "answer_types": ["( integer, string )"],
+        "plural": True,
+        "evaluation_time": "0.47ms",
+        "error": None,
+        "error_kind": None,
+        "elapsed_ms": 12,
+    }
 
 
 # --- answer summary (issue 8) ----------------------------------------------------------
@@ -1847,8 +2309,29 @@ def test_preview_counts_inventory_selection_and_explicit_targets():
     assert "1 local" in p.detail
 
 
-def test_preview_with_nothing_selected_reports_the_form_problem():
+def test_preview_with_nothing_selected_counts_the_whole_inventory():
     p = preview(TargetForm())
+
+    assert p.problem is None
+    assert p.systems == len(INV)
+    assert p.sources == (("inventory", len(INV)),)
+
+
+def test_preview_with_nothing_to_run_and_discovery_left_says_so():
+    p = preview(TargetForm(), inventory=[], discoverable=True)
+
+    assert p.problem is None
+    assert p.discovers
+    assert p.text == "auto-discovery"
+    assert "auto-discovery" in p.detail
+    # Both dialects: no discovery, the BigFix servers run on their own.
+    both = preview(TargetForm(), inventory=[], discoverable=True, session=True)
+    assert not both.discovers
+    assert both.text == "BigFix server"
+
+
+def test_preview_with_nothing_selected_reports_the_form_problem():
+    p = preview(TargetForm(), inventory=[])
 
     assert p.systems == 0
     assert p.problem == "Pick at least one target."
@@ -1938,6 +2421,8 @@ def test_preview_says_nothing_about_runs_when_they_equal_systems():
         (TargetForm(container=True, container_images="a:1, b:2"), {"a:1": ["x86_64", "arm64"]}),
         (TargetForm(inventory_selected=[1]), {}),
         (TargetForm(local=True, inventory_selected=None), {}),
+        (TargetForm(), {}),
+        (TargetForm(inventory_selected=None), {}),
         (TargetForm(local=True, ssh=True, ssh_host="b", inventory_selected=[0, 1, 2, 7]), {}),
     ],
 )
@@ -1967,10 +2452,21 @@ def test_preview_both_adds_the_server():
 
 
 def test_preview_both_without_client_targets_runs_session_only():
-    p = preview(TargetForm(), session=True)
+    p = preview(TargetForm(), inventory=[], session=True)
 
     assert p.problem is None
     assert p.text == "BigFix server"
+
+
+def test_preview_counts_several_bigfix_servers():
+    p = preview(TargetForm(), client=False, session=True, session_servers=2)
+
+    assert p.text == "2 BigFix servers"
+    assert "session relevance on 2 BigFix servers" in p.detail
+    assert (
+        preview(TargetForm(inventory_selected=[0, 1]), session=True, session_servers=3).text
+        == "2 systems + 3 BigFix servers"
+    )
 
 
 def test_preview_both_with_a_bad_target_is_still_a_problem():

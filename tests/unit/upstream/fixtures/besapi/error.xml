@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<BESAPI xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="BESAPI.xsd">
-<Query Resource="nme of bes computers">
-<Result></Result>
-<Error>The operator &quot;nme&quot; is not defined.</Error>
-</Query>
-</BESAPI>

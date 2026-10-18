@@ -14,6 +14,7 @@ from bigfix_remote_client_relevance.bootstrap.targets import KNOWN_TARGETS
 
 from bigfix_relevance_debugger.upstream import remote_client_relevance as rcr
 from bigfix_relevance_debugger.upstream.remote_client_relevance import (
+    discover_into,
     find_or_discover_inventory,
     published_arches,
     target_platform,
@@ -168,3 +169,30 @@ def test_discovery_that_writes_nothing_returns_none(tmp_path):
     )
 
     assert path is None
+
+
+# --- discover_into -------------------------------------------------------------------
+
+
+def test_discover_into_runs_even_when_the_file_exists(tmp_path):
+    # A placeholder (or emptied) inventory: discovery adds what it finds.
+    path = tmp_path / "remote_clients.toml"
+    path.write_text("# placeholder\n", encoding="utf-8")
+    calls: list[Path] = []
+
+    def discover(p):
+        calls.append(p)
+        p.write_text('[hosts.local]\ntransport = "local"\n', encoding="utf-8")
+        return ["local"]
+
+    assert discover_into(path, discover=discover) == path
+    assert calls == [path]
+
+
+def test_discover_into_defaults_to_the_user_inventory(tmp_path, monkeypatch):
+    user = tmp_path / ".bigfix" / "remote_clients.toml"
+    monkeypatch.setattr(rcr, "user_inventory_path", lambda: user)
+    calls: list[Path] = []
+
+    assert discover_into(None, discover=lambda p: calls.append(p) or []) is None
+    assert calls == [user]

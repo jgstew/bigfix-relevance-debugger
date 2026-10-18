@@ -59,21 +59,27 @@ def _no_real_container_engine(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _no_real_besapi_connection(monkeypatch):
-    """Fail loudly instead of connecting to a real BigFix root server.
+def _no_real_session_relevance_client(tmp_path, monkeypatch):
+    """Fail loudly instead of connecting to a real BigFix server, and keep its files out.
 
-    besapi reads credentials from the environment and ~/.besapi.conf, so a
-    test that reached it could log in to whatever server the developer has
-    configured. The process-wide session connector is reset too, so a
-    connection one test made can't leak into the next.
+    bigfix-remote-session-relevance reads connections from its TOML file,
+    the ``BES_*`` env vars and ``~/.besapi.conf``, uses a root server's own
+    credentials, writes discovered deployment ids back to its file and pins
+    certificates under ``~/.bigfix``. So HOME and every lookup point at
+    ``tmp_path``, the default client factory refuses, and the process-wide
+    clients are reset so a client one test built can't leak into the next.
     """
-    from besapi import besapi, plugin_utilities
-
     from bigfix_relevance_debugger import evaluation
 
-    def refuse(*args, **kwargs):
-        raise AssertionError("a test reached a real besapi connection")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.setenv("BFRSR_CONFIG", str(tmp_path / "no-session-connections.toml"))
+    monkeypatch.setenv("BFRSR_LOCAL_ROOT_SERVER", "0")
+    for name in ("BES_ROOT_SERVER", "BES_USER_NAME", "BES_PASSWORD"):
+        monkeypatch.delenv(name, raising=False)
 
-    monkeypatch.setattr(plugin_utilities, "get_besapi_connection", refuse)
-    monkeypatch.setattr(besapi.BESConnection, "login", refuse)
-    monkeypatch.setattr(evaluation, "_default_connector", None)
+    def refuse(*args, **kwargs):
+        raise AssertionError("a test reached a real session relevance client")
+
+    monkeypatch.setattr(evaluation, "default_session_client", refuse)
+    monkeypatch.setattr(evaluation, "_session_clients", None)

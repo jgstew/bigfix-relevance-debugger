@@ -1,8 +1,10 @@
-"""Forward ``bigfix_remote_client_relevance`` log records to a UI callback.
+"""Forward the evaluation libraries' log records to a UI callback.
 
-The library logs and never prints; its INFO records are the progress of slow
-first-time work (qna downloads, image pulls, image prep), which is exactly
-what the activity log panel should show. No NiceGUI imports here: the
+The libraries log and never print. bigfix-remote-client-relevance's INFO
+records are the progress of slow first-time work (qna downloads, image pulls,
+image prep); bigfix-remote-session-relevance's are certificate pins (a
+WARNING with the fingerprint), failover and recorded deployment ids. That's
+exactly what the activity log panel should show. No NiceGUI imports here: the
 callback is whatever the UI passes (e.g. a ``ui.log``'s ``push``).
 """
 
@@ -12,7 +14,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 
-LIBRARY_LOGGER = "bigfix_remote_client_relevance"
+LIBRARY_LOGGERS = ("bigfix_remote_client_relevance", "bigfix_remote_session_relevance")
 
 _FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
 
@@ -67,22 +69,24 @@ def attach(
     *,
     loop: asyncio.AbstractEventLoop | None = None,
 ) -> CallbackHandler:
-    """Attach a handler to the library logger and make sure ``level`` gets through.
+    """Attach one handler to each library logger and make sure ``level`` gets through.
 
-    The library attaches only a ``NullHandler`` and leaves its logger level
-    unset, which inherits root's WARNING -- INFO records would never be
-    created. Lower the logger to ``level`` if needed, but never raise it: a
+    The libraries attach at most a ``NullHandler`` and leave their logger
+    level unset, which inherits root's WARNING -- INFO records would never be
+    created. Lower each logger to ``level`` if needed, but never raise it: a
     second client asking for INFO must not silence the first one's DEBUG.
     """
-    logger = logging.getLogger(LIBRARY_LOGGER)
     handler = CallbackHandler(callback, level, loop=loop)
-    logger.addHandler(handler)
-    if logger.level == logging.NOTSET or logger.level > level:
-        logger.setLevel(level)
+    for name in LIBRARY_LOGGERS:
+        logger = logging.getLogger(name)
+        logger.addHandler(handler)
+        if logger.level == logging.NOTSET or logger.level > level:
+            logger.setLevel(level)
     return handler
 
 
 def detach(handler: logging.Handler) -> None:
     """Remove a handler added by :func:`attach`. Safe to call twice."""
-    logging.getLogger(LIBRARY_LOGGER).removeHandler(handler)
+    for name in LIBRARY_LOGGERS:
+        logging.getLogger(name).removeHandler(handler)
     handler.close()

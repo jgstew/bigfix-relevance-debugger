@@ -18,7 +18,7 @@ import sys
 import threading
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from bigfix_remote_client_relevance import (
     BigFixRelevanceError,
@@ -27,6 +27,8 @@ from bigfix_remote_client_relevance import (
     find_inventory_path,
     results_to_dicts,
 )
+from bigfix_remote_client_relevance.inventory_paths import user_inventory_path
+from nicegui import app as nicegui_app
 from nicegui import background_tasks, ui
 from nicegui.events import GenericEventArguments, ValueChangeEventArguments
 
@@ -60,9 +62,11 @@ from bigfix_relevance_debugger.evaluation import (
     breakdown_qna_note,
     build_targets,
     choose_breakdown_target,
-    evaluate_session,
+    close_session_clients,
+    expected_session_results,
     inventory_table_row,
     load_inventory_targets,
+    needs_discovery,
     pick_label,
     preview_targets,
     resolve_container_arches,
@@ -73,15 +77,21 @@ from bigfix_relevance_debugger.evaluation import (
     session_result_to_dict,
     session_row_wanted,
     stream_results,
+    stream_session,
     tally_table_row,
     total_work,
     visible_results,
     waits_for_inventory,
 )
 from bigfix_relevance_debugger.log_bridge import attach, detach
-from bigfix_relevance_debugger.upstream.remote_client_relevance import find_or_discover_inventory
+from bigfix_relevance_debugger.upstream.remote_client_relevance import (
+    discover_into,
+    find_or_discover_inventory,
+)
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 TITLE = "BigFix Relevance Debugger"
 LOGO = Path(__file__).with_name("logo.svg")
@@ -706,6 +716,7 @@ async def root() -> None:
     # --- target count -----------------------------------------------------------
 
     def current_preview() -> TargetPreview:
+        session = SESSION in state.view.run_dialects
         return preview_targets(
             state.form,
             inventory.targets,
@@ -713,11 +724,15 @@ async def root() -> None:
             qna_spec=EvalOptions(qna_version=state.qna_version or "").qna_spec,
             inventory_pending=not state.inventory_ready,
             client=CLIENT in state.view.run_dialects,
-            session=SESSION in state.view.run_dialects,
+            session=session,
+            discoverable=discoverable(),
+            # Only asked when session relevance runs: it reads the config.
+            session_servers=expected_session_results() if session else 1,
         )
 
     def refresh_targets() -> TargetPreview:
         """Show what Evaluate would run on now, in the header and the side panel."""
+        show_inventory_count()
         preview = current_preview()
         problem = preview.problem is not None
         targets_toggle.set_text(preview.text)
@@ -809,15 +824,40 @@ async def root() -> None:
             try:
                 targets = build_targets(state.form, inventory.targets, image_arches)
             except NoTargetsError as exc:
-                if not session:
-                    raise
-                ui.notify(f"{exc} Running session relevance only.", type="info")
-                targets = []
+                problem, targets = exc, []
+                # Client-only relevance and no client target configured at all:
+                # discover some first. With session too, run what is configured.
+                if needs_discovery(
+                    state.form, inventory.targets, discoverable=discoverable(), session=session
+                ):
+                    where = await discover_now()
+                    try:
+                        targets = build_targets(state.form, inventory.targets, image_arches)
+                    except NoTargetsError:
+                        problem = NoTargetsError(
+                            f"Pick at least one target: auto-discovery found none to add to {where}."
+                        )
+                if not targets:
+                    if not session:
+                        raise problem from None
+                    ui.notify(f"{problem} Running session relevance only.", type="info")
         except ValueError as exc:
             ui.notify(str(exc), type="warning")
             side_panel.show()  # targets and options both live there
             return None
         return targets, opts
+
+    def in_page(work: Awaitable[T]) -> asyncio.Task[T]:
+        """A task that can update this page: ``ui.notify`` and new elements need
+        a slot, and NiceGUI keeps the slot stack per task, so a fresh task has
+        none. (The simulated user's ``ui.notify`` needs none, which hides it.)
+        """
+
+        async def entered() -> T:
+            with client:
+                return await work
+
+        return asyncio.create_task(entered())
 
     def start(job: Callable[[], Awaitable[None]]) -> None:
         """Run ``job`` as the page's one task, created before the click returns.
@@ -851,7 +891,7 @@ async def root() -> None:
                 if not client.is_deleted:
                     update_buttons()
 
-        state.task = asyncio.create_task(wrapper())
+        state.task = in_page(wrapper())
         update_buttons()
 
     def evaluate() -> None:
@@ -865,7 +905,10 @@ async def root() -> None:
             if collected is None:
                 return
             targets, opts = collected
-            total = (total_work(targets, opts) if targets else 0) + int(session)
+            # Deployments not discovered yet count as one per connection; the
+            # session task corrects the total once it knows.
+            session_expected = expected_session_results(opts=opts) if session else 0
+            total = (total_work(targets, opts) if targets else 0) + session_expected
             done = 0
             state.results = []
             state.session_results = []
@@ -881,11 +924,14 @@ async def root() -> None:
             progress.set_value(0)
             progress_label.set_text(f"0 / {total}")
 
+            def show_progress() -> None:
+                progress.set_value(done / total if total else 1)
+                progress_label.set_text(f"{done} / {total}")
+
             def tick() -> None:
                 nonlocal done
                 done += 1
-                progress.set_value(done / total if total else 1)
-                progress_label.set_text(f"{done} / {total}")
+                show_progress()
 
             def arrived(row: ResultRow) -> None:
                 state.table_rows.append(results_table_row(len(state.rows), row))
@@ -899,23 +945,36 @@ async def root() -> None:
             session_optional = view.session_optional and bool(targets)
 
             async def run_session() -> None:
-                ev = await evaluate_session(text, opts)
-                if not session_row_wanted(ev, optional=session_optional):
-                    activity.push(
-                        "session relevance skipped: no BigFix server is configured. "
-                        "Pick Session or Both in the Dialect picker to see where it looked."
+                nonlocal total, session_expected
+                seen = 0
+                # One result per deployment, as each answers.
+                async for ev in stream_session(text, opts):
+                    seen += 1
+                    if seen > session_expected:
+                        # More deployments than counted: grow the total now,
+                        # so progress never reads past it.
+                        total += 1
+                        session_expected = seen
+                    if not session_row_wanted(ev, optional=session_optional):
+                        # Not an error row (it wasn't asked for), but say how to add one.
+                        activity.push(f"session relevance skipped: {ev.error}")
+                        ui.notify(f"Session relevance skipped. {ev.error}", type="info")
+                        tick()
+                        continue
+                    state.session_results.append(ev)
+                    outcome = (
+                        f"{len(ev.answers)} answer(s)" if ev.ok else f"{ev.error_kind}: {ev.error}"
                     )
-                    tick()
-                    return
-                state.session_results.append(ev)
-                outcome = (
-                    f"{len(ev.answers)} answer(s)" if ev.ok else f"{ev.error_kind}: {ev.error}"
-                )
-                activity.push(f"session relevance on {ev.host}: {outcome}")
-                arrived(ResultRow.from_session(ev))
+                    where = f"{ev.connection} ({ev.backend})" if ev.connection else ev.host
+                    activity.push(f"session relevance on {where}: {outcome}")
+                    arrived(ResultRow.from_session(ev))
+                if seen < session_expected:
+                    # Fewer: connections to one deployment counted once.
+                    total -= session_expected - seen
+                    show_progress()
 
-            # The root server answers alongside qna, so a slow one holds up nothing.
-            session_task = asyncio.create_task(run_session()) if session else None
+            # The BigFix servers answer alongside qna, so a slow one holds up nothing.
+            session_task = in_page(run_session()) if session else None
             try:
                 if targets:
                     async for result in stream_results(text, targets, opts):
@@ -1124,15 +1183,20 @@ async def root() -> None:
 
     # --- inventory -------------------------------------------------------------------
 
+    def show_inventory_count() -> None:
+        """Refresh the inventory table's selection count; set while the table shows."""
+
     def render_inventory(discovering: bool = False) -> None:
+        nonlocal show_inventory_count
+        show_inventory_count = lambda: None  # until a table shows a count again
         inventory_box.clear()
         with inventory_box:
             if discovering:
                 with ui.row().classes("items-center gap-2").mark("inventory-discovering"):
                     ui.spinner(size="sm")
                     ui.label(
-                        "No remote_clients.toml found: running auto-discovery, which "
-                        "writes ~/.bigfix/remote_clients.toml (progress in the activity log)."
+                        f"No client targets configured: running auto-discovery, which "
+                        f"writes {discovery_path()} (progress in the activity log)."
                     ).classes("text-caption")
             elif inventory.error:
                 where = f" {inventory.path}" if inventory.path else ""
@@ -1170,7 +1234,11 @@ async def root() -> None:
         count = ui.label().classes("text-caption opacity-70").mark("inventory-count")
 
         def show_count() -> None:
-            count.set_text(f"{len(table.selected)} of {len(rows)} selected")
+            if table.selected or state.form.local or state.form.container or state.form.ssh:
+                count.set_text(f"{len(table.selected)} of {len(rows)} selected")
+            else:
+                # build_targets' default: picking nothing runs on every host.
+                count.set_text(f"none selected: Evaluate runs on all {len(rows)}")
 
         def on_select(_: Any) -> None:
             state.form.inventory_selected = sorted(int(r["id"]) for r in table.selected)
@@ -1186,7 +1254,35 @@ async def root() -> None:
                 table.update()
 
             host_filter.on_value_change(on_filter)
+        nonlocal show_inventory_count
+        show_inventory_count = show_count
         show_count()
+
+    def discovery_path() -> Path:
+        return inventory.path or _inventory_path or user_inventory_path()
+
+    def discoverable() -> bool:
+        """The inventory can take auto-discovery, and it hasn't been tried on it yet."""
+        return inventory.empty and discovery_path() not in _discovery_tried
+
+    async def discover_now() -> Path:
+        """Auto-discovery into the inventory, for a run with no client target configured."""
+        nonlocal inventory
+        path = discovery_path()
+        activity.push(f"no client targets configured: running auto-discovery into {path}")
+        progress_label.set_text("running auto-discovery ...")
+        render_inventory(discovering=True)
+        try:
+            inventory = load_inventory_targets(await asyncio.to_thread(_discover_into_once, path))
+        except Exception as exc:
+            logger.debug("auto-discovery failed", exc_info=True)
+            inventory = InventoryLoad(path=path, targets=[], error=f"auto-discovery failed: {exc}")
+        finally:
+            progress_label.set_text("")
+        state.form.inventory_selected = list(range(len(inventory.targets)))
+        render_inventory()
+        refresh_targets()
+        return path
 
     async def load_inventory() -> None:
         nonlocal inventory
@@ -1224,9 +1320,21 @@ async def root() -> None:
 _discovery_lock = threading.Lock()
 
 
+_discovery_tried: set[Path] = set()
+"""Inventories auto-discovery already ran on in this process. It evaluates every
+candidate and may pull images, so a fruitless one isn't repeated on every Evaluate."""
+
+
 def _discover_inventory_once() -> Path | None:
     with _discovery_lock:
+        _discovery_tried.add(user_inventory_path())
         return find_or_discover_inventory()
+
+
+def _discover_into_once(path: Path) -> Path | None:
+    with _discovery_lock:
+        _discovery_tried.add(path)
+        return discover_into(path)
 
 
 def _breakdown_table(
@@ -1370,4 +1478,5 @@ def main(argv: list[str] | None = None) -> None:
         kwargs["window_size"] = WINDOW_SIZE
     if args.port is not None:
         kwargs["port"] = args.port
+    nicegui_app.on_shutdown(close_session_clients)
     ui.run(root, **kwargs)

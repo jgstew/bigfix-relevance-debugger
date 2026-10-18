@@ -8,8 +8,9 @@ Guidance for AI coding agents working in this repo. Usage docs are in
 A NiceGUI (asyncio) browser app for BigFix client and session relevance. It
 does live static analysis with `bigfix-relevance-analyzer`, evaluates client
 relevance with real `qna` through `bigfix-remote-client-relevance` and
-session relevance on a root server through `besapi`, and has a per-level
-breakdown (client only).
+session relevance on every configured BigFix deployment through
+`bigfix-remote-session-relevance`, and has a per-level breakdown (client
+only).
 Entry point: `bigfix_relevance_debugger.app:main`, run via
 `uvx`/`uv run`.
 
@@ -17,14 +18,14 @@ Entry point: `bigfix_relevance_debugger.app:main`, run via
   - `analysis.py`: analyzer -> frozen view-model dataclasses, plus CodeMirror
     decoration specs (the breakdown highlight only). Pure and sync.
   - `evaluation.py`: target form -> `Target`s, inventory loading, streaming,
-    session relevance (`evaluate_session`) and `run_breakdown`. Async.
-  - `log_bridge.py`: library logger -> UI callback, thread-safe.
+    session relevance (`stream_session`) and `run_breakdown`. Async.
+  - `log_bridge.py`: library loggers -> UI callback, thread-safe.
   - `editor.py` + `relevance_codemirror.js`: the relevance editor, NiceGUI's
     CodeMirror wired to the analyzer's language server. See below.
   - `app.py`: the page and `main()`. UI wiring only.
   - `upstream/`: code meant to be donated to the libraries, one module per
-    library (`remote_client_relevance.py`, `relevance_analyzer.py`,
-    `besapi.py`). See below.
+    library (`remote_client_relevance.py`, `relevance_analyzer.py`). See
+    below.
 - `tests/unit/`: offline. No Docker, qna, SSH or network.
 
 **Keep NiceGUI out of `analysis.py`, `evaluation.py` and `log_bridge.py`** so
@@ -121,16 +122,32 @@ uv run pyright src tests
 - **Dialect decides what Evaluate runs.** `analysis.summarize(text, mode)`
   sets `run_dialects` (session first) from `upstream.relevance_analyzer.dialect_fit`
   or the picker's override. Session results always sort first.
-- **Session relevance connects with besapi's own lookup**
-  (`plugin_utilities.get_besapi_connection(None)`: root server credentials,
-  `BES_*` env vars, then `besapi.conf` files). Don't add another config file.
-  Avoid `init_plugin` (it parses `sys.argv`, calls `basicConfig(force=True)`
-  and exits) and `session_relevance_array` (it loses tuple answers); parse
-  the `session_relevance_xml` response with `upstream.besapi`. Tests inject a
-  `SessionConnector` with a fake connection (`evaluate_session(...,
-  connector=...)`) or monkeypatch `app.evaluate_session`.
+- **Session relevance connects with `bigfix-remote-session-relevance`'s own
+  lookup** (`load_config`: its TOML file, else the `BES_*` env vars and
+  `~/.besapi.conf`, plus a root server's own credentials). Don't add a
+  config file of the app's own: the library's TOML file is shared with its
+  CLI, as `~/.bigfix/remote_clients.toml` is for client relevance.
+  `evaluation.SessionClients` holds the one process-wide
+  `AsyncSessionRelevanceClient` (built lazily, rebuilt when the timeout
+  changes or after a config failure, closed at shutdown). It runs on the
+  event loop: no threads. `stream_session` yields one `SessionEvaluation`
+  per deployment, or one `config` result when nothing is configured
+  (`"config"` is this app's kind; the rest are the library's
+  `ResultError.kind`). Tests build `SessionClients` over
+  `default_session_client(opts, load=..., transport_factory=..., trust=None)`
+  with fake servers (`httpx.MockTransport`), or monkeypatch
+  `app.stream_session` and `app.expected_session_results`.
+- **The session row count is `expected_session_results`**: the library's
+  `result_count()` (one per deployment), else the connection count before
+  deployment ids are discovered (the run corrects its progress total), and
+  1 for the `config` row. The header's target count and progress both use
+  it.
 - **Tests must never connect to a real BigFix server.** `tests/conftest.py`
-  makes besapi's connection fail loudly and resets the shared connector.
+  points HOME, `BFRSR_CONFIG` and the `BES_*` vars at nothing, turns off the
+  local root server lookup, makes `evaluation.default_session_client` fail
+  loudly and resets the shared clients. Test modules import the real
+  `default_session_client` before that patch, so they can still use it with
+  a fake `load`.
 - **Tests must never run real discovery.** It writes
   `~/.bigfix/remote_clients.toml`; `tests/conftest.py` makes it fail loudly.
 - **Tests must never ask a real container engine.** The page looks up an
@@ -139,12 +156,24 @@ uv run pyright src tests
   page tests fake `app.resolve_container_arches`.
 - **Smart defaults, no required clicks.** Infer the best option (inventory
   all selected, auto arch, the best breakdown target) and say why; selecting
-  less is the override. Don't add dialogs that ask.
+  less is the override. Don't add dialogs that ask. Selecting nothing at all
+  is not "run nothing": `evaluation.inventory_indexes` runs every inventory
+  host. What an empty setup does depends on the dialect: client-only
+  relevance with no host configured runs auto-discovery into the inventory
+  first (`needs_discovery`, once per file per process; page tests fake
+  `app.discover_into`); session-only relevance with no BigFix server shows
+  the `config` row saying how to add one; both dialects run what is
+  configured, never discover, and advise adding a server when there is none.
+- **`ui.notify` and new elements need a slot, and NiceGUI keeps the slot
+  stack per task.** Start page work in a task with `in_page(...)` (it enters
+  the page's client), never a bare `asyncio.create_task`. The simulated
+  user's `ui.notify` doesn't look the slot up, so `test_app.py`'s autouse
+  `app_started` fixture makes it, as a served page does.
 - **Logging, never print** (ruff `T20`). Library INFO goes to the activity
   log by default and DEBUG with `-v`, matching the library CLI's policy.
 - **Check UI changes in a real run** when Docker is available, e.g. evaluate
   `name of operating system` on `debian:11` / `arm64` / qna `11.0.7.61`.
-  For session relevance, `now` runs both dialects if a root server is
+  For session relevance, `now` runs both dialects if a BigFix server is
   configured (read-only queries only).
 
 ## Releasing

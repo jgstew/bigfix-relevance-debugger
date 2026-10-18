@@ -34,7 +34,11 @@ def test_pre_commit_ruff_matches_the_locked_ruff():
 
 # jgstew's own libraries: this app is developed alongside them and often
 # needs a release the day it ships, so they skip the cooldown.
-JGSTEW_PACKAGES = {"besapi", "bigfix-relevance-analyzer", "bigfix-remote-client-relevance"}
+JGSTEW_PACKAGES = {
+    "bigfix-relevance-analyzer",
+    "bigfix-remote-client-relevance",
+    "bigfix-remote-session-relevance",
+}
 
 
 def uv_settings() -> dict:

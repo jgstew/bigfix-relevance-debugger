@@ -119,3 +119,24 @@ def find_or_discover_inventory(
     if not user_path.exists():
         (discover or run_auto_discovery)(user_path)
     return user_path if user_path.is_file() else None
+
+
+def discover_into(
+    path: Path | None = None,
+    *,
+    discover: Callable[[Path], list[str]] | None = None,
+) -> Path | None:
+    """Run auto-discovery into ``path`` (the per-user inventory by default).
+
+    Unlike :func:`find_or_discover_inventory`, it runs even when the file
+    exists: for a front end whose user has no client targets configured
+    (an inventory with no hosts, such as the placeholder a fruitless
+    discovery leaves). ``run_auto_discovery`` only adds hosts missing from
+    the file. Blocking, like discovery itself. Returns ``path`` when it is a
+    file afterwards.
+
+    Upstream: ``discovery.py``, beside ``run_auto_discovery``.
+    """
+    path = path if path is not None else user_inventory_path()
+    (discover or run_auto_discovery)(path)
+    return path if path.is_file() else None
