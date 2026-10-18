@@ -79,6 +79,14 @@ def test_main_runs_without_reload(captured_run):
     assert call["dark"] is None
 
 
+def test_main_uses_the_logo_as_favicon(captured_run):
+    main([])
+
+    [call] = captured_run
+    assert call["favicon"] == app_module.LOGO
+    assert app_module.LOGO.is_file()
+
+
 def test_main_defaults_to_a_native_window(captured_run):
     main([])
 
@@ -2354,6 +2362,16 @@ async def test_toggle_opens_and_closes_the_side_panel(inventory_user):
 
     inventory_user.find(marker="targets-toggle").click()
     assert side_panel(inventory_user).value is False
+
+
+async def test_header_shows_the_logo_before_the_title(user):
+    await user.open("/")
+
+    [logo] = user.find(marker="header-logo").elements
+    assert logo.props["src"]
+    siblings = list(logo.parent_slot.children)
+    title = next(e for e in siblings if getattr(e, "text", None) == app_module.TITLE)
+    assert siblings.index(logo) < siblings.index(title)
 
 
 async def test_header_shows_how_many_systems_will_be_targeted(inventory_user):
