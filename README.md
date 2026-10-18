@@ -195,11 +195,20 @@ discovery doesn't repeat on every start. The page opens right away; the
 table fills in when discovery finishes, and its progress is in the activity
 log.
 
+**An inventory with no hosts** (such as that placeholder) gets discovery on
+**Evaluate** instead: with nothing ticked, the header reads `auto-discovery`,
+and Evaluate runs discovery into that file first, adding whatever works, then
+evaluates on it. Discovery runs at most once per file while the app runs. If
+it finds nothing, the run says so (session relevance still runs when it
+applies). A file that fails to load is never discovered into.
+
 **Every inventory host is selected by default**, so **Evaluate** runs on the
 whole inventory (plus any Local/Container/SSH target you tick under **Add
 targets**). The inventory is a checkbox table with each host's kind,
 platform and qna version(s); untick hosts to narrow a run, or use the header
-checkbox for all or none. From 9 hosts it gets a filter box. With many
+checkbox for all or none. **Unticking every host means all of them**, the
+same as the default (the table says `none selected: Evaluate runs on all`),
+unless you tick a Local, Container or SSH target, which then runs alone. From 9 hosts it gets a filter box. With many
 container hosts, the first run against images that aren't cached yet is
 slow; **Max parallel** limits how many targets run at once.
 
@@ -220,6 +229,8 @@ reads:
 - `12 systems + BigFix server` when session relevance runs too, and
   `BigFix server` when only session relevance runs; `2 BigFix servers` with
   two deployments configured.
+- `auto-discovery` when no client target is configured and Evaluate will
+  discover some first (see above).
 - `0 systems`, with a warning icon, when nothing would run. The panel then
   opens itself and says why. It also opens when a run stops on a target or
   option problem, but it never closes itself.

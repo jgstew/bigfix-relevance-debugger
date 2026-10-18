@@ -12,6 +12,7 @@ import asyncio
 import dataclasses
 import functools
 import logging
+from collections import OrderedDict
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
 from contextlib import aclosing, asynccontextmanager
 from dataclasses import dataclass, field
@@ -30,6 +31,7 @@ from bigfix_remote_client_relevance import (
 )
 from bigfix_remote_client_relevance.bootstrap.targets import host_arch, normalize_arch
 from bigfix_remote_client_relevance.discovery import ImageSource, default_image_source
+from bigfix_remote_client_relevance.inventory import EmptyInventoryError
 from bigfix_remote_client_relevance.render import display_host
 from bigfix_remote_session_relevance import (
     AsyncSessionRelevanceClient,
@@ -157,12 +159,35 @@ def build_targets(
             )
         )
 
-    selected = form.inventory_selected or []
-    targets.extend(inventory[i] for i in selected if 0 <= i < len(inventory))
+    targets.extend(inventory[i] for i in inventory_indexes(form, inventory))
 
     if not targets:
         raise NoTargetsError("Pick at least one target.")
     return targets
+
+
+def _ticked(form: TargetForm) -> bool:
+    return form.local or form.container or form.ssh
+
+
+def inventory_indexes(form: TargetForm, inventory: Sequence[Target]) -> list[int]:
+    """The inventory hosts a run uses: the picked ones, or all when nothing at all is picked.
+
+    Picking nothing means the default, every configured host, not an empty
+    run; ticking Local, Container or SSH alone runs just that.
+    """
+    if not form.inventory_selected and not _ticked(form):
+        return list(range(len(inventory)))
+    return [i for i in form.inventory_selected or [] if 0 <= i < len(inventory)]
+
+
+def needs_discovery(form: TargetForm, inventory: Sequence[Target], *, discoverable: bool) -> bool:
+    """Whether Evaluate runs auto-discovery first: nothing picked and no host configured.
+
+    ``discoverable``: the inventory loaded with no hosts (or there is no
+    file), and discovery hasn't already been tried on it.
+    """
+    return discoverable and not inventory and not _ticked(form)
 
 
 # --- choosing the breakdown target --------------------------------------------------
@@ -283,14 +308,19 @@ class InventoryLoad:
     path: Path | None
     targets: list[Target]
     error: str | None
+    empty: bool = False
+    """No file, or one that parsed fine with no hosts: auto-discovery may add
+    to it. A broken file is never discovered into."""
 
 
 def load_inventory_targets(path: Path | None) -> InventoryLoad:
     """Load an inventory for the picker. A bad file is reported, never raised."""
     if path is None:
-        return InventoryLoad(path=None, targets=[], error=None)
+        return InventoryLoad(path=None, targets=[], error=None, empty=True)
     try:
         return InventoryLoad(path=path, targets=load_inventory(path), error=None)
+    except EmptyInventoryError as exc:
+        return InventoryLoad(path=path, targets=[], error=str(exc), empty=True)
     except InventoryError as exc:
         return InventoryLoad(path=path, targets=[], error=str(exc))
     except Exception as exc:  # noqa: BLE001 - the picker must not take the page down
@@ -348,6 +378,8 @@ class TargetPreview:
     """Session relevance runs on the BigFix servers too (or only, with no systems)."""
     session_servers: int = 1
     """Session results the run yields: one per configured deployment."""
+    discovers: bool = False
+    """No client target is configured, so Evaluate runs auto-discovery first."""
 
     @property
     def session_text(self) -> str:
@@ -361,6 +393,8 @@ class TargetPreview:
         """Short, for the header: ``"12 systems"``, ``"≥ 2 systems"``, ``"BigFix server"``."""
         if self.systems is None:
             text = "finding inventory …"
+        elif self.discovers:
+            text = "auto-discovery"
         elif self.session and self.systems == 0:
             return self.session_text
         else:
@@ -376,6 +410,11 @@ class TargetPreview:
             parts.append(self.problem)
         if self.systems is None:
             parts.append("waiting for inventory auto-discovery")
+        if self.discovers:
+            parts.append(
+                "no client targets configured: Evaluate runs auto-discovery first "
+                "and adds what it finds to the inventory"
+            )
         if self.sources:
             parts.append(" · ".join(f"{n} {name}" for name, n in self.sources))
         if self.systems and self.runs != self.systems:
@@ -398,6 +437,7 @@ def preview_targets(
     client: bool = True,
     session: bool = False,
     session_servers: int = 1,
+    discoverable: bool = False,
 ) -> TargetPreview:
     """What Evaluate would target right now, by its own rules.
 
@@ -406,6 +446,7 @@ def preview_targets(
     ``session``, having none selected isn't a problem either (the run goes
     ahead as session only), but a selected target with a bad field still is.
     ``session_servers`` is ``expected_session_results()``, as progress uses.
+    ``discoverable`` is as for :func:`needs_discovery`.
     """
     if not client:
         return TargetPreview(systems=0, session=session, session_servers=session_servers)
@@ -414,6 +455,10 @@ def preview_targets(
     try:
         targets = build_targets(form, inventory, image_arches)
     except NoTargetsError as exc:
+        if needs_discovery(form, inventory, discoverable=discoverable):
+            return TargetPreview(
+                systems=0, discovers=True, session=session, session_servers=session_servers
+            )
         if session:
             return TargetPreview(systems=0, session=True, session_servers=session_servers)
         return TargetPreview(systems=0, problem=str(exc))
@@ -426,7 +471,7 @@ def preview_targets(
     if form.container and AUTO_ARCH in form.container_arches:
         unresolved = tuple(i for i in _images(form) if i not in image_arches)
     # build_targets puts the inventory hosts last.
-    from_inventory = sum(1 for i in form.inventory_selected or [] if 0 <= i < len(inventory))
+    from_inventory = len(inventory_indexes(form, inventory))
     explicit = targets[: len(targets) - from_inventory]
     sources = [("inventory", from_inventory)] + [
         (kind, sum(1 for t in explicit if t.kind == kind)) for kind in ("local", "container", "ssh")
@@ -630,30 +675,39 @@ def default_session_client(
 SessionClientFactory = Callable[[EvalOptions], AsyncSessionRelevanceClient]
 
 
+SESSION_CLIENTS_KEPT = 4
+"""Clients kept open, one per run timeout, least recently used closed first."""
+
+
 class SessionClients:
-    """The process's session relevance client, shared by every page and run.
+    """The process's session relevance clients, shared by every page and run.
 
     Shared because BigFix SaaS signs in per client (and failed sign-ins lock
-    the account), and deployment discovery is per client. Built on first use,
-    rebuilt when the timeout changes, and retried on the next run after the
-    config failed to load or had nothing in it, so running ``--setup`` needs
-    no restart. A replaced client is closed once no stream is using it. No
-    threads: everything runs on the event loop.
+    the account), and deployment discovery is per client. The library sets
+    timeouts per connection when a client is built, so there is one client
+    per run timeout: pages with different timeouts each keep theirs instead
+    of evicting each other's (up to ``SESSION_CLIENTS_KEPT``). Built on first
+    use, and retried on the next run after the config failed to load or had
+    nothing in it, so running ``--setup`` needs no restart. A client that is
+    dropped is closed once no stream is using it. Building one is cheap: it
+    signs in on its first query. No threads: everything runs on the event loop.
     """
 
     def __init__(self, factory: SessionClientFactory | None = None) -> None:
         self._factory = factory
-        self._client: AsyncSessionRelevanceClient | None = None
-        self._timeout_s: float | None = None
+        self._clients: OrderedDict[float, AsyncSessionRelevanceClient] = OrderedDict()
+        """By run timeout, least recently used first."""
         self._users: dict[AsyncSessionRelevanceClient, int] = {}
         self._retired: set[AsyncSessionRelevanceClient] = set()
         self._problem: str | None = None
         """Why the last build gave no client, until one succeeds."""
 
     def _build(self, opts: EvalOptions) -> AsyncSessionRelevanceClient | str:
-        """The current client for ``opts``, building it if needed; else what's wrong."""
-        if self._client is not None and self._timeout_s == opts.timeout_s:
-            return self._client
+        """The client for ``opts``, building it if needed; else what's wrong."""
+        client = self._clients.get(opts.timeout_s)
+        if client is not None:
+            self._clients.move_to_end(opts.timeout_s)
+            return client
         # Looked up on each call (not bound at import) so tests can replace it.
         factory = self._factory or default_session_client
         try:
@@ -665,24 +719,28 @@ class SessionClients:
             logger.debug("session config could not be read", exc_info=True)
             self._problem = f"{type(exc).__name__}: {exc}"
             return self._problem
-        self._retire(self._client)
         if not client.connections:
-            self._client, self._timeout_s = None, None
-            self._retire(client)
+            # Nothing configured any more: the other clients are stale too.
+            for old in [client, *self._clients.values()]:
+                self._retire(old)
+            self._clients.clear()
             self._problem = NO_SESSION_CONFIG
             return self._problem
-        self._client, self._timeout_s, self._problem = client, opts.timeout_s, None
+        self._clients[opts.timeout_s] = client
+        self._problem = None
+        while len(self._clients) > SESSION_CLIENTS_KEPT:
+            _, oldest = self._clients.popitem(last=False)
+            self._retire(oldest)
         return client
 
     def discard(self, client: AsyncSessionRelevanceClient) -> None:
         """Stop handing out ``client`` (its config turned out bad); the next run rebuilds."""
-        if self._client is client:
-            self._client, self._timeout_s = None, None
-            self._retire(client)
+        for timeout_s, kept in list(self._clients.items()):
+            if kept is client:
+                del self._clients[timeout_s]
+                self._retire(client)
 
-    def _retire(self, client: AsyncSessionRelevanceClient | None) -> None:
-        if client is None:
-            return
+    def _retire(self, client: AsyncSessionRelevanceClient) -> None:
         if self._users.get(client):
             self._retired.add(client)
         else:
@@ -691,13 +749,14 @@ class SessionClients:
     def expected(self, opts: EvalOptions | None = None) -> int:
         """Session results a run yields: one per deployment, or the one ``config`` row.
 
-        Builds the client if there is none yet, but doesn't retry a config
-        that failed: that's for the next run.
+        Asks the most recently used client, building one if there is none
+        yet, but doesn't retry a config that failed: that's for the next run.
         """
-        client = self._client
-        if client is None:
-            if self._problem is not None:
-                return 1
+        if self._clients:
+            client = next(reversed(self._clients.values()))
+        elif self._problem is not None:
+            return 1
+        else:
             built = self._build(opts or EvalOptions())
             if isinstance(built, str):
                 return 1
@@ -725,10 +784,8 @@ class SessionClients:
 
     async def aclose(self) -> None:
         """Close every client, in use or not: the app is stopping."""
-        clients = {*self._retired, *self._users}
-        if self._client is not None:
-            clients.add(self._client)
-        self._client, self._timeout_s = None, None
+        clients = {*self._retired, *self._users, *self._clients.values()}
+        self._clients.clear()
         self._retired.clear()
         await asyncio.gather(*(c.aclose() for c in clients), return_exceptions=True)
 
@@ -800,6 +857,18 @@ async def stream_session(
             # (e.g. a BES_ROOT_SERVER with a path): a config row, not a crash.
             clients.discard(client)
             yield _config_problem(session_relevance, str(exc))
+        except Exception as exc:
+            # The library reports failures as results; anything else (an
+            # OSError pinning a certificate, a bug) becomes one too, so the
+            # run's other rows and its progress still finish. The client is
+            # kept: rebuilding would sign in again and forget discovered ids.
+            logger.debug("session relevance stream failed", exc_info=True)
+            yield SessionEvaluation(
+                session_relevance,
+                SESSION_HOST_UNKNOWN,
+                error=f"{type(exc).__name__}: {exc}",
+                error_kind="error",
+            )
 
 
 def session_row_wanted(ev: SessionEvaluation, *, optional: bool) -> bool:

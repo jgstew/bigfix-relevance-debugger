@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import time
 from pathlib import Path
 from typing import Any
@@ -55,6 +56,7 @@ from bigfix_relevance_debugger.evaluation import (
     expected_session_results,
     inventory_table_row,
     load_inventory_targets,
+    needs_discovery,
     order_results,
     pick_label,
     pick_phrase,
@@ -372,6 +374,56 @@ def test_a_bad_target_field_is_rejected_as_a_form_error(form, message):
 def test_nothing_selected_is_rejected():
     with pytest.raises(NoTargetsError, match="target"):
         build_targets(TargetForm())
+
+
+@pytest.mark.parametrize("selected", [[], None])
+def test_nothing_selected_runs_on_the_whole_inventory(selected):
+    inventory = [Target(kind="ssh", name="a"), Target(kind="ssh", name="b")]
+
+    targets = build_targets(TargetForm(inventory_selected=selected), inventory)
+
+    assert targets == inventory
+
+
+def test_a_ticked_target_with_no_hosts_selected_runs_only_that():
+    inventory = [Target(kind="ssh", name="a")]
+
+    targets = build_targets(TargetForm(local=True, inventory_selected=[]), inventory)
+
+    assert [t.kind for t in targets] == ["local"]
+
+
+@pytest.mark.parametrize(
+    ("form", "inventory", "discoverable", "wanted"),
+    [
+        (TargetForm(), [], True, True),
+        # Something to run already, or a host list that can't take discovery.
+        (TargetForm(), [Target(kind="ssh", name="a")], True, False),
+        (TargetForm(local=True), [], True, False),
+        (TargetForm(), [], False, False),
+    ],
+)
+def test_needs_discovery(form, inventory, discoverable, wanted):
+    assert needs_discovery(form, inventory, discoverable=discoverable) is wanted
+
+
+def test_an_empty_inventory_file_can_take_discovery(tmp_path):
+    empty = tmp_path / "remote_clients.toml"
+    empty.write_text("# no hosts yet\n", encoding="utf-8")
+
+    load = load_inventory_targets(empty)
+
+    assert load.targets == []
+    assert load.error is not None and "no [hosts.*]" in load.error
+    assert load.empty
+
+
+def test_a_broken_inventory_file_cannot_take_discovery(tmp_path):
+    broken = tmp_path / "remote_clients.toml"
+    broken.write_text("= nope", encoding="utf-8")
+
+    assert not load_inventory_targets(broken).empty
+    assert load_inventory_targets(None).empty
 
 
 def test_no_targets_is_a_target_form_error():
@@ -1511,16 +1563,31 @@ async def test_session_client_is_built_once_and_reused():
     assert len(clients.built) == 1
 
 
-async def test_session_client_is_rebuilt_when_the_timeout_changes():
+async def test_each_timeout_gets_its_own_client_and_keeps_it():
+    # Two pages with different timeouts take turns: neither evicts the other's
+    # client, which would sign in again (SaaS) and forget discovered ids.
     clients = session_clients(rest_conn("prod"))
 
-    await collect_session("now", EvalOptions(timeout_s=30), clients=clients)
-    await collect_session("now", EvalOptions(timeout_s=12), clients=clients)
-    await collect_session("now", EvalOptions(timeout_s=12), clients=clients)
+    for timeout_s in (30, 12, 30, 12):
+        await collect_session("now", EvalOptions(timeout_s=timeout_s), clients=clients)
 
-    old, new = clients.built
-    assert old._backends == {}  # closed
-    assert [c.read_timeout for c in new.connections] == [12.0]
+    thirty, twelve = clients.built
+    assert [c.read_timeout for c in thirty.connections] == [30.0]
+    assert [c.read_timeout for c in twelve.connections] == [12.0]
+    assert thirty._backends and twelve._backends  # neither closed
+
+
+async def test_the_least_recently_used_client_is_closed_past_the_limit(monkeypatch):
+    monkeypatch.setattr(evaluation, "SESSION_CLIENTS_KEPT", 2)
+    clients = session_clients(rest_conn("prod"))
+
+    for timeout_s in (10, 20, 10, 30):
+        await collect_session("now", EvalOptions(timeout_s=timeout_s), clients=clients)
+    await asyncio.sleep(0)
+
+    ten, twenty, thirty = clients.built
+    assert twenty._backends == {}  # least recently used: closed
+    assert ten._backends and thirty._backends
 
 
 async def test_session_client_is_rebuilt_after_a_config_failure():
@@ -1588,13 +1655,14 @@ async def test_leaving_the_stream_early_cancels_the_other_queries():
     await asyncio.wait_for(cancelled.wait(), 2)
 
 
-async def test_a_rebuild_waits_for_streams_still_using_the_old_client():
-    # Two pages with different timeouts: the second page's rebuild must not
-    # close the client the first page's run is still reading from.
+async def test_an_evicted_client_waits_for_streams_still_using_it(monkeypatch):
+    # Evicted while a page's run is still reading from it: closed only after.
+    monkeypatch.setattr(evaluation, "SESSION_CLIENTS_KEPT", 1)
     release = asyncio.Event()
 
     async def held(relevance):
-        await release.wait()
+        if relevance == "now":  # only the first run's query
+            await release.wait()
         return rest_body("plural_tuples")
 
     clients = session_clients(rest_conn("prod"), router=Router(prod=held))
@@ -1605,12 +1673,79 @@ async def test_a_rebuild_waits_for_streams_still_using_the_old_client():
         await asyncio.sleep(0)
     await asyncio.sleep(0.01)
 
-    release.set()
-    await collect_session("now", EvalOptions(timeout_s=12), clients=clients)
-    [ev] = await first_run
+    await collect_session("other", EvalOptions(timeout_s=12), clients=clients)
+    await asyncio.sleep(0)
+    assert clients.built[0]._backends  # still open: the first run uses it
 
-    assert ev.ok
+    release.set()
+    evs = await first_run
+
+    assert all(ev.ok for ev in evs)
     assert clients.built[0]._backends == {}  # closed once its stream ended
+
+
+class RaisingClient:
+    """A client whose stream yields ``before`` results, then raises ``exc``."""
+
+    def __init__(self, exc, before=0):
+        self.exc = exc
+        self.before = before
+        self.connections = (rest_conn("prod"), rest_conn("lab"))
+        self.closed = False
+
+    def result_count(self):
+        return 2
+
+    async def evaluate_stream(self, session_relevance):
+        for _ in range(self.before):
+            yield session_result(connection="prod")
+        raise self.exc
+
+    async def aclose(self):
+        self.closed = True
+
+
+@pytest.mark.parametrize("before", [0, 1])
+async def test_an_unexpected_stream_failure_is_a_result(before, caplog):
+    client = RaisingClient(
+        OSError("cannot write ~/.bigfix/.remote_session_known_certs.toml"), before
+    )
+    clients = SessionClients(lambda opts: client)  # type: ignore[arg-type, return-value]
+
+    with caplog.at_level(logging.DEBUG, logger=evaluation.__name__):
+        evs = await collect_session("now", clients=clients)
+
+    *answered, failed = evs
+    assert [ev.connection for ev in answered] == ["prod"] * before
+    assert failed.error_kind == "error"
+    assert failed.error is not None
+    assert "OSError" in failed.error and "known_certs" in failed.error
+    assert failed.host == SESSION_HOST_UNKNOWN
+    assert "session relevance stream failed" in caplog.text
+    assert caplog.records[-1].exc_info is not None
+    # Kept: the failure may be passing (a file write), and rebuilding would
+    # sign in again and forget discovered deployment ids.
+    await collect_session("now", clients=clients)
+    assert not client.closed
+
+
+async def test_cancelling_a_session_stream_is_not_turned_into_a_result():
+    started = asyncio.Event()
+
+    class Hanging(RaisingClient):
+        async def evaluate_stream(self, session_relevance):
+            started.set()
+            await asyncio.sleep(30)
+            yield session_result()  # pragma: no cover
+
+    clients = SessionClients(lambda opts: Hanging(None))  # type: ignore[arg-type, return-value]
+    task = asyncio.create_task(collect_session("now", clients=clients))
+    await started.wait()
+
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 async def test_session_clients_aclose_closes_the_client():
@@ -2172,8 +2307,29 @@ def test_preview_counts_inventory_selection_and_explicit_targets():
     assert "1 local" in p.detail
 
 
-def test_preview_with_nothing_selected_reports_the_form_problem():
+def test_preview_with_nothing_selected_counts_the_whole_inventory():
     p = preview(TargetForm())
+
+    assert p.problem is None
+    assert p.systems == len(INV)
+    assert p.sources == (("inventory", len(INV)),)
+
+
+def test_preview_with_nothing_to_run_and_discovery_left_says_so():
+    p = preview(TargetForm(), inventory=[], discoverable=True)
+
+    assert p.problem is None
+    assert p.discovers
+    assert p.text == "auto-discovery"
+    assert "auto-discovery" in p.detail
+    assert (
+        preview(TargetForm(), inventory=[], discoverable=True, session=True).text
+        == "auto-discovery + BigFix server"
+    )
+
+
+def test_preview_with_nothing_selected_reports_the_form_problem():
+    p = preview(TargetForm(), inventory=[])
 
     assert p.systems == 0
     assert p.problem == "Pick at least one target."
@@ -2263,6 +2419,8 @@ def test_preview_says_nothing_about_runs_when_they_equal_systems():
         (TargetForm(container=True, container_images="a:1, b:2"), {"a:1": ["x86_64", "arm64"]}),
         (TargetForm(inventory_selected=[1]), {}),
         (TargetForm(local=True, inventory_selected=None), {}),
+        (TargetForm(), {}),
+        (TargetForm(inventory_selected=None), {}),
         (TargetForm(local=True, ssh=True, ssh_host="b", inventory_selected=[0, 1, 2, 7]), {}),
     ],
 )
@@ -2292,7 +2450,7 @@ def test_preview_both_adds_the_server():
 
 
 def test_preview_both_without_client_targets_runs_session_only():
-    p = preview(TargetForm(), session=True)
+    p = preview(TargetForm(), inventory=[], session=True)
 
     assert p.problem is None
     assert p.text == "BigFix server"

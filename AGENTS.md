@@ -156,7 +156,16 @@ uv run pyright src tests
   page tests fake `app.resolve_container_arches`.
 - **Smart defaults, no required clicks.** Infer the best option (inventory
   all selected, auto arch, the best breakdown target) and say why; selecting
-  less is the override. Don't add dialogs that ask.
+  less is the override. Don't add dialogs that ask. Selecting nothing at all
+  is not "run nothing": `evaluation.inventory_indexes` runs every inventory
+  host, and with no host configured Evaluate runs auto-discovery into the
+  inventory first (`needs_discovery`, once per file per process; page tests
+  fake `app.discover_into`).
+- **`ui.notify` and new elements need a slot, and NiceGUI keeps the slot
+  stack per task.** Start page work in a task with `in_page(...)` (it enters
+  the page's client), never a bare `asyncio.create_task`. The simulated
+  user's `ui.notify` doesn't look the slot up, so `test_app.py`'s autouse
+  `app_started` fixture makes it, as a served page does.
 - **Logging, never print** (ruff `T20`). Library INFO goes to the activity
   log by default and DEBUG with `-v`, matching the library CLI's policy.
 - **Check UI changes in a real run** when Docker is available, e.g. evaluate

@@ -12,10 +12,16 @@ import json
 import logging
 import threading
 from collections.abc import AsyncIterator
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from bigfix_remote_client_relevance import ClientRelevanceResult, InventoryError, Target
+from bigfix_remote_client_relevance import (
+    BigFixRelevanceError,
+    ClientRelevanceResult,
+    InventoryError,
+    Target,
+)
 from nicegui import ui
 from nicegui.testing.user_download import UserDownload
 from nicegui.testing.user_simulation import user_simulation
@@ -241,6 +247,28 @@ async def test_debouncer_supports_async_callbacks():
 def no_inventory(monkeypatch):
     monkeypatch.setattr(app_module, "find_inventory_path", lambda: None)
     monkeypatch.setattr(app_module, "find_or_discover_inventory", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def app_started(monkeypatch):
+    """Make ``ui.notify`` fail where it fails in a real browser.
+
+    The simulated user swaps ``ui.notify`` for a recorder that never looks
+    up the current slot, and NiceGUI gives a slot-less task a pseudo client
+    until the app is started. A served page has neither: ``ui.notify`` from a
+    task with an empty slot stack raises. Do the real lookup, as started.
+    """
+    from nicegui import app as nicegui_app
+    from nicegui.testing.user_notify import UserNotify
+
+    monkeypatch.setattr(type(nicegui_app), "is_started", property(lambda self: True))
+    record = UserNotify.__call__
+
+    def notify_like_nicegui(self, message, **kwargs):
+        ui.context.client  # noqa: B018 - what ui.notify does first; raises without a slot
+        return record(self, message, **kwargs)
+
+    monkeypatch.setattr(UserNotify, "__call__", notify_like_nicegui)
 
 
 @pytest.fixture
@@ -844,16 +872,149 @@ async def test_breakdown_picks_the_target_matching_the_expressions_platform(monk
     assert seen["target"] is windows
 
 
-async def test_inventory_can_select_none(inventory_user):
+async def test_selecting_no_hosts_runs_on_all_of_them(inventory_user, monkeypatch):
+    # Nothing picked means the default, every configured host, not nothing.
+    streamed: list[list[Target]] = []
+
+    async def fake_stream(text, targets, opts, **upstream):
+        streamed.append(list(targets))
+        for _ in ():
+            yield
+
+    monkeypatch.setattr(app_module, "stream_results", fake_stream)
     await inventory_user.open("/")
     await inventory_user.should_see(marker="inventory")
 
     await deselect(inventory_user, 0, 1)
 
     assert selected_ids(inventory_user) == []
-    await count_reads(inventory_user, "0 systems")
+    await count_reads(inventory_user, "2 systems")
+    assert hidden_element(inventory_user, "inventory-count").text == (
+        "none selected: Evaluate runs on all 2"
+    )
+    # Ticking a target makes "nothing picked" mean no hosts after all.
+    inventory_user.find(marker="target-local").click()
+    await count_reads(inventory_user, "1 system")
+    assert hidden_element(inventory_user, "inventory-count").text == "0 of 2 selected"
+    inventory_user.find(marker="target-local").click()
+    await count_reads(inventory_user, "2 systems")
     inventory_user.find(marker="evaluate").click()
-    await notified(inventory_user, "Pick at least one target")
+    await inventory_user.should_see("0 / 2")
+    assert streamed == [TWO_HOSTS]
+
+
+# --- auto-discovery when no client targets are configured -------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_discovery_tried_yet(monkeypatch):
+    monkeypatch.setattr(app_module, "_discovery_tried", set())
+
+
+@pytest.fixture
+async def empty_inventory_user(monkeypatch, tmp_path):
+    """An inventory file with no hosts yet, e.g. the placeholder discovery leaves."""
+    path = tmp_path / "remote_clients.toml"
+    path.write_text("# no hosts yet\n", encoding="utf-8")
+    monkeypatch.setattr(app_module, "_inventory_path", path)
+    async with user_simulation(root=app_module.root) as simulated:
+        simulated.inventory_path = path  # type: ignore[attr-defined]
+        yield simulated
+
+
+def fake_discovery(calls: list[Path], hosts: str = ""):
+    def discover_into(path):
+        calls.append(path)
+        if hosts:
+            path.write_text(hosts, encoding="utf-8")
+        return path
+
+    return discover_into
+
+
+async def test_evaluate_discovers_targets_when_none_are_configured(
+    empty_inventory_user, monkeypatch
+):
+    user = empty_inventory_user
+    calls: list[Path] = []
+    monkeypatch.setattr(
+        app_module, "discover_into", fake_discovery(calls, '[hosts.local]\ntransport = "local"\n')
+    )
+    streamed: list[list[Target]] = []
+
+    async def fake_stream(text, targets, opts, **upstream):
+        streamed.append(list(targets))
+        yield ClientRelevanceResult(host="local", transport="local", client_relevance=text)
+
+    monkeypatch.setattr(app_module, "stream_results", fake_stream)
+    await user.open("/")
+    await set_text(user, "name of operating system")
+    await count_reads(user, "auto-discovery")
+    assert toggle(user).props["icon"] == "dns"  # not a problem: Evaluate handles it
+
+    user.find(marker="evaluate").click()
+
+    await user.should_see("1 / 1")
+    assert calls == [user.inventory_path]
+    [targets] = streamed
+    assert [t.kind for t in targets] == ["local"]
+    await count_reads(user, "1 system")
+
+
+async def test_discovery_that_finds_nothing_says_so_and_is_not_repeated(
+    empty_inventory_user, monkeypatch
+):
+    user = empty_inventory_user
+    calls: list[Path] = []
+    monkeypatch.setattr(app_module, "discover_into", fake_discovery(calls))
+    await user.open("/")
+    await set_text(user, "name of operating system")
+    await count_reads(user, "auto-discovery")
+
+    user.find(marker="evaluate").click()
+    await notified(user, "auto-discovery found none")
+    await count_reads(user, "0 systems")
+    user.find(marker="evaluate").click()
+    await asyncio.sleep(0.2)
+
+    assert calls == [user.inventory_path]
+    assert side_panel(user).value is True
+
+
+async def test_discovery_finding_nothing_still_runs_session_relevance(
+    empty_inventory_user, monkeypatch
+):
+    user = empty_inventory_user
+    calls: list[Path] = []
+    monkeypatch.setattr(app_module, "discover_into", fake_discovery(calls))
+    sessions: list[str] = []
+    monkeypatch.setattr(app_module, "stream_session", fake_session(sessions))
+    await user.open("/")
+    await set_text(user, "now")
+
+    user.find(marker="evaluate").click()
+
+    await user.should_see("1 / 1")
+    await notified(user, "session relevance only")
+    assert calls == [user.inventory_path]
+    assert sessions == ["now"]
+
+
+async def test_a_broken_inventory_is_never_discovered_into(no_inventory, monkeypatch, tmp_path):
+    bad = tmp_path / "remote_clients.toml"
+    bad.write_text("= nope", encoding="utf-8")
+    monkeypatch.setattr(app_module, "_inventory_path", bad)
+    calls: list[Path] = []
+    monkeypatch.setattr(app_module, "discover_into", fake_discovery(calls))
+
+    async with user_simulation(root=app_module.root) as user:
+        await user.open("/")
+        await set_text(user, "name of operating system")
+        await count_reads(user, "0 systems")
+        user.find(marker="evaluate").click()
+        await notified(user, "Pick at least one target")
+
+    assert calls == []
 
 
 async def test_container_auto_arch_evaluates_every_published_arch(user, monkeypatch):
@@ -1730,6 +1891,39 @@ async def test_the_filter_waits_for_typing_to_pause(user, monkeypatch):
 
     await asyncio.sleep(app_module.FILTER_DEBOUNCE_S + 0.1)
     assert result_hosts(user) == ["deb", "multi", "multi"]
+
+
+# --- notifications from a run (a real browser) -------------------------------------------
+
+
+async def test_a_run_can_notify_in_a_real_browser(user, monkeypatch):
+    async def failing_stream(text, targets, opts, **upstream):
+        raise BigFixRelevanceError("qna went away")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(app_module, "stream_results", failing_stream)
+    await user.open("/")
+    await set_text(user, "name of operating system")
+    user.find(marker="target-local").click()
+
+    user.find(marker="evaluate").click()
+
+    await notified(user, "qna went away")
+
+
+async def test_the_session_task_can_notify_in_a_real_browser(user, monkeypatch):
+    # The session task is a task of its own inside the run.
+    async def stream_session(text, opts, **upstream):
+        ui.notify("from the session task")
+        yield SessionEvaluation(text, SERVER, answers=("1",))
+
+    monkeypatch.setattr(app_module, "stream_session", stream_session)
+    await user.open("/")
+    await set_text(user, "number of bes computers")
+
+    user.find(marker="evaluate").click()
+
+    await notified(user, "from the session task")
 
 
 # --- session relevance (issue 7) ---------------------------------------------------------
