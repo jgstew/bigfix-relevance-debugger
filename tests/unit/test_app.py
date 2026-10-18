@@ -981,9 +981,10 @@ async def test_discovery_that_finds_nothing_says_so_and_is_not_repeated(
     assert side_panel(user).value is True
 
 
-async def test_discovery_finding_nothing_still_runs_session_relevance(
+async def test_both_dialects_run_what_is_configured_without_discovery(
     empty_inventory_user, monkeypatch
 ):
+    # Discovery is for client-only relevance; `now` runs on the BigFix servers.
     user = empty_inventory_user
     calls: list[Path] = []
     monkeypatch.setattr(app_module, "discover_into", fake_discovery(calls))
@@ -991,12 +992,13 @@ async def test_discovery_finding_nothing_still_runs_session_relevance(
     monkeypatch.setattr(app_module, "stream_session", fake_session(sessions))
     await user.open("/")
     await set_text(user, "now")
+    await count_reads(user, "BigFix server")
 
     user.find(marker="evaluate").click()
 
     await user.should_see("1 / 1")
     await notified(user, "session relevance only")
-    assert calls == [user.inventory_path]
+    assert calls == []
     assert sessions == ["now"]
 
 
@@ -2106,6 +2108,8 @@ async def test_no_server_hides_the_session_row_auto_added(user, monkeypatch):
     await user.should_see("session relevance skipped")
     assert calls == ["now"]
     assert [r["dialect"] for r in results_table(user).rows] == ["client"]
+    # Not an error row, but worth a word on how to add one.
+    await notified(user, "No BigFix server is configured")
 
 
 async def test_no_server_still_shows_when_both_was_picked(user, monkeypatch):

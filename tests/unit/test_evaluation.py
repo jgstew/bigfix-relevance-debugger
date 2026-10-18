@@ -394,17 +394,19 @@ def test_a_ticked_target_with_no_hosts_selected_runs_only_that():
 
 
 @pytest.mark.parametrize(
-    ("form", "inventory", "discoverable", "wanted"),
+    ("form", "inventory", "discoverable", "session", "wanted"),
     [
-        (TargetForm(), [], True, True),
+        (TargetForm(), [], True, False, True),
         # Something to run already, or a host list that can't take discovery.
-        (TargetForm(), [Target(kind="ssh", name="a")], True, False),
-        (TargetForm(local=True), [], True, False),
-        (TargetForm(), [], False, False),
+        (TargetForm(), [Target(kind="ssh", name="a")], True, False, False),
+        (TargetForm(local=True), [], True, False, False),
+        (TargetForm(), [], False, False, False),
+        # Both dialects run what is configured; only a client-only run discovers.
+        (TargetForm(), [], True, True, False),
     ],
 )
-def test_needs_discovery(form, inventory, discoverable, wanted):
-    assert needs_discovery(form, inventory, discoverable=discoverable) is wanted
+def test_needs_discovery(form, inventory, discoverable, session, wanted):
+    assert needs_discovery(form, inventory, discoverable=discoverable, session=session) is wanted
 
 
 def test_an_empty_inventory_file_can_take_discovery(tmp_path):
@@ -2322,10 +2324,10 @@ def test_preview_with_nothing_to_run_and_discovery_left_says_so():
     assert p.discovers
     assert p.text == "auto-discovery"
     assert "auto-discovery" in p.detail
-    assert (
-        preview(TargetForm(), inventory=[], discoverable=True, session=True).text
-        == "auto-discovery + BigFix server"
-    )
+    # Both dialects: no discovery, the BigFix servers run on their own.
+    both = preview(TargetForm(), inventory=[], discoverable=True, session=True)
+    assert not both.discovers
+    assert both.text == "BigFix server"
 
 
 def test_preview_with_nothing_selected_reports_the_form_problem():

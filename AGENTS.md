@@ -158,9 +158,12 @@ uv run pyright src tests
   all selected, auto arch, the best breakdown target) and say why; selecting
   less is the override. Don't add dialogs that ask. Selecting nothing at all
   is not "run nothing": `evaluation.inventory_indexes` runs every inventory
-  host, and with no host configured Evaluate runs auto-discovery into the
-  inventory first (`needs_discovery`, once per file per process; page tests
-  fake `app.discover_into`).
+  host. What an empty setup does depends on the dialect: client-only
+  relevance with no host configured runs auto-discovery into the inventory
+  first (`needs_discovery`, once per file per process; page tests fake
+  `app.discover_into`); session-only relevance with no BigFix server shows
+  the `config` row saying how to add one; both dialects run what is
+  configured, never discover, and advise adding a server when there is none.
 - **`ui.notify` and new elements need a slot, and NiceGUI keeps the slot
   stack per task.** Start page work in a task with `in_page(...)` (it enters
   the page's client), never a bare `asyncio.create_task`. The simulated

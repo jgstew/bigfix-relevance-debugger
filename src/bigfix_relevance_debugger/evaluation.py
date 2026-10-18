@@ -181,13 +181,18 @@ def inventory_indexes(form: TargetForm, inventory: Sequence[Target]) -> list[int
     return [i for i in form.inventory_selected or [] if 0 <= i < len(inventory)]
 
 
-def needs_discovery(form: TargetForm, inventory: Sequence[Target], *, discoverable: bool) -> bool:
-    """Whether Evaluate runs auto-discovery first: nothing picked and no host configured.
+def needs_discovery(
+    form: TargetForm, inventory: Sequence[Target], *, discoverable: bool, session: bool = False
+) -> bool:
+    """Whether Evaluate runs auto-discovery first: client-only relevance, nothing
+    picked and no host configured.
 
     ``discoverable``: the inventory loaded with no hosts (or there is no
-    file), and discovery hasn't already been tried on it.
+    file), and discovery hasn't already been tried on it. ``session``: the
+    run evaluates session relevance too; then it runs on what is configured
+    (the BigFix servers) rather than discover clients first.
     """
-    return discoverable and not inventory and not _ticked(form)
+    return discoverable and not session and not inventory and not _ticked(form)
 
 
 # --- choosing the breakdown target --------------------------------------------------
@@ -455,7 +460,7 @@ def preview_targets(
     try:
         targets = build_targets(form, inventory, image_arches)
     except NoTargetsError as exc:
-        if needs_discovery(form, inventory, discoverable=discoverable):
+        if needs_discovery(form, inventory, discoverable=discoverable, session=session):
             return TargetPreview(
                 systems=0, discovers=True, session=session, session_servers=session_servers
             )

@@ -158,7 +158,8 @@ The app builds its connections on the first session run (or when the target
 count first needs them), not at startup, and reuses them. If nothing is
 configured, the client evaluation still runs. When auto added session
 relevance only because the expression is valid in either dialect (`now`),
-that is noted in the activity log, not shown as an error row. When you asked
+that isn't shown as an error row: a notification and the activity log say
+it was skipped and how to configure a server. When you asked
 for session relevance (a session-only expression, or **Session** / **Both**
 in the picker), the session row says so and says what to set up. A config
 you add while the app is running is picked up on the next run. Queries are
@@ -196,11 +197,13 @@ table fills in when discovery finishes, and its progress is in the activity
 log.
 
 **An inventory with no hosts** (such as that placeholder) gets discovery on
-**Evaluate** instead: with nothing ticked, the header reads `auto-discovery`,
-and Evaluate runs discovery into that file first, adding whatever works, then
-evaluates on it. Discovery runs at most once per file while the app runs. If
-it finds nothing, the run says so (session relevance still runs when it
-applies). A file that fails to load is never discovered into.
+**Evaluate** instead, for **client-only** relevance: with nothing ticked, the
+header reads `auto-discovery`, and Evaluate runs discovery into that file
+first, adding whatever works, then evaluates on it. Discovery runs at most
+once per file while the app runs, and if it finds nothing the run says so. A
+file that fails to load is never discovered into. Relevance that runs as
+both dialects doesn't discover: it runs on what is configured (the BigFix
+servers, say), and session-only relevance needs no client targets at all.
 
 **Every inventory host is selected by default**, so **Evaluate** runs on the
 whole inventory (plus any Local/Container/SSH target you tick under **Add
@@ -229,8 +232,8 @@ reads:
 - `12 systems + BigFix server` when session relevance runs too, and
   `BigFix server` when only session relevance runs; `2 BigFix servers` with
   two deployments configured.
-- `auto-discovery` when no client target is configured and Evaluate will
-  discover some first (see above).
+- `auto-discovery` when client-only relevance has no client target configured
+  and Evaluate will discover some first (see above).
 - `0 systems`, with a warning icon, when nothing would run. The panel then
   opens itself and says why. It also opens when a run stops on a target or
   option problem, but it never closes itself.

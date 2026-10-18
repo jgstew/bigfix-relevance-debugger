@@ -825,8 +825,11 @@ async def root() -> None:
                 targets = build_targets(state.form, inventory.targets, image_arches)
             except NoTargetsError as exc:
                 problem, targets = exc, []
-                # No client target configured at all: discover some first.
-                if needs_discovery(state.form, inventory.targets, discoverable=discoverable()):
+                # Client-only relevance and no client target configured at all:
+                # discover some first. With session too, run what is configured.
+                if needs_discovery(
+                    state.form, inventory.targets, discoverable=discoverable(), session=session
+                ):
                     where = await discover_now()
                     try:
                         targets = build_targets(state.form, inventory.targets, image_arches)
@@ -953,10 +956,9 @@ async def root() -> None:
                         total += 1
                         session_expected = seen
                     if not session_row_wanted(ev, optional=session_optional):
-                        activity.push(
-                            "session relevance skipped: no BigFix server is configured. "
-                            "Pick Session or Both in the Dialect picker to see where it looked."
-                        )
+                        # Not an error row (it wasn't asked for), but say how to add one.
+                        activity.push(f"session relevance skipped: {ev.error}")
+                        ui.notify(f"Session relevance skipped. {ev.error}", type="info")
                         tick()
                         continue
                     state.session_results.append(ev)
