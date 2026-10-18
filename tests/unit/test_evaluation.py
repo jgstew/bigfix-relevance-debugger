@@ -12,6 +12,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import parse_qs
 
 import pytest
 from bigfix_remote_client_relevance import ClientRelevanceResult, ResolvedQna, Target
@@ -1264,7 +1265,9 @@ class FakeBESConnection:
         self.raises = raises
         self.calls = []
 
-    def session_relevance_xml(self, relevance, **kwargs):
+    def post(self, path, data, **kwargs):
+        assert path == "query"
+        (relevance,) = parse_qs(data)["relevance"]
         self.calls.append((relevance, kwargs))
         if self.raises is not None:
             raise self.raises
@@ -1373,7 +1376,8 @@ class BlockingBESConnection(FakeBESConnection):
         self.entered = threading.Event()
         self.release = threading.Event()
 
-    def session_relevance_xml(self, relevance, **kwargs):
+    def post(self, path, data, **kwargs):
+        (relevance,) = parse_qs(data)["relevance"]
         if relevance == self.blocking:
             self.entered.set()
             assert self.release.wait(5), "test never released the query"
@@ -1381,7 +1385,7 @@ class BlockingBESConnection(FakeBESConnection):
                 raise self.blocked_raises
         if relevance in self.fails:
             raise TimeoutError("read timed out")
-        return super().session_relevance_xml(relevance, **kwargs)
+        return super().post(path, data, **kwargs)
 
 
 def query_in_thread(connector, relevance):
