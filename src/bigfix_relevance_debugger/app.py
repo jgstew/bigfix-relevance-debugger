@@ -341,7 +341,9 @@ async def root() -> None:
     inventory = InventoryLoad(path=None, targets=[], error=None)
 
     with ui.header().classes("items-center"):
-        ui.image(LOGO).classes("w-8 h-8").props("no-spinner no-transition").mark("header-logo")
+        ui.image(LOGO).classes("w-8 h-8").props('no-spinner no-transition alt=""').mark(
+            "header-logo"
+        )
         ui.label(TITLE).classes("text-h6")
         ui.label(f"v{__version__}").classes("text-caption opacity-70")
         ui.space()

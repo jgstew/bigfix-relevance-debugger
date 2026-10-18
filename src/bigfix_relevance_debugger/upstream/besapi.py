@@ -37,6 +37,9 @@ from typing import Any
 
 _logger = logging.getLogger(__name__)
 
+_SAID_MAX = 200
+"""How much of a non-result response goes into the error."""
+
 _TIME_RE = re.compile(r"^\s*([0-9]*\.?[0-9]+)\s*(ms|s)\s*$")
 
 EXPLORER_RECHECK_SECONDS = 300
@@ -131,8 +134,8 @@ def session_relevance_result(conn: Any, relevance: str, **kwargs: Any) -> Sessio
     """Evaluate ``relevance`` through ``conn`` (a ``BESConnection``) and parse the answer.
 
     ``kwargs`` go to the request (e.g. ``timeout``). Blocking. Raises
-    ``ValueError`` naming the HTTP status when the server didn't answer with a
-    query result, and whatever ``requests`` raises for a network failure.
+    ``ValueError`` naming the HTTP status and quoting the start of the answer
+    when the server didn't answer with a query result, and whatever ``requests`` raises for a network failure.
 
     Upstream: a ``BESConnection.session_relevance_result`` method.
     """
@@ -140,7 +143,10 @@ def session_relevance_result(conn: Any, relevance: str, **kwargs: Any) -> Sessio
     try:
         return parse_query_result(relevance, response.text)
     except ValueError as exc:
-        raise ValueError(f"HTTP {_status(response)}: {exc}") from exc
+        said = response.text.strip()
+        if len(said) > _SAID_MAX:
+            said = said[:_SAID_MAX] + "..."
+        raise ValueError(f"HTTP {_status(response)}: {exc}; the server said: {said}") from exc
 
 
 def _status(response: Any) -> int | None:
@@ -224,17 +230,19 @@ def explorer_answers_query(conn: Any, **kwargs: Any) -> bool:
 
 
 def _json_safe(relevance: str) -> str:
-    """``relevance``, in parentheses if it is valid JSON.
+    """``relevance``, in parentheses if the root server would read it as JSON.
 
     The root server reads a form-posted relevance that parses as JSON as a
-    JSON query and refuses it with HTTP 400 unless it is an object. Any JSON
+    JSON query and refuses it with HTTP 400 unless it is an object. Its parser
+    also takes a leading BOM and control characters (a tab, a newline) inside
+    strings, so this does too (checked live, 2026-10-18). Any JSON
     that isn't an object (a string, number, ``true``, ``null``) is also a
     whole relevance expression, and parentheses don't change what it means.
     An object isn't relevance at all; in parentheses it gets a relevance error
     instead of being taken for a JSON query.
     """
     try:
-        json.loads(relevance)
+        json.loads(relevance.lstrip("\ufeff"), strict=False)
     except ValueError:
         return relevance
     return f"({relevance})"

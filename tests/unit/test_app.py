@@ -2369,6 +2369,8 @@ async def test_header_shows_the_logo_before_the_title(user):
 
     [logo] = user.find(marker="header-logo").elements
     assert logo.props["src"]
+    # Decorative: the title right after it says the same, so screen readers skip it.
+    assert logo.props["alt"] == ""
     siblings = list(logo.parent_slot.children)
     title = next(e for e in siblings if getattr(e, "text", None) == app_module.TITLE)
     assert siblings.index(logo) < siblings.index(title)

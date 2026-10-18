@@ -203,8 +203,9 @@ JSON_RELEVANCE_ANSWER = (
 
 
 def _is_json_but_not_an_object(text: str) -> bool:
+    # The server's parser also takes control characters in strings and a BOM.
     try:
-        value = json.loads(text)
+        value = json.loads(text.lstrip("\ufeff"), strict=False)
     except ValueError:
         return False
     return not isinstance(value, dict)
@@ -530,6 +531,25 @@ def test_session_relevance_result_reports_http_status_for_a_non_result():
         session_relevance_result(conn, "now")
 
 
+def test_a_non_result_error_carries_what_the_server_said():
+    conn = QueryServer("explorer")
+    body = '{"error":"Invalid JSON: Invalid required value type"}'
+    conn.post = lambda *a, **kw: _response(body, 400)  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match="HTTP 400") as raised:
+        session_relevance_result(conn, "now")
+    assert body in str(raised.value)
+
+
+def test_a_long_non_result_is_cut_short_in_the_error():
+    conn = QueryServer("explorer")
+    conn.post = lambda *a, **kw: _response("<html>" + "x" * 5000, 502)  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError) as raised:
+        session_relevance_result(conn, "now")
+    assert len(str(raised.value)) < 500
+
+
 # --- New: relevance that is valid JSON is sent in parentheses --------------
 
 # Each got HTTP 400 "Invalid JSON ... expected type: "object"" from a live root
@@ -544,6 +564,10 @@ JSON_SHAPED = [
     "true",
     "null",
     ' "x"\n',
+    '"x" ',
+    '"a\tb"',
+    '"a\nb"',
+    '\ufeff"x"',
 ]
 
 
