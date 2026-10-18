@@ -15,6 +15,11 @@ since besapi 4.3.1. That is right when Web Reports answers ``/api/query`` (it
 decodes twice) but breaks every relevance with a space when BigFix Explorer
 answers (it decodes once). See jgstew/besapi#30; delete this half once besapi
 ships that fix.
+
+The root server also answers HTTP 400 ``Invalid JSON ... expected type:
+"object"`` to a form-posted relevance that is itself valid JSON (``"now"``,
+``1``, ``true``), so ``post_session_relevance`` sends such relevance in
+parentheses. Seen with Explorer answering; besapi's own requests have it too.
 """
 
 from __future__ import annotations
@@ -218,6 +223,23 @@ def explorer_answers_query(conn: Any, **kwargs: Any) -> bool:
     return explorer
 
 
+def _json_safe(relevance: str) -> str:
+    """``relevance``, in parentheses if it is valid JSON.
+
+    The root server reads a form-posted relevance that parses as JSON as a
+    JSON query and refuses it with HTTP 400 unless it is an object. Any JSON
+    that isn't an object (a string, number, ``true``, ``null``) is also a
+    whole relevance expression, and parentheses don't change what it means.
+    An object isn't relevance at all; in parentheses it gets a relevance error
+    instead of being taken for a JSON query.
+    """
+    try:
+        json.loads(relevance)
+    except ValueError:
+        return relevance
+    return f"({relevance})"
+
+
 def post_session_relevance(conn: Any, relevance: str, **kwargs: Any) -> Any:
     """POST ``relevance`` to ``/api/query`` through ``conn``, encoded for whoever answers.
 
@@ -226,11 +248,13 @@ def post_session_relevance(conn: Any, relevance: str, **kwargs: Any) -> Any:
     or Web Reports (decodes twice) answers, and needs no probe. With ``%`` the
     two differ (``%2541`` must stay ``%2541``), so ask ``explorer_answers_query``:
     Explorer gets it encoded once, anything else gets besapi 4.3.1+'s double
-    encoding. ``kwargs`` go to the request (e.g. ``timeout``). Returns what
-    ``conn.post`` returns.
+    encoding. Relevance that is valid JSON goes in parentheses (``_json_safe``).
+    ``kwargs`` go to the request (e.g. ``timeout``). Returns what ``conn.post``
+    returns.
 
     Upstream: the body builder behind ``BESConnection.session_relevance_xml``.
     """
+    relevance = _json_safe(relevance)
     if "%" not in relevance or explorer_answers_query(conn, **kwargs):
         return conn.post(
             "query", data="relevance=" + urllib.parse.quote(relevance, safe=":"), **kwargs
