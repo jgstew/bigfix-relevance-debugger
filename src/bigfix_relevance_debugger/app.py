@@ -84,6 +84,8 @@ from bigfix_relevance_debugger.upstream.remote_client_relevance import find_or_d
 logger = logging.getLogger(__name__)
 
 TITLE = "BigFix Relevance Debugger"
+LOGO = Path(__file__).with_name("logo.svg")
+"""bigfix-relevance-analyzer's light logo (docs/images/logo.svg): favicon and header."""
 DEBOUNCE_S = 0.3
 FILTER_DEBOUNCE_S = 0.2
 """Each filter change resends the results table, so wait for typing to pause."""
@@ -339,6 +341,9 @@ async def root() -> None:
     inventory = InventoryLoad(path=None, targets=[], error=None)
 
     with ui.header().classes("items-center"):
+        ui.image(LOGO).classes("w-8 h-8").props('no-spinner no-transition alt=""').mark(
+            "header-logo"
+        )
         ui.label(TITLE).classes("text-h6")
         ui.label(f"v{__version__}").classes("text-caption opacity-70")
         ui.space()
@@ -1352,6 +1357,7 @@ def main(argv: list[str] | None = None) -> None:
     kwargs: dict[str, Any] = {
         "host": args.host,
         "title": TITLE,
+        "favicon": LOGO,
         "native": native,
         "show": not native and not args.no_browser,
         # Follow the OS light/dark setting.

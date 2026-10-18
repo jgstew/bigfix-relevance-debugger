@@ -130,7 +130,9 @@ class QueryServer:
     form-decodes it and then percent-decodes it again, keeping ``+``. A query
     answers the text the server would evaluate, so tests compare it with the
     relevance. The ``application/json+relevance`` probe gets 200 from Explorer
-    and 503 from Web Reports, unless ``probe_status`` overrides it. Like
+    and 503 from Web Reports, unless ``probe_status`` overrides it. A query
+    whose evaluated text is valid JSON but not an object gets the live root
+    server's 400 (seen with Explorer answering, 2026-10-18). Like
     ``BESConnection`` it defines ``__eq__`` and so is unhashable.
     """
 
@@ -165,7 +167,10 @@ class QueryServer:
             if self.probe_body is not None:
                 return _response(self.probe_body, status)
             return _response(EXPLORER_PROBE_ANSWER if status == 200 else "unavailable", status)
-        return _response(self._answer(self.evaluated(data)))
+        evaluated = self.evaluated(data)
+        if _is_json_but_not_an_object(evaluated):
+            return _response(JSON_RELEVANCE_ANSWER, 400)
+        return _response(self._answer(evaluated))
 
     def evaluated(self, data) -> str:
         if isinstance(data, dict):
@@ -188,6 +193,22 @@ class QueryServer:
 EXPLORER_PROBE_ANSWER = (
     '{"result":[1],"count":1,"plural":false,"type":"integer","evaltime_ms":0.04}'
 )
+
+
+# The live root server's answer to a form-posted relevance of "now" (with
+# the quotes), 2026-10-18.
+JSON_RELEVANCE_ANSWER = (
+    '{"error":"Invalid JSON: Invalid required value type, expected type: \\"object\\""}'
+)
+
+
+def _is_json_but_not_an_object(text: str) -> bool:
+    # The server's parser also takes control characters in strings and a BOM.
+    try:
+        value = json.loads(text.lstrip("\ufeff"), strict=False)
+    except ValueError:
+        return False
+    return not isinstance(value, dict)
 
 
 def _is_probe(kwargs: dict) -> bool:
@@ -508,3 +529,62 @@ def test_session_relevance_result_reports_http_status_for_a_non_result():
 
     with pytest.raises(ValueError, match="HTTP 401"):
         session_relevance_result(conn, "now")
+
+
+def test_a_non_result_error_carries_what_the_server_said():
+    conn = QueryServer("explorer")
+    body = '{"error":"Invalid JSON: Invalid required value type"}'
+    conn.post = lambda *a, **kw: _response(body, 400)  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError, match="HTTP 400") as raised:
+        session_relevance_result(conn, "now")
+    assert body in str(raised.value)
+
+
+def test_a_long_non_result_is_cut_short_in_the_error():
+    conn = QueryServer("explorer")
+    conn.post = lambda *a, **kw: _response("<html>" + "x" * 5000, 502)  # type: ignore[method-assign]
+
+    with pytest.raises(ValueError) as raised:
+        session_relevance_result(conn, "now")
+    assert len(str(raised.value)) < 500
+
+
+# --- New: relevance that is valid JSON is sent in parentheses --------------
+
+# Each got HTTP 400 "Invalid JSON ... expected type: "object"" from a live root
+# server when sent as is, and its answer when sent in parentheses (2026-10-18).
+JSON_SHAPED = [
+    '"now"',
+    '"this has a space"',
+    '"a%2541"',
+    "1",
+    "-1",
+    "1.5",
+    "true",
+    "null",
+    ' "x"\n',
+    '"x" ',
+    '"a\tb"',
+    '"a\nb"',
+    '\ufeff"x"',
+]
+
+
+@pytest.mark.parametrize("state", STATES)
+@pytest.mark.parametrize("relevance", JSON_SHAPED)
+def test_json_shaped_relevance_is_evaluated_in_parentheses(state, relevance):
+    conn = QueryServer(state)
+
+    result = session_relevance_result(conn, relevance)
+
+    assert result.ok
+    assert result.relevance == relevance
+    assert result.answers == (f"({relevance})",)
+
+
+@pytest.mark.parametrize("relevance", ['"a" & "b"', "now", '("now")', 'it of "x"'])
+def test_relevance_that_is_not_json_is_sent_as_is(relevance):
+    conn = QueryServer("explorer")
+
+    assert session_relevance_result(conn, relevance).answers == (relevance,)
