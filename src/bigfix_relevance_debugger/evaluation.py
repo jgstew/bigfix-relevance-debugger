@@ -1022,9 +1022,9 @@ class ResultRow:
         """Whether this result is counted under the answer-summary row ``key``.
 
         Exact, unlike ``matches``: a pick shows exactly the systems its row
-        counted. Session results are never counted, so never match.
+        counted.
         """
-        return self.dialect != "session" and key in self._tally_key_set
+        return key in self._tally_key_set
 
 
 # --- results view ---------------------------------------------------------------------
@@ -1236,22 +1236,21 @@ def _row_keys(row: ResultRow) -> list[str]:
 class AnswerTally:
     """Distinct systems per answer, built as results stream in: one ``add`` per result.
 
-    A system is a ``display_host``, so a host listing several qna versions
-    counts once per answer, and one whose versions disagree counts under each.
-    Session results are left out: they come from one server, not a fleet.
+    A system is a ``ResultRow.group``: a client host by ``display_host``, so
+    one listing several qna versions counts once per answer, and one whose
+    versions disagree counts under each; a BigFix deployment's session result
+    is one system too, apart from that root server's own client result.
     """
 
     def __init__(self) -> None:
-        # key -> display hosts, in arrival order (the last tie-break).
-        self._hosts: dict[str, dict[str, None]] = {}
-        self._systems: dict[str, None] = {}
+        # key -> groups, in arrival order (the last tie-break).
+        self._hosts: dict[str, dict[tuple[str, str], None]] = {}
+        self._systems: dict[tuple[str, str], None] = {}
 
     def add(self, row: ResultRow) -> None:
-        if row.dialect == "session":
-            return
-        self._systems[row.display_host] = None
+        self._systems[row.group] = None
         for key in row.tally_keys:
-            self._hosts.setdefault(key, {})[row.display_host] = None
+            self._hosts.setdefault(key, {})[row.group] = None
 
     @property
     def systems(self) -> int:

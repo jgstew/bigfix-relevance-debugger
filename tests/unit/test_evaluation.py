@@ -2107,11 +2107,19 @@ def test_tally_shows_an_empty_string_answer_as_quotes():
     assert counts(tallied(row("a", [""]))) == [('""', 1)]
 
 
-def test_tally_ignores_session_rows():
-    tally = tallied(server_row(), row("a", ["x"]))
+def test_tally_counts_each_deployment_as_one_system():
+    tally = tallied(server_row(["x", "y"]), row("a", ["x"]))
 
-    assert counts(tally) == [("x", 1)]
-    assert tally.systems == 1
+    assert counts(tally) == [("x", 2), ("y", 1)]
+    assert tally.systems == 2
+
+
+def test_tally_counts_a_root_servers_session_and_client_results_apart():
+    # A root server answers session relevance and, as a client, qna too.
+    tally = tallied(server_row(["x"]), row("bigfix.example.com", ["x"]))
+
+    assert counts(tally) == [("x", 2)]
+    assert tally.systems == 2
 
 
 def test_tally_table_row_cells_are_scalars():
@@ -2225,20 +2233,28 @@ def test_visible_results_without_pick_is_unchanged():
 
 
 def test_pick_shows_exactly_the_tallied_systems():
-    rows = [*PICK_FLEET, row("other", error="crash", error_kind="qna"), row("e2")]
+    rows = [
+        *PICK_FLEET,
+        row("other", error="crash", error_kind="qna"),
+        row("e2"),
+        server_row(["Linux Debian 11"]),
+        row("bigfix.example.com", ["Linux Debian 11"]),
+    ]
     tally = tallied(*rows)
     tallies, _ = tally.rows()
     assert len(tallies) == 6  # 3 answers, no answers, 2 error kinds
 
     for r in tallies:
-        shown = {rows[i].display_host for i in visible_results(rows, "", r.key)}
+        shown = {rows[i].group for i in visible_results(rows, "", r.key)}
         assert len(shown) == r.systems, r.label
 
 
-def test_session_rows_never_match_a_pick():
-    rows = [server_row(["x"]), row("a", ["x"])]
+def test_a_pick_matches_session_rows_too():
+    rows = [server_row(["x"]), row("a", ["x"]), row("b", ["y"])]
 
-    assert hosts(rows, visible_results(rows, "", TallyRow("answer", "x", 1).key)) == ["a"]
+    shown = visible_results(rows, "", TallyRow("answer", "x", 1).key)
+
+    assert hosts(rows, shown) == ["bigfix.example.com", "a"]
 
 
 def test_summary_with_pick_says_which_answer():

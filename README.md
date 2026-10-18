@@ -323,9 +323,10 @@ Then come one `(no answers)` row and one row per error kind
 (`error: transport`, ...); they always go last. A system counts once per
 answer, however many qna versions it ran, so plural answers' shares can add
 up to more than 100%. It shows the 50 most common answers and says how many
-more there are. It covers the whole run, whatever the filter hides, and
-leaves the session results out (those are servers, not a fleet). With a
-single system it's hidden, since it would only repeat that system's row.
+more there are. It covers the whole run, whatever the filter hides. Each
+BigFix deployment's session result counts as one system, separately from
+that root server's own client result. With a single system it's hidden,
+since it would only repeat that system's row.
 
 **Click a row in Answers** to show only the systems it counted. They keep all
 their rows, and a removable `Only: ...` chip says what's picked. Click the row

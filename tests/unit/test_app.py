@@ -2402,7 +2402,7 @@ async def test_clear_removes_the_answer_summary(user, monkeypatch):
     assert answers_table(user).rows == []
 
 
-async def test_answer_summary_ignores_session_results(user, monkeypatch):
+async def test_answer_summary_counts_session_results(user, monkeypatch):
     monkeypatch.setattr(app_module, "stream_session", fake_session([]))
     monkeypatch.setattr(
         app_module, "stream_results", stream_of(result("a", ["x"]), result("b", ["y"]))
@@ -2415,9 +2415,23 @@ async def test_answer_summary_ignores_session_results(user, monkeypatch):
     user.find(marker="evaluate").click()
 
     await user.should_see("3 / 3")
-    assert answer_rows(user) == [("x", 1), ("y", 1)]
+    assert answer_rows(user) == [("35", 1), ("x", 1), ("y", 1)]
     [title] = user.find(marker="answers-title").elements
-    assert "2 systems" in title.text
+    assert "3 systems" in title.text
+
+
+async def test_answer_summary_shows_for_session_only_relevance(user, monkeypatch):
+    calls: list[str] = []
+    monkeypatch.setattr(app_module, "stream_session", fake_session(calls, "prod", "test"))
+    monkeypatch.setattr(app_module, "expected_session_results", lambda *a, **k: 2)
+    await user.open("/")
+    await set_text(user, "number of bes computers")
+
+    user.find(marker="evaluate").click()
+
+    await user.should_see("2 / 2")
+    assert answer_rows(user) == [("35", 2)]
+    await user.should_see(marker="answers-section")
 
 
 async def test_each_result_is_tallied_once(user, monkeypatch):
