@@ -18,6 +18,7 @@ import sys
 import threading
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from platform import machine
 from typing import Any, TypeVar
 
 from bigfix_remote_client_relevance import (
@@ -104,6 +105,8 @@ WINDOW_ICONS = {
     "win32": LOGO.with_suffix(".ico"),
 }
 """The native window's icon by `sys.platform`; GTK and Qt get `logo.png`."""
+APP_NAME = "Relevance Debugger"
+"""The native window's app name in macOS's LaunchServices, "Python" otherwise."""
 DEBOUNCE_S = 0.3
 FILTER_DEBOUNCE_S = 0.2
 """Each filter change resends the results table, so wait for typing to pause."""
@@ -112,6 +115,40 @@ ARCH_LOOKUP_DEBOUNCE_S = 0.5
 SIDE_PANEL_WIDTH = 460
 INVENTORY_FILTER_MIN = 9
 """Hosts it takes for the inventory table to get a filter box."""
+
+
+def name_macos_app(name: str) -> None:
+    """Register this process with macOS as the app `name` (e.g. in Activity Monitor).
+
+    LaunchServices takes the name from the bundle's ``CFBundleName``, which is
+    Python.app's, when the Cocoa app starts, so call it before pywebview's
+    ``webview.start``; later it changes nothing. The Dock's tooltip still says
+    "Python": it reads the bundle on disk. Does nothing off macOS or without
+    pyobjc (pywebview's macOS dependency).
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        from Foundation import NSBundle  # pyright: ignore[reportAttributeAccessIssue]
+    except ImportError:
+        return
+    NSBundle.mainBundle().infoDictionary()["CFBundleName"] = name
+
+
+def name_window_process() -> None:
+    """Name the app if this is NiceGUI's native window process being set up.
+
+    NiceGUI opens the native window in a spawned process, which re-imports the
+    console script (and so this module) as `__mp_main__` before it starts
+    pywebview: the one chance to rename the app there. The window's process
+    isn't marked as a child yet at that point (`parent_process()` is None), and
+    `python -m` runs aren't re-imported at all.
+    """
+    if "__mp_main__" in sys.modules:
+        name_macos_app(APP_NAME)
+
+
+name_window_process()
 
 EXAMPLES = {
     "name of operating system": "name of operating system",
@@ -1398,14 +1435,97 @@ def _breakdown_table(
 WINDOW_SIZE = (1400, 900)
 
 
+WEBVIEW2_RUNTIMES = (
+    "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",  # stable
+    "{2CD8A007-E189-409D-A2C8-9AF4EF3C72AA}",  # beta
+    "{0D50BFEC-CD6A-4F9A-964C-C7416E3ACB10}",  # dev
+    "{65C35B14-6C1D-4122-AC46-7148CC9D6497}",  # canary
+)
+"""EdgeUpdate client ids of the WebView2 runtimes pywebview looks for."""
+WEBVIEW2_MIN = 86
+"""The WebView2 runtime's major version pywebview needs (it compares only that)."""
+NET_4_6_2 = 394802
+"""The ``Release`` value of .NET Framework 4.6.2, which pywebview's WebView2 needs."""
+WEBVIEW2_URL = "https://developer.microsoft.com/microsoft-edge/webview2/"
+WEBVIEW2_INSTALL = (
+    '$f = "$env:TEMP\\MicrosoftEdgeWebview2Setup.exe"; '
+    'Invoke-WebRequest "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile $f '
+    "-UseBasicParsing; "
+    'Start-Process $f -ArgumentList "/silent","/install" -Wait'
+)
+"""Installs the WebView2 runtime with Microsoft's Evergreen bootstrapper.
+
+Windows PowerShell 5.1 (Server 2019's) needs ``-UseBasicParsing`` where IE
+was never set up. Run as Administrator to install it for every user; offline
+machines need the standalone installer from `WEBVIEW2_URL`.
+"""
+
+
+def read_registry(hive: str, key: str, name: str) -> object | None:
+    """The registry value `hive`\\`key`\\`name`, or None if it's missing."""
+    if sys.platform != "win32":
+        return None
+    import winreg
+
+    try:
+        with winreg.OpenKey(getattr(winreg, hive), key) as handle:
+            return winreg.QueryValueEx(handle, name)[0]
+    except OSError:
+        return None
+
+
+def _version(text: object) -> tuple[int, ...]:
+    try:
+        return tuple(int(part) for part in str(text).split("."))
+    except ValueError:
+        return ()
+
+
+def windows_webview_problem() -> str | None:
+    """Why pywebview would fall back to MSHTML (IE) on this Windows, or None.
+
+    It uses Edge's WebView2 only when the runtime and .NET 4.6.2 are installed,
+    and silently falls back to MSHTML, which can't load NiceGUI's ES modules.
+    Windows Server 2019 ships without WebView2. Mirrors pywebview's own
+    (private) check in ``webview/platforms/winforms.py``, which a
+    ``PYWEBVIEW_GUI`` other than ``edgechromium`` or ``mshtml`` (e.g. ``cef``)
+    skips.
+    """
+    gui = os.environ.get("PYWEBVIEW_GUI", "").lower()
+    if gui not in ("", "edgechromium", "mshtml"):
+        return None
+    if gui == "mshtml":
+        return "PYWEBVIEW_GUI=mshtml picks the IE engine, which can't run this app"
+    release = read_registry(
+        "HKEY_LOCAL_MACHINE", r"SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full", "Release"
+    )
+    if not isinstance(release, int) or release < NET_4_6_2:
+        return "pywebview's Edge WebView2 needs .NET Framework 4.6.2 or later"
+    # A 64-bit Windows keeps the machine-wide runtime in the 32-bit registry view.
+    machine_root = "SOFTWARE" if machine() == "x86" else r"SOFTWARE\WOW6432Node"
+    for runtime in WEBVIEW2_RUNTIMES:
+        for hive, root in (("HKEY_CURRENT_USER", "SOFTWARE"), ("HKEY_LOCAL_MACHINE", machine_root)):
+            key = rf"{root}\Microsoft\EdgeUpdate\Clients\{runtime}"
+            if _version(read_registry(hive, key, "pv"))[:1] >= (WEBVIEW2_MIN,):
+                return None
+    return (
+        "the Microsoft Edge WebView2 Runtime isn't installed, and pywebview's "
+        "fallback (IE) can't run this app; meanwhile use Edge or Chrome. "
+        f"To install it (see {WEBVIEW2_URL}), run in PowerShell: {WEBVIEW2_INSTALL}"
+    )
+
+
 def native_window_problem() -> str | None:
     """Why a native window can't open here, or None if it can.
 
     pywebview ships with this package, but on Linux it brings no GUI toolkit
-    of its own: it needs PyGObject (GTK) or Qt bindings, and a display.
+    of its own: it needs PyGObject (GTK) or Qt bindings, and a display. On
+    Windows it needs Edge's WebView2 runtime.
     """
     if importlib.util.find_spec("webview") is None:
         return "pywebview isn't installed"
+    if sys.platform == "win32":
+        return windows_webview_problem()
     if sys.platform.startswith("linux"):
         if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
             return "no display (DISPLAY / WAYLAND_DISPLAY unset)"

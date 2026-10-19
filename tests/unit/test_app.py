@@ -115,6 +115,63 @@ def test_native_window_icon_suits_the_platform(captured_run, monkeypatch, platfo
     assert icon.is_file()
 
 
+def fake_foundation(info: dict) -> SimpleNamespace:
+    bundle = SimpleNamespace(infoDictionary=lambda: info)
+    return SimpleNamespace(NSBundle=SimpleNamespace(mainBundle=lambda: bundle))
+
+
+def test_name_macos_app_renames_the_bundle(monkeypatch):
+    info = {"CFBundleName": "Python"}
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setitem(app_module.sys.modules, "Foundation", fake_foundation(info))
+
+    app_module.name_macos_app("Relevance Debugger")
+
+    assert info["CFBundleName"] == "Relevance Debugger"
+
+
+def test_the_app_is_named_relevance_debugger():
+    assert app_module.APP_NAME == "Relevance Debugger"
+
+
+def test_the_window_process_is_named_while_spawn_reimports_the_script(monkeypatch):
+    names: list[str] = []
+    monkeypatch.setattr(app_module, "name_macos_app", names.append)
+    monkeypatch.setitem(app_module.sys.modules, "__mp_main__", SimpleNamespace())
+
+    app_module.name_window_process()
+
+    assert names == ["Relevance Debugger"]
+
+
+def test_the_main_process_is_not_renamed(monkeypatch):
+    names: list[str] = []
+    monkeypatch.setattr(app_module, "name_macos_app", names.append)
+    monkeypatch.delitem(app_module.sys.modules, "__mp_main__", raising=False)
+
+    app_module.name_window_process()
+
+    assert names == []
+
+
+def test_name_macos_app_does_nothing_elsewhere(monkeypatch):
+    info = {"CFBundleName": "Python"}
+    monkeypatch.setattr(app_module.sys, "platform", "linux")
+    monkeypatch.setitem(app_module.sys.modules, "Foundation", fake_foundation(info))
+
+    app_module.name_macos_app("Relevance Debugger")
+
+    assert info["CFBundleName"] == "Python"
+
+
+def test_name_macos_app_without_pyobjc_does_nothing(monkeypatch):
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    # None in sys.modules makes the import raise ImportError.
+    monkeypatch.setitem(app_module.sys.modules, "Foundation", None)
+
+    app_module.name_macos_app("Relevance Debugger")
+
+
 def test_windows_icon_is_a_bmp_framed_ico():
     # .NET's System.Drawing.Icon can't be relied on for PNG-compressed frames.
     data = app_module.WINDOW_ICONS["win32"].read_bytes()
@@ -232,6 +289,109 @@ def test_native_on_linux_needs_gtk_or_qt(monkeypatch, specs):
     assert "GTK" in (app_module.native_window_problem() or "")
     specs.add("qtpy")
     assert app_module.native_window_problem() is None
+
+
+WEBVIEW2_RUNTIME = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+NET_FRAMEWORK = r"SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full"
+
+
+@pytest.fixture
+def registry(monkeypatch, specs):
+    """A fake Windows registry: {(hive, subkey, value): data}, .NET 4.8 installed."""
+    monkeypatch.setattr("sys.platform", "win32")
+    monkeypatch.setattr(app_module, "machine", lambda: "AMD64")
+    monkeypatch.delenv("PYWEBVIEW_GUI", raising=False)
+    values: dict[tuple[str, str, str], object] = {
+        ("HKEY_LOCAL_MACHINE", NET_FRAMEWORK, "Release"): 528040,
+    }
+    monkeypatch.setattr(
+        app_module, "read_registry", lambda hive, key, name: values.get((hive, key, name))
+    )
+    return values
+
+
+MACHINE_WEBVIEW2 = (
+    "HKEY_LOCAL_MACHINE",
+    rf"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_RUNTIME}",
+    "pv",
+)
+
+
+def test_native_on_windows_needs_webview2(registry):
+    # Windows Server 2019 has no WebView2, and pywebview's MSHTML (IE) fallback
+    # can't load NiceGUI's ES modules.
+    problem = app_module.native_window_problem() or ""
+
+    assert "WebView2" in problem
+    assert "https://developer.microsoft.com/microsoft-edge/webview2/" in problem
+
+
+def test_missing_webview2_says_how_to_install_it_from_powershell(registry):
+    problem = app_module.native_window_problem() or ""
+
+    # Microsoft's Evergreen bootstrapper, installed silently. Server 2019's
+    # PowerShell 5.1 needs -UseBasicParsing where IE was never set up.
+    command = problem.split("run in PowerShell: ", 1)[1]
+    assert "https://go.microsoft.com/fwlink/p/?LinkId=2124703" in command
+    assert "-UseBasicParsing" in command
+    assert '"/silent","/install"' in command
+    assert command == app_module.WEBVIEW2_INSTALL
+
+
+def test_native_on_windows_with_machine_wide_webview2(registry):
+    registry[MACHINE_WEBVIEW2] = "131.0.2903.70"
+
+    assert app_module.native_window_problem() is None
+
+
+def test_native_on_windows_with_per_user_webview2(registry):
+    key = rf"SOFTWARE\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_RUNTIME}"
+    registry[("HKEY_CURRENT_USER", key, "pv")] = "131.0.2903.70"
+
+    assert app_module.native_window_problem() is None
+
+
+def test_native_on_32_bit_windows_reads_the_native_registry_view(registry, monkeypatch):
+    monkeypatch.setattr(app_module, "machine", lambda: "x86")
+    key = rf"SOFTWARE\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_RUNTIME}"
+    registry[("HKEY_LOCAL_MACHINE", key, "pv")] = "131.0.2903.70"
+
+    assert app_module.native_window_problem() is None
+
+
+@pytest.mark.parametrize("version", ["0.0.0.0", "85.9.9.9", "not a version", ""])
+def test_native_on_windows_ignores_a_missing_or_too_old_webview2(registry, version):
+    # An uninstalled runtime can leave "0.0.0.0"; pywebview wants major 86+.
+    registry[MACHINE_WEBVIEW2] = version
+
+    assert "WebView2" in (app_module.native_window_problem() or "")
+
+
+def test_native_on_windows_accepts_any_86_runtime_as_pywebview_does(registry):
+    registry[MACHINE_WEBVIEW2] = "86.0.600.0"
+
+    assert app_module.native_window_problem() is None
+
+
+@pytest.mark.parametrize("gui", ["cef", "qt", "CEF"])
+def test_native_on_windows_with_another_engine_needs_no_webview2(registry, monkeypatch, gui):
+    monkeypatch.setenv("PYWEBVIEW_GUI", gui)
+
+    assert app_module.native_window_problem() is None
+
+
+def test_native_on_windows_forced_to_ie_is_a_problem(registry, monkeypatch):
+    registry[MACHINE_WEBVIEW2] = "131.0.2903.70"
+    monkeypatch.setenv("PYWEBVIEW_GUI", "mshtml")
+
+    assert "mshtml" in (app_module.native_window_problem() or "")
+
+
+def test_native_on_windows_needs_net_4_6_2(registry):
+    registry[MACHINE_WEBVIEW2] = "131.0.2903.70"
+    registry[("HKEY_LOCAL_MACHINE", NET_FRAMEWORK, "Release")] = 394801
+
+    assert ".NET" in (app_module.native_window_problem() or "")
 
 
 # --- Debouncer ---------------------------------------------------------------------
