@@ -39,7 +39,12 @@ uv run pytest
 uv run ruff check src tests
 uv run ruff format src tests
 uv run pyright src tests
+scripts/ci_local.sh   # approximate CI locally (act + Docker) when GitHub Actions is down
 ```
+
+`scripts/ci_local.sh --help` lists its jobs and how it differs from CI (no
+Windows; Linux containers use the host's architecture). Its smoke steps copy
+`test.yaml`'s `smoke` job, so change both together.
 
 ## How to work here
 
