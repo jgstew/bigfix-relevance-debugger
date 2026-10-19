@@ -1447,6 +1447,18 @@ WEBVIEW2_MIN = 86
 NET_4_6_2 = 394802
 """The ``Release`` value of .NET Framework 4.6.2, which pywebview's WebView2 needs."""
 WEBVIEW2_URL = "https://developer.microsoft.com/microsoft-edge/webview2/"
+WEBVIEW2_INSTALL = (
+    '$f = "$env:TEMP\\MicrosoftEdgeWebview2Setup.exe"; '
+    'Invoke-WebRequest "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile $f '
+    "-UseBasicParsing; "
+    'Start-Process $f -ArgumentList "/silent","/install" -Wait'
+)
+"""Installs the WebView2 runtime with Microsoft's Evergreen bootstrapper.
+
+Windows PowerShell 5.1 (Server 2019's) needs ``-UseBasicParsing`` where IE
+was never set up. Run as Administrator to install it for every user; offline
+machines need the standalone installer from `WEBVIEW2_URL`.
+"""
 
 
 def read_registry(hive: str, key: str, name: str) -> object | None:
@@ -1498,8 +1510,8 @@ def windows_webview_problem() -> str | None:
                 return None
     return (
         "the Microsoft Edge WebView2 Runtime isn't installed, and pywebview's "
-        f"fallback (IE) can't run this app; install it from {WEBVIEW2_URL} "
-        "and meanwhile use Edge or Chrome"
+        "fallback (IE) can't run this app; meanwhile use Edge or Chrome. "
+        f"To install it (see {WEBVIEW2_URL}), run in PowerShell: {WEBVIEW2_INSTALL}"
     )
 
 

@@ -326,6 +326,18 @@ def test_native_on_windows_needs_webview2(registry):
     assert "https://developer.microsoft.com/microsoft-edge/webview2/" in problem
 
 
+def test_missing_webview2_says_how_to_install_it_from_powershell(registry):
+    problem = app_module.native_window_problem() or ""
+
+    # Microsoft's Evergreen bootstrapper, installed silently. Server 2019's
+    # PowerShell 5.1 needs -UseBasicParsing where IE was never set up.
+    command = problem.split("run in PowerShell: ", 1)[1]
+    assert "https://go.microsoft.com/fwlink/p/?LinkId=2124703" in command
+    assert "-UseBasicParsing" in command
+    assert '"/silent","/install"' in command
+    assert command == app_module.WEBVIEW2_INSTALL
+
+
 def test_native_on_windows_with_machine_wide_webview2(registry):
     registry[MACHINE_WEBVIEW2] = "131.0.2903.70"
 

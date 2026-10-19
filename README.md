@@ -85,7 +85,14 @@ opens a browser tab instead. For a native window, add a toolkit, e.g.
 (and .NET Framework 4.6.2+). Windows 11 and updated Windows 10 have it; Windows Server 2019
 doesn't. Without it, pywebview would fall back to the old IE engine, which
 can't run the app, so the app says why and opens a browser tab instead.
-Install the runtime, or browse to the URL in Edge or Chrome (not IE).
+Install the runtime, or browse to the URL in Edge or Chrome (not IE). The
+app's warning includes this PowerShell command, which installs it with
+Microsoft's bootstrapper (as Administrator for every user; it needs internet
+access, otherwise use the standalone installer from the page above):
+
+```powershell
+$f = "$env:TEMP\MicrosoftEdgeWebview2Setup.exe"; Invoke-WebRequest "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile $f -UseBasicParsing; Start-Process $f -ArgumentList "/silent","/install" -Wait
+```
 
 **macOS:** the window's process is named "Relevance Debugger" (e.g. in
 Activity Monitor) when started with `uvx` or `uv run bigfix-relevance-debugger`;
