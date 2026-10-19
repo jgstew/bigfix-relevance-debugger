@@ -104,6 +104,8 @@ WINDOW_ICONS = {
     "win32": LOGO.with_suffix(".ico"),
 }
 """The native window's icon by `sys.platform`; GTK and Qt get `logo.png`."""
+APP_NAME = "Relevance Debugger"
+"""The native window's app name in macOS's LaunchServices, "Python" otherwise."""
 DEBOUNCE_S = 0.3
 FILTER_DEBOUNCE_S = 0.2
 """Each filter change resends the results table, so wait for typing to pause."""
@@ -112,6 +114,33 @@ ARCH_LOOKUP_DEBOUNCE_S = 0.5
 SIDE_PANEL_WIDTH = 460
 INVENTORY_FILTER_MIN = 9
 """Hosts it takes for the inventory table to get a filter box."""
+
+
+def name_macos_app(name: str) -> None:
+    """Register this process with macOS as the app `name` (e.g. in Activity Monitor).
+
+    LaunchServices takes the name from the bundle's ``CFBundleName``, which is
+    Python.app's, when the Cocoa app starts, so call it before pywebview's
+    ``webview.start``; later it changes nothing. The Dock's tooltip still says
+    "Python": it reads the bundle on disk. Does nothing off macOS or without
+    pyobjc (pywebview's macOS dependency).
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        from Foundation import NSBundle  # pyright: ignore[reportAttributeAccessIssue]
+    except ImportError:
+        return
+    NSBundle.mainBundle().infoDictionary()["CFBundleName"] = name
+
+
+# NiceGUI opens the native window in a spawned process, which re-imports the
+# console script (and so this module) as `__mp_main__` before it starts
+# pywebview: the one chance to rename the app there. The window's process
+# isn't marked as a child yet at that point (`parent_process()` is None), and
+# `python -m` runs aren't re-imported at all.
+if "__mp_main__" in sys.modules:
+    name_macos_app(APP_NAME)
 
 EXAMPLES = {
     "name of operating system": "name of operating system",

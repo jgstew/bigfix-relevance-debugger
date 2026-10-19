@@ -115,6 +115,43 @@ def test_native_window_icon_suits_the_platform(captured_run, monkeypatch, platfo
     assert icon.is_file()
 
 
+def fake_foundation(info: dict) -> SimpleNamespace:
+    bundle = SimpleNamespace(infoDictionary=lambda: info)
+    return SimpleNamespace(NSBundle=SimpleNamespace(mainBundle=lambda: bundle))
+
+
+def test_name_macos_app_renames_the_bundle(monkeypatch):
+    info = {"CFBundleName": "Python"}
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    monkeypatch.setitem(app_module.sys.modules, "Foundation", fake_foundation(info))
+
+    app_module.name_macos_app("Relevance Debugger")
+
+    assert info["CFBundleName"] == "Relevance Debugger"
+
+
+def test_the_app_is_named_relevance_debugger():
+    assert app_module.APP_NAME == "Relevance Debugger"
+
+
+def test_name_macos_app_does_nothing_elsewhere(monkeypatch):
+    info = {"CFBundleName": "Python"}
+    monkeypatch.setattr(app_module.sys, "platform", "linux")
+    monkeypatch.setitem(app_module.sys.modules, "Foundation", fake_foundation(info))
+
+    app_module.name_macos_app("Relevance Debugger")
+
+    assert info["CFBundleName"] == "Python"
+
+
+def test_name_macos_app_without_pyobjc_does_nothing(monkeypatch):
+    monkeypatch.setattr(app_module.sys, "platform", "darwin")
+    # None in sys.modules makes the import raise ImportError.
+    monkeypatch.setitem(app_module.sys.modules, "Foundation", None)
+
+    app_module.name_macos_app("Relevance Debugger")
+
+
 def test_windows_icon_is_a_bmp_framed_ico():
     # .NET's System.Drawing.Icon can't be relied on for PNG-compressed frames.
     data = app_module.WINDOW_ICONS["win32"].read_bytes()
