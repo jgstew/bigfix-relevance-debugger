@@ -135,13 +135,20 @@ def name_macos_app(name: str) -> None:
     NSBundle.mainBundle().infoDictionary()["CFBundleName"] = name
 
 
-# NiceGUI opens the native window in a spawned process, which re-imports the
-# console script (and so this module) as `__mp_main__` before it starts
-# pywebview: the one chance to rename the app there. The window's process
-# isn't marked as a child yet at that point (`parent_process()` is None), and
-# `python -m` runs aren't re-imported at all.
-if "__mp_main__" in sys.modules:
-    name_macos_app(APP_NAME)
+def name_window_process() -> None:
+    """Name the app if this is NiceGUI's native window process being set up.
+
+    NiceGUI opens the native window in a spawned process, which re-imports the
+    console script (and so this module) as `__mp_main__` before it starts
+    pywebview: the one chance to rename the app there. The window's process
+    isn't marked as a child yet at that point (`parent_process()` is None), and
+    `python -m` runs aren't re-imported at all.
+    """
+    if "__mp_main__" in sys.modules:
+        name_macos_app(APP_NAME)
+
+
+name_window_process()
 
 EXAMPLES = {
     "name of operating system": "name of operating system",
@@ -1435,7 +1442,8 @@ WEBVIEW2_RUNTIMES = (
     "{65C35B14-6C1D-4122-AC46-7148CC9D6497}",  # canary
 )
 """EdgeUpdate client ids of the WebView2 runtimes pywebview looks for."""
-WEBVIEW2_MIN = (86, 0, 622, 0)
+WEBVIEW2_MIN = 86
+"""The WebView2 runtime's major version pywebview needs (it compares only that)."""
 NET_4_6_2 = 394802
 """The ``Release`` value of .NET Framework 4.6.2, which pywebview's WebView2 needs."""
 WEBVIEW2_URL = "https://developer.microsoft.com/microsoft-edge/webview2/"
@@ -1467,8 +1475,15 @@ def windows_webview_problem() -> str | None:
     It uses Edge's WebView2 only when the runtime and .NET 4.6.2 are installed,
     and silently falls back to MSHTML, which can't load NiceGUI's ES modules.
     Windows Server 2019 ships without WebView2. Mirrors pywebview's own
-    (private) check in ``webview/platforms/winforms.py``.
+    (private) check in ``webview/platforms/winforms.py``, which a
+    ``PYWEBVIEW_GUI`` other than ``edgechromium`` or ``mshtml`` (e.g. ``cef``)
+    skips.
     """
+    gui = os.environ.get("PYWEBVIEW_GUI", "").lower()
+    if gui not in ("", "edgechromium", "mshtml"):
+        return None
+    if gui == "mshtml":
+        return "PYWEBVIEW_GUI=mshtml picks the IE engine, which can't run this app"
     release = read_registry(
         "HKEY_LOCAL_MACHINE", r"SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full", "Release"
     )
@@ -1479,7 +1494,7 @@ def windows_webview_problem() -> str | None:
     for runtime in WEBVIEW2_RUNTIMES:
         for hive, root in (("HKEY_CURRENT_USER", "SOFTWARE"), ("HKEY_LOCAL_MACHINE", machine_root)):
             key = rf"{root}\Microsoft\EdgeUpdate\Clients\{runtime}"
-            if _version(read_registry(hive, key, "pv")) >= WEBVIEW2_MIN:
+            if _version(read_registry(hive, key, "pv"))[:1] >= (WEBVIEW2_MIN,):
                 return None
     return (
         "the Microsoft Edge WebView2 Runtime isn't installed, and pywebview's "

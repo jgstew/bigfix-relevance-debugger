@@ -87,6 +87,10 @@ doesn't. Without it, pywebview would fall back to the old IE engine, which
 can't run the app, so the app says why and opens a browser tab instead.
 Install the runtime, or browse to the URL in Edge or Chrome (not IE).
 
+**macOS:** the window's process is named "Relevance Debugger" (e.g. in
+Activity Monitor) when started with `uvx` or `uv run bigfix-relevance-debugger`;
+`python -m` runs are "Python". The Dock's tooltip says "Python" either way.
+
 ## Prerequisites
 
 - **Containers:** a running Docker (or Podman) daemon. The first run against

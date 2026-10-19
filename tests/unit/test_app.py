@@ -134,6 +134,26 @@ def test_the_app_is_named_relevance_debugger():
     assert app_module.APP_NAME == "Relevance Debugger"
 
 
+def test_the_window_process_is_named_while_spawn_reimports_the_script(monkeypatch):
+    names: list[str] = []
+    monkeypatch.setattr(app_module, "name_macos_app", names.append)
+    monkeypatch.setitem(app_module.sys.modules, "__mp_main__", SimpleNamespace())
+
+    app_module.name_window_process()
+
+    assert names == ["Relevance Debugger"]
+
+
+def test_the_main_process_is_not_renamed(monkeypatch):
+    names: list[str] = []
+    monkeypatch.setattr(app_module, "name_macos_app", names.append)
+    monkeypatch.delitem(app_module.sys.modules, "__mp_main__", raising=False)
+
+    app_module.name_window_process()
+
+    assert names == []
+
+
 def test_name_macos_app_does_nothing_elsewhere(monkeypatch):
     info = {"CFBundleName": "Python"}
     monkeypatch.setattr(app_module.sys, "platform", "linux")
@@ -280,6 +300,7 @@ def registry(monkeypatch, specs):
     """A fake Windows registry: {(hive, subkey, value): data}, .NET 4.8 installed."""
     monkeypatch.setattr("sys.platform", "win32")
     monkeypatch.setattr(app_module, "machine", lambda: "AMD64")
+    monkeypatch.delenv("PYWEBVIEW_GUI", raising=False)
     values: dict[tuple[str, str, str], object] = {
         ("HKEY_LOCAL_MACHINE", NET_FRAMEWORK, "Release"): 528040,
     }
@@ -326,12 +347,32 @@ def test_native_on_32_bit_windows_reads_the_native_registry_view(registry, monke
     assert app_module.native_window_problem() is None
 
 
-@pytest.mark.parametrize("version", ["0.0.0.0", "86.0.621.9", "not a version"])
+@pytest.mark.parametrize("version", ["0.0.0.0", "85.9.9.9", "not a version", ""])
 def test_native_on_windows_ignores_a_missing_or_too_old_webview2(registry, version):
-    # An uninstalled runtime can leave "0.0.0.0"; pywebview wants 86.0.622.0+.
+    # An uninstalled runtime can leave "0.0.0.0"; pywebview wants major 86+.
     registry[MACHINE_WEBVIEW2] = version
 
     assert "WebView2" in (app_module.native_window_problem() or "")
+
+
+def test_native_on_windows_accepts_any_86_runtime_as_pywebview_does(registry):
+    registry[MACHINE_WEBVIEW2] = "86.0.600.0"
+
+    assert app_module.native_window_problem() is None
+
+
+@pytest.mark.parametrize("gui", ["cef", "qt", "CEF"])
+def test_native_on_windows_with_another_engine_needs_no_webview2(registry, monkeypatch, gui):
+    monkeypatch.setenv("PYWEBVIEW_GUI", gui)
+
+    assert app_module.native_window_problem() is None
+
+
+def test_native_on_windows_forced_to_ie_is_a_problem(registry, monkeypatch):
+    registry[MACHINE_WEBVIEW2] = "131.0.2903.70"
+    monkeypatch.setenv("PYWEBVIEW_GUI", "mshtml")
+
+    assert "mshtml" in (app_module.native_window_problem() or "")
 
 
 def test_native_on_windows_needs_net_4_6_2(registry):
