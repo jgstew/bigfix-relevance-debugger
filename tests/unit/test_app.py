@@ -271,6 +271,76 @@ def test_native_on_linux_needs_gtk_or_qt(monkeypatch, specs):
     assert app_module.native_window_problem() is None
 
 
+WEBVIEW2_RUNTIME = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+NET_FRAMEWORK = r"SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full"
+
+
+@pytest.fixture
+def registry(monkeypatch, specs):
+    """A fake Windows registry: {(hive, subkey, value): data}, .NET 4.8 installed."""
+    monkeypatch.setattr("sys.platform", "win32")
+    monkeypatch.setattr(app_module, "machine", lambda: "AMD64")
+    values: dict[tuple[str, str, str], object] = {
+        ("HKEY_LOCAL_MACHINE", NET_FRAMEWORK, "Release"): 528040,
+    }
+    monkeypatch.setattr(
+        app_module, "read_registry", lambda hive, key, name: values.get((hive, key, name))
+    )
+    return values
+
+
+MACHINE_WEBVIEW2 = (
+    "HKEY_LOCAL_MACHINE",
+    rf"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_RUNTIME}",
+    "pv",
+)
+
+
+def test_native_on_windows_needs_webview2(registry):
+    # Windows Server 2019 has no WebView2, and pywebview's MSHTML (IE) fallback
+    # can't load NiceGUI's ES modules.
+    problem = app_module.native_window_problem() or ""
+
+    assert "WebView2" in problem
+    assert "https://developer.microsoft.com/microsoft-edge/webview2/" in problem
+
+
+def test_native_on_windows_with_machine_wide_webview2(registry):
+    registry[MACHINE_WEBVIEW2] = "131.0.2903.70"
+
+    assert app_module.native_window_problem() is None
+
+
+def test_native_on_windows_with_per_user_webview2(registry):
+    key = rf"SOFTWARE\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_RUNTIME}"
+    registry[("HKEY_CURRENT_USER", key, "pv")] = "131.0.2903.70"
+
+    assert app_module.native_window_problem() is None
+
+
+def test_native_on_32_bit_windows_reads_the_native_registry_view(registry, monkeypatch):
+    monkeypatch.setattr(app_module, "machine", lambda: "x86")
+    key = rf"SOFTWARE\Microsoft\EdgeUpdate\Clients\{WEBVIEW2_RUNTIME}"
+    registry[("HKEY_LOCAL_MACHINE", key, "pv")] = "131.0.2903.70"
+
+    assert app_module.native_window_problem() is None
+
+
+@pytest.mark.parametrize("version", ["0.0.0.0", "86.0.621.9", "not a version"])
+def test_native_on_windows_ignores_a_missing_or_too_old_webview2(registry, version):
+    # An uninstalled runtime can leave "0.0.0.0"; pywebview wants 86.0.622.0+.
+    registry[MACHINE_WEBVIEW2] = version
+
+    assert "WebView2" in (app_module.native_window_problem() or "")
+
+
+def test_native_on_windows_needs_net_4_6_2(registry):
+    registry[MACHINE_WEBVIEW2] = "131.0.2903.70"
+    registry[("HKEY_LOCAL_MACHINE", NET_FRAMEWORK, "Release")] = 394801
+
+    assert ".NET" in (app_module.native_window_problem() or "")
+
+
 # --- Debouncer ---------------------------------------------------------------------
 
 

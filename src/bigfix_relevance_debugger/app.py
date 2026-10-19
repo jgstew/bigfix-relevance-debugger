@@ -18,6 +18,7 @@ import sys
 import threading
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from platform import machine
 from typing import Any, TypeVar
 
 from bigfix_remote_client_relevance import (
@@ -1427,14 +1428,77 @@ def _breakdown_table(
 WINDOW_SIZE = (1400, 900)
 
 
+WEBVIEW2_RUNTIMES = (
+    "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",  # stable
+    "{2CD8A007-E189-409D-A2C8-9AF4EF3C72AA}",  # beta
+    "{0D50BFEC-CD6A-4F9A-964C-C7416E3ACB10}",  # dev
+    "{65C35B14-6C1D-4122-AC46-7148CC9D6497}",  # canary
+)
+"""EdgeUpdate client ids of the WebView2 runtimes pywebview looks for."""
+WEBVIEW2_MIN = (86, 0, 622, 0)
+NET_4_6_2 = 394802
+"""The ``Release`` value of .NET Framework 4.6.2, which pywebview's WebView2 needs."""
+WEBVIEW2_URL = "https://developer.microsoft.com/microsoft-edge/webview2/"
+
+
+def read_registry(hive: str, key: str, name: str) -> object | None:
+    """The registry value `hive`\\`key`\\`name`, or None if it's missing."""
+    if sys.platform != "win32":
+        return None
+    import winreg
+
+    try:
+        with winreg.OpenKey(getattr(winreg, hive), key) as handle:
+            return winreg.QueryValueEx(handle, name)[0]
+    except OSError:
+        return None
+
+
+def _version(text: object) -> tuple[int, ...]:
+    try:
+        return tuple(int(part) for part in str(text).split("."))
+    except ValueError:
+        return ()
+
+
+def windows_webview_problem() -> str | None:
+    """Why pywebview would fall back to MSHTML (IE) on this Windows, or None.
+
+    It uses Edge's WebView2 only when the runtime and .NET 4.6.2 are installed,
+    and silently falls back to MSHTML, which can't load NiceGUI's ES modules.
+    Windows Server 2019 ships without WebView2. Mirrors pywebview's own
+    (private) check in ``webview/platforms/winforms.py``.
+    """
+    release = read_registry(
+        "HKEY_LOCAL_MACHINE", r"SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full", "Release"
+    )
+    if not isinstance(release, int) or release < NET_4_6_2:
+        return "pywebview's Edge WebView2 needs .NET Framework 4.6.2 or later"
+    # A 64-bit Windows keeps the machine-wide runtime in the 32-bit registry view.
+    machine_root = "SOFTWARE" if machine() == "x86" else r"SOFTWARE\WOW6432Node"
+    for runtime in WEBVIEW2_RUNTIMES:
+        for hive, root in (("HKEY_CURRENT_USER", "SOFTWARE"), ("HKEY_LOCAL_MACHINE", machine_root)):
+            key = rf"{root}\Microsoft\EdgeUpdate\Clients\{runtime}"
+            if _version(read_registry(hive, key, "pv")) >= WEBVIEW2_MIN:
+                return None
+    return (
+        "the Microsoft Edge WebView2 Runtime isn't installed, and pywebview's "
+        f"fallback (IE) can't run this app; install it from {WEBVIEW2_URL} "
+        "and meanwhile use Edge or Chrome"
+    )
+
+
 def native_window_problem() -> str | None:
     """Why a native window can't open here, or None if it can.
 
     pywebview ships with this package, but on Linux it brings no GUI toolkit
-    of its own: it needs PyGObject (GTK) or Qt bindings, and a display.
+    of its own: it needs PyGObject (GTK) or Qt bindings, and a display. On
+    Windows it needs Edge's WebView2 runtime.
     """
     if importlib.util.find_spec("webview") is None:
         return "pywebview isn't installed"
+    if sys.platform == "win32":
+        return windows_webview_problem()
     if sys.platform.startswith("linux"):
         if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
             return "no display (DISPLAY / WAYLAND_DISPLAY unset)"

@@ -80,6 +80,13 @@ GTK (PyGObject) or Qt bindings, or without a display, the app says why and
 opens a browser tab instead. For a native window, add a toolkit, e.g.
 `uvx --with 'pywebview[qt]' bigfix-relevance-debugger`.
 
+**Windows:** the native window needs the
+[Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)
+(and .NET Framework 4.6.2+). Windows 11 and updated Windows 10 have it; Windows Server 2019
+doesn't. Without it, pywebview would fall back to the old IE engine, which
+can't run the app, so the app says why and opens a browser tab instead.
+Install the runtime, or browse to the URL in Edge or Chrome (not IE).
+
 ## Prerequisites
 
 - **Containers:** a running Docker (or Podman) daemon. The first run against
