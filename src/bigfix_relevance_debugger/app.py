@@ -96,6 +96,14 @@ T = TypeVar("T")
 TITLE = "BigFix Relevance Debugger"
 LOGO = Path(__file__).with_name("logo.svg")
 """bigfix-relevance-analyzer's light logo (docs/images/logo.svg): favicon, header and Dock icon."""
+WINDOW_ICONS = {
+    "darwin": LOGO,
+    # pywebview's Windows backend reads only an .ico (an SVG or PNG crashes it),
+    # with BMP frames for .NET's System.Drawing.Icon. Both are made from the
+    # analyzer's docs/images/logo-256.png.
+    "win32": LOGO.with_suffix(".ico"),
+}
+"""The native window's icon by `sys.platform`; GTK and Qt get `logo.png`."""
 DEBOUNCE_S = 0.3
 FILTER_DEBOUNCE_S = 0.2
 """Each filter change resends the results table, so wait for typing to pause."""
@@ -1476,9 +1484,10 @@ def main(argv: list[str] | None = None) -> None:
     }
     if native:
         kwargs["window_size"] = WINDOW_SIZE
-        # The favicon doesn't reach the macOS Dock, which shows Python's rocket
-        # unless pywebview is given an icon (Windows uses the favicon).
-        nicegui_app.native.start_args["icon"] = str(LOGO)
+        # The favicon doesn't reach the macOS Dock or the Windows taskbar, which
+        # show Python's icon unless pywebview is given one in a format it reads.
+        icon = WINDOW_ICONS.get(sys.platform, LOGO.with_suffix(".png"))
+        nicegui_app.native.start_args["icon"] = str(icon)
     if args.port is not None:
         kwargs["port"] = args.port
     nicegui_app.on_shutdown(close_session_clients)
