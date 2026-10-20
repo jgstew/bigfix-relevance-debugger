@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bigfix-relevance-debugger"
-version = "0.5.4"
+version = "0.5.5"
 description = "A browser GUI for BigFix client and session relevance: live static analysis, evaluation with qna and the REST API / BigFix Explorer / Web Reports, and a per-level breakdown."
 readme = "README.md"
 license = "MIT"
