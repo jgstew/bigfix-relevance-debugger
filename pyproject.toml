@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bigfix-relevance-debugger"
-version = "0.5.4"
+version = "0.5.5"
 description = "A browser GUI for BigFix client and session relevance: live static analysis, evaluation with qna and the REST API / BigFix Explorer / Web Reports, and a per-level breakdown."
 readme = "README.md"
 license = "MIT"
@@ -30,7 +30,7 @@ classifiers = [
 dependencies = [
     "bigfix-relevance-analyzer>=1.35.0,<2",
     "bigfix-remote-client-relevance>=1.5.2,<2",
-    "bigfix-remote-session-relevance>=0.5.0,<1",
+    "bigfix-remote-session-relevance>=1.1,<2",
     "nicegui[native]>=3.18.0",
 ]
 
