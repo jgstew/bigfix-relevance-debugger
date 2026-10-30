@@ -59,6 +59,19 @@ def _no_real_container_engine(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _implicit_trust_warns_every_test(monkeypatch):
+    """Re-arm the library's once-per-process implicit-trust DeprecationWarning.
+
+    pyproject.toml turns it into an error; without this, only the first test
+    to build an implicit TrustStore would see it, and a caller that swallows
+    the error would hide it from every later test.
+    """
+    from bigfix_remote_session_relevance import trust
+
+    monkeypatch.setattr(trust, "_implicit_auto_warned", False)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_session_relevance_client(tmp_path, monkeypatch):
     """Fail loudly instead of connecting to a real BigFix server, and keep its files out.
 

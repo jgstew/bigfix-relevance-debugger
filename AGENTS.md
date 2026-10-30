@@ -24,8 +24,8 @@ Entry point: `bigfix_relevance_debugger.app:main`, run via
     CodeMirror wired to the analyzer's language server. See below.
   - `app.py`: the page and `main()`. UI wiring only.
   - `upstream/`: code meant to be donated to the libraries, one module per
-    library (`remote_client_relevance.py`, `relevance_analyzer.py`). See
-    below.
+    library (today `remote_client_relevance.py`; a `relevance_analyzer.py`
+    when there is analyzer code to donate). See below.
 - `tests/unit/`: offline. No Docker, qna, SSH or network.
 
 **Keep NiceGUI out of `analysis.py`, `evaluation.py` and `log_bridge.py`** so
@@ -125,7 +125,7 @@ Windows; Linux containers use the host's architecture). Its smoke steps copy
   (`~/.bigfix/remote_clients.toml` etc.), and first-run auto-discovery when
   there is none. Don't invent a separate config file.
 - **Dialect decides what Evaluate runs.** `analysis.summarize(text, mode)`
-  sets `run_dialects` (session first) from `upstream.relevance_analyzer.dialect_fit`
+  sets `run_dialects` (session first) from the analyzer's `dialect_fit`
   or the picker's override. Session results always sort first.
 - **Session relevance connects with `bigfix-remote-session-relevance`'s own
   lookup** (`load_config`: its TOML file, else the `BES_*` env vars and

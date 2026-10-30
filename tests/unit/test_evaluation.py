@@ -1634,7 +1634,8 @@ def test_default_session_client_never_prompts_and_trusts_on_first_use():
     assert client._prompt is None
     assert isinstance(client._trust, TrustStore)
     assert client._trust.callback is None
-    assert client._trust.trust_on_first_use
+    # Explicit, so the library neither warns nor flips it to refuse in 2.0.
+    assert client._trust.trust_on_first_use == "auto"
 
 
 async def test_leaving_the_stream_early_cancels_the_other_queries():
