@@ -2,7 +2,8 @@
 
 One module per library: ``remote_client_relevance`` for
 bigfix-remote-client-relevance, and ``relevance_analyzer`` for
-bigfix-relevance-analyzer when there is something to donate to it. Rules that keep a move a copy-paste:
+bigfix-relevance-analyzer when there is something to donate to it. Rules that
+keep a move a copy-paste:
 
 * Import only the stdlib and *that* library's public API (its package
   ``__init__`` or a submodule's ``__all__``) -- never this app's modules,
