@@ -249,7 +249,7 @@ wheels = [
 
 [[package]]
 name = "bigfix-relevance-debugger"
-version = "0.6.0"
+version = "0.6.1"
 source = { editable = "." }
 dependencies = [
     { name = "bigfix-relevance-analyzer" },
@@ -269,7 +269,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "bigfix-relevance-analyzer", specifier = ">=1.41.0,<2" },
-    { name = "bigfix-remote-client-relevance", specifier = ">=1.10.0,<2" },
+    { name = "bigfix-remote-client-relevance", specifier = ">=1.11.1,<2" },
     { name = "bigfix-remote-session-relevance", specifier = ">=1.4.0,<2" },
     { name = "nicegui", extras = ["native"], specifier = ">=3.18.0" },
 ]
@@ -284,7 +284,7 @@ dev = [
 
 [[package]]
 name = "bigfix-remote-client-relevance"
-version = "1.10.0"
+version = "1.11.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "asyncssh", marker = "sys_platform != 'android' and sys_platform != 'ios'" },
@@ -299,9 +299,9 @@ dependencies = [
     { name = "typer" },
     { name = "zstandard", marker = "python_full_version < '3.14' and sys_platform != 'android' and sys_platform != 'ios'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/8b/0d/c296ac54414951ffa3266b96c08b8add44d1d586187cfb3c3ea5b2743fd2/bigfix_remote_client_relevance-1.10.0.tar.gz", hash = "sha256:b03165b5efa9d4200159abef9fde7d56ce9dad958662d88ff8df50ed3815daa7", size = 536941, upload-time = "2026-10-30T12:33:08.763Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/8e/51/ce66d18dd8984a5eefab5f1bd0c88f6f400c4593acf3ffeffb5ec14f4709/bigfix_remote_client_relevance-1.11.1.tar.gz", hash = "sha256:da9f42432ba06bb7b755aef78f4281a8e21e2f8ce0b525ac9b3401bc836f377d", size = 548927, upload-time = "2026-10-30T15:33:46.548Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/4d/60/770f1e644fdb1c9b7c6222d48c29db579c70fc7f8913004b8fcfe5294b2e/bigfix_remote_client_relevance-1.10.0-py3-none-any.whl", hash = "sha256:470337a3dc6d4e5a037f38e20b0d5839520098ac2f8518c52bf604d86e5a89b3", size = 175307, upload-time = "2026-10-30T12:33:07.336Z" },
+    { url = "https://files.pythonhosted.org/packages/43/84/e192f2c06e3c98b525b11337cca850902606ae43723609620865b657c26e/bigfix_remote_client_relevance-1.11.1-py3-none-any.whl", hash = "sha256:c43bd987294628a34f449995550218773dd423c4e2c8d8888d5896fe2670224d", size = 180342, upload-time = "2026-10-30T15:33:44.933Z" },
 ]
 
 [[package]]

@@ -25,7 +25,9 @@ from bigfix_remote_client_relevance import (
     BigFixRelevanceError,
     ClientRelevanceResult,
     Target,
+    discover_into,
     find_inventory_path,
+    find_or_discover_inventory,
     results_to_dicts,
 )
 from bigfix_remote_client_relevance.inventory_paths import user_inventory_path
@@ -85,10 +87,6 @@ from bigfix_relevance_debugger.evaluation import (
     waits_for_inventory,
 )
 from bigfix_relevance_debugger.log_bridge import attach, detach
-from bigfix_relevance_debugger.upstream.remote_client_relevance import (
-    discover_into,
-    find_or_discover_inventory,
-)
 
 logger = logging.getLogger(__name__)
 

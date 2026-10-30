@@ -24,8 +24,9 @@ Entry point: `bigfix_relevance_debugger.app:main`, run via
     CodeMirror wired to the analyzer's language server. See below.
   - `app.py`: the page and `main()`. UI wiring only.
   - `upstream/`: code meant to be donated to the libraries, one module per
-    library (today `remote_client_relevance.py`; a `relevance_analyzer.py`
-    when there is analyzer code to donate). See below.
+    library (`remote_client_relevance.py`, `relevance_analyzer.py`), each
+    only while it holds something the library hasn't shipped. Empty today:
+    both libraries ship everything donated so far. See below.
 - `tests/unit/`: offline. No Docker, qna, SSH or network.
 
 **Keep NiceGUI out of `analysis.py`, `evaluation.py` and `log_bridge.py`** so

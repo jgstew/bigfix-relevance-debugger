@@ -18,7 +18,13 @@ ALLOWED = {
 """The library each module may donate to. A module exists only while it has
 something not yet shipped, so a rule can outlive its module."""
 
-PRESENT = {m: lib for m, lib in ALLOWED.items() if (UPSTREAM / m).exists()}
+
+def present(upstream: Path) -> dict[str, str]:
+    """The modules under ``upstream`` that have a rule, with their library."""
+    return {m: lib for m, lib in ALLOWED.items() if (upstream / m).exists()}
+
+
+PRESENT = present(UPSTREAM)
 
 
 def top_level_imports(path: Path) -> set[str]:
@@ -33,10 +39,32 @@ def top_level_imports(path: Path) -> set[str]:
     return names
 
 
-def test_every_upstream_module_has_a_rule():
-    modules = {p.name for p in UPSTREAM.glob("*.py") if p.name != "__init__.py"}
+def modules_in(upstream: Path) -> set[str]:
+    return {p.name for p in upstream.glob("*.py") if p.name != "__init__.py"}
 
-    assert modules <= set(ALLOWED)
+
+def test_every_upstream_module_has_a_rule():
+    assert modules_in(UPSTREAM) <= set(ALLOWED)
+
+
+def test_the_package_is_where_the_rules_look():
+    """With no module left the per-module tests skip; make sure that's because there are none.
+
+    A wrong ``UPSTREAM`` would also find no modules and skip every check.
+    """
+    assert (UPSTREAM / "__init__.py").is_file()
+    assert PRESENT == present(UPSTREAM)
+    assert set(PRESENT) == modules_in(UPSTREAM)
+
+
+def test_a_new_module_is_checked(tmp_path):
+    """``present`` (what the per-module tests are parametrized from) picks up a module added later."""
+    (tmp_path / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "remote_client_relevance.py").write_text("", encoding="utf-8")
+    (tmp_path / "stray.py").write_text("", encoding="utf-8")
+
+    assert present(tmp_path) == {"remote_client_relevance.py": "bigfix_remote_client_relevance"}
+    assert modules_in(tmp_path) - set(ALLOWED) == {"stray.py"}
 
 
 @pytest.mark.parametrize(("module", "library"), sorted(PRESENT.items()))

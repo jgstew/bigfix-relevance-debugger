@@ -292,15 +292,18 @@ async def test_resolve_container_arches_default_engine_is_looked_up_at_call_time
 
 
 async def test_resolve_container_arches_without_an_engine_is_this_machine(monkeypatch):
-    from bigfix_relevance_debugger.upstream import remote_client_relevance
+    from bigfix_remote_client_relevance import discovery
 
-    monkeypatch.setattr(remote_client_relevance, "host_arch", lambda: "arm64")
+    # published_arches reads host_arch from discovery's namespace (not in its
+    # __all__; the test fails loudly if that moves). Not a real host's arch,
+    # so the test can't pass by matching the machine it runs on.
+    monkeypatch.setattr(discovery, "host_arch", lambda: "riscv64")
 
     resolved = await resolve_container_arches(
         TargetForm(container=True), images_factory=lambda: None
     )
 
-    assert resolved == {"debian:11": ["arm64"]}
+    assert resolved == {"debian:11": ["riscv64"]}
 
 
 def test_container_rebuild_image():
@@ -1064,9 +1067,18 @@ def test_breakdown_version_pin_is_named(monkeypatch):
 
 
 def test_arch_picker_and_arch_lookup_share_one_list():
-    from bigfix_relevance_debugger.upstream.remote_client_relevance import SUPPORTED_ARCHS
+    from bigfix_remote_client_relevance.discovery import SUPPORTED_ARCHS
 
     assert evaluation.ARCHES is SUPPORTED_ARCHS
+
+
+def test_platforms_and_arches_come_from_the_client_library():
+    """Client 1.11 ships these; the app calls the library's, not a copy."""
+    from bigfix_remote_client_relevance.bootstrap import targets
+    from bigfix_remote_client_relevance.discovery import published_arches
+
+    assert evaluation.target_platform is targets.target_platform
+    assert evaluation.published_arches is published_arches
 
 
 # --- results view (issue 4) ---------------------------------------------------------

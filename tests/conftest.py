@@ -5,6 +5,8 @@ The unit suite runs offline: no Docker, qna, SSH or network.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 
@@ -26,13 +28,22 @@ def _no_real_auto_discovery(monkeypatch):
 
     It evaluates candidates, may pull images and writes
     ~/.bigfix/remote_clients.toml -- never something a unit test may do.
+    Yields the paths it refused, for the test that checks the guard itself.
     """
-    from bigfix_relevance_debugger.upstream import remote_client_relevance
+    from bigfix_remote_client_relevance import discovery
+
+    reached: list[Path] = []
 
     def refuse(path):
+        reached.append(path)
         raise AssertionError(f"a test reached real auto-discovery (would write {path})")
 
-    monkeypatch.setattr(remote_client_relevance, "run_auto_discovery", refuse)
+    # find_or_discover_inventory and discover_into look it up per call.
+    monkeypatch.setattr(discovery, "run_auto_discovery", refuse)
+    yield reached
+    # Also at teardown: the page reports a failed discovery instead of
+    # raising, which would swallow the raise above.
+    assert not reached, f"a test reached real auto-discovery (would write {reached})"
 
 
 @pytest.fixture(autouse=True)
