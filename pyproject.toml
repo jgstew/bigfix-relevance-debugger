@@ -28,9 +28,9 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-    "bigfix-relevance-analyzer>=1.35.0,<2",
-    "bigfix-remote-client-relevance>=1.5.2,<2",
-    "bigfix-remote-session-relevance>=1.1,<2",
+    "bigfix-relevance-analyzer>=1.41.0,<2",
+    "bigfix-remote-client-relevance>=1.10.0,<2",
+    "bigfix-remote-session-relevance>=1.4.0,<2",
     "nicegui[native]>=3.18.0",
 ]
 
@@ -79,6 +79,10 @@ required-version = ">=0.12"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# bigfix-remote-session-relevance 1.4 deprecates a TrustStore that auto-trusts
+# only because it has no callback; the app must choose its trust explicitly.
+# tests/conftest.py re-arms the library's once-per-process warning per test.
+filterwarnings = ["error:TrustStore with no callback:DeprecationWarning"]
 
 [tool.ruff]
 line-length = 100

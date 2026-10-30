@@ -671,10 +671,12 @@ def default_session_client(
     Never prompts (a missing password is an ``authentication`` result) and
     trusts a self-signed certificate on first use, pinning it and logging a
     WARNING with its fingerprint; pins are shared with the library's CLI.
+    That is ``trust_on_first_use="auto"``, chosen explicitly: the library's
+    implicit default warns, and refuses from 2.0.
     """
     client_kwargs.setdefault("prompt", None)
     if "trust" not in client_kwargs:
-        client_kwargs["trust"] = TrustStore()
+        client_kwargs["trust"] = TrustStore(trust_on_first_use="auto")
     return AsyncSessionRelevanceClient(session_config(load(), opts), **client_kwargs)
 
 
