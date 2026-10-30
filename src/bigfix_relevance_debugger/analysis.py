@@ -12,16 +12,13 @@ from dataclasses import dataclass
 
 from bigfix_relevance_analyzer import (
     Dialect,
+    DialectFit,
     Finding,
     LintConfig,
     analyze_relevance,
-    lint_text,
-)
-
-from bigfix_relevance_debugger.upstream.relevance_analyzer import (
-    DialectFit,
     client_platforms,
     dialect_fit,
+    lint_text,
 )
 
 CLIENT = "client"
@@ -158,17 +155,6 @@ class AnalysisView:
         Then a missing root server configuration isn't worth an error row.
         """
         return self.dialect_mode == AUTO and self.run_dialects == (SESSION, CLIENT)
-
-
-def _type_summary(check: object) -> str | None:
-    value = getattr(check, "value", None)
-    if value is None:
-        return None
-    types = value.types
-    plurality = value.plurality.value
-    if not types:
-        return f"{plurality} (unknown type)" if plurality != "unknown" else "unknown"
-    return f"{plurality} {' | '.join(sorted(types))}"
 
 
 def _names(names: tuple[str, ...], limit: int = 3) -> str:
@@ -334,7 +320,7 @@ def summarize(text: str, mode: str = AUTO) -> AnalysisView:
         run_dialects=run_dialects,
         dialect_reason=dialect_reason,
         lint_dialect=dialect.value,
-        type_summary=_type_summary(check),
+        type_summary=None if check is None else check.value.describe(),
         type_errors=type_errors,
         platforms=platforms,
         complexity_score=complexity.score,

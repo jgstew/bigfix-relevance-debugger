@@ -15,6 +15,10 @@ ALLOWED = {
     "remote_client_relevance.py": "bigfix_remote_client_relevance",
     "relevance_analyzer.py": "bigfix_relevance_analyzer",
 }
+"""The library each module may donate to. A module exists only while it has
+something not yet shipped, so a rule can outlive its module."""
+
+PRESENT = {m: lib for m, lib in ALLOWED.items() if (UPSTREAM / m).exists()}
 
 
 def top_level_imports(path: Path) -> set[str]:
@@ -32,10 +36,10 @@ def top_level_imports(path: Path) -> set[str]:
 def test_every_upstream_module_has_a_rule():
     modules = {p.name for p in UPSTREAM.glob("*.py") if p.name != "__init__.py"}
 
-    assert modules == set(ALLOWED)
+    assert modules <= set(ALLOWED)
 
 
-@pytest.mark.parametrize(("module", "library"), sorted(ALLOWED.items()))
+@pytest.mark.parametrize(("module", "library"), sorted(PRESENT.items()))
 def test_upstream_module_imports_only_stdlib_and_its_library(module, library):
     imported = top_level_imports(UPSTREAM / module)
 
@@ -95,7 +99,7 @@ def library_api(root: Path) -> set[str]:
     )
 
 
-@pytest.mark.parametrize(("module", "library"), sorted(ALLOWED.items()))
+@pytest.mark.parametrize(("module", "library"), sorted(PRESENT.items()))
 def test_nothing_the_library_ships_is_kept_here(module, library):
     """Once the library has it, ours goes: callers use the library's."""
     spec = importlib.util.find_spec(library)

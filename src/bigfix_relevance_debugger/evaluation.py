@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlsplit
 
+from bigfix_relevance_analyzer import summarize_count_results
 from bigfix_remote_client_relevance import (
     ClientRelevanceResult,
     InventoryError,
@@ -44,7 +45,6 @@ from bigfix_remote_session_relevance import (
 )
 
 from bigfix_relevance_debugger.analysis import AnalysisView, LevelView
-from bigfix_relevance_debugger.upstream.relevance_analyzer import summarize_count_results
 from bigfix_relevance_debugger.upstream.remote_client_relevance import (
     SUPPORTED_ARCHS,
     published_arches,
