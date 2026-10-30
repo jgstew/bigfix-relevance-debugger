@@ -53,11 +53,12 @@ def test_the_package_is_where_the_rules_look():
     A wrong ``UPSTREAM`` would also find no modules and skip every check.
     """
     assert (UPSTREAM / "__init__.py").is_file()
+    assert PRESENT == present(UPSTREAM)
     assert set(PRESENT) == modules_in(UPSTREAM)
 
 
 def test_a_new_module_is_checked(tmp_path):
-    """The per-module tests are parametrized from ``present``: a module added later gets them."""
+    """``present`` (what the per-module tests are parametrized from) picks up a module added later."""
     (tmp_path / "__init__.py").write_text("", encoding="utf-8")
     (tmp_path / "remote_client_relevance.py").write_text("", encoding="utf-8")
     (tmp_path / "stray.py").write_text("", encoding="utf-8")

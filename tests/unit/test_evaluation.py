@@ -294,7 +294,9 @@ async def test_resolve_container_arches_default_engine_is_looked_up_at_call_time
 async def test_resolve_container_arches_without_an_engine_is_this_machine(monkeypatch):
     from bigfix_remote_client_relevance import discovery
 
-    # Not a real host's arch, so the test can't pass by matching the machine it runs on.
+    # published_arches reads host_arch from discovery's namespace (not in its
+    # __all__; the test fails loudly if that moves). Not a real host's arch,
+    # so the test can't pass by matching the machine it runs on.
     monkeypatch.setattr(discovery, "host_arch", lambda: "riscv64")
 
     resolved = await resolve_container_arches(

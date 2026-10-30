@@ -1123,6 +1123,21 @@ def test_discovery_comes_from_the_client_library():
     assert app_module.find_or_discover_inventory is discovery.find_or_discover_inventory
 
 
+def test_the_discovery_guard_catches_the_library_helpers(tmp_path, _no_real_auto_discovery):
+    """conftest's guard sits where both library helpers look discovery up.
+
+    If the library ever binds ``run_auto_discovery`` at import instead, this
+    fails rather than letting a page test run real discovery.
+    """
+    with pytest.raises(AssertionError, match="real auto-discovery"):
+        app_module.find_or_discover_inventory(find=lambda: None, user_path=tmp_path / "a.toml")
+    with pytest.raises(AssertionError, match="real auto-discovery"):
+        app_module.discover_into(tmp_path / "b.toml")
+
+    assert _no_real_auto_discovery == [tmp_path / "a.toml", tmp_path / "b.toml"]
+    _no_real_auto_discovery.clear()  # reached on purpose; teardown fails on anything else
+
+
 def fake_discovery(calls: list[Path], hosts: str = ""):
     def discover_into(path):
         calls.append(path)
