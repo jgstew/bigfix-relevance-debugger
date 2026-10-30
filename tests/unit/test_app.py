@@ -1115,6 +1115,14 @@ async def empty_inventory_user(monkeypatch, tmp_path):
         yield simulated
 
 
+def test_discovery_comes_from_the_client_library():
+    """Client 1.11 ships these; the page calls the library's, not a copy."""
+    from bigfix_remote_client_relevance import discovery
+
+    assert app_module.discover_into is discovery.discover_into
+    assert app_module.find_or_discover_inventory is discovery.find_or_discover_inventory
+
+
 def fake_discovery(calls: list[Path], hosts: str = ""):
     def discover_into(path):
         calls.append(path)

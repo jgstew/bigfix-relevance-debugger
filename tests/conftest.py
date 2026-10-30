@@ -27,12 +27,13 @@ def _no_real_auto_discovery(monkeypatch):
     It evaluates candidates, may pull images and writes
     ~/.bigfix/remote_clients.toml -- never something a unit test may do.
     """
-    from bigfix_relevance_debugger.upstream import remote_client_relevance
+    from bigfix_remote_client_relevance import discovery
 
     def refuse(path):
         raise AssertionError(f"a test reached real auto-discovery (would write {path})")
 
-    monkeypatch.setattr(remote_client_relevance, "run_auto_discovery", refuse)
+    # find_or_discover_inventory and discover_into look it up per call.
+    monkeypatch.setattr(discovery, "run_auto_discovery", refuse)
 
 
 @pytest.fixture(autouse=True)

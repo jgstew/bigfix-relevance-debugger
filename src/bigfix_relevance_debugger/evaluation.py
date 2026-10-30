@@ -23,6 +23,7 @@ from urllib.parse import urlsplit
 
 from bigfix_relevance_analyzer import summarize_count_results
 from bigfix_remote_client_relevance import (
+    SUPPORTED_ARCHS,
     ClientRelevanceResult,
     InventoryError,
     Target,
@@ -30,6 +31,8 @@ from bigfix_remote_client_relevance import (
     evaluate_client_relevance_stream,
     evaluate_many_stream,
     load_inventory,
+    published_arches,
+    target_platform,
 )
 from bigfix_remote_client_relevance.bootstrap.targets import host_arch, normalize_arch
 from bigfix_remote_client_relevance.discovery import ImageSource, default_image_source
@@ -45,11 +48,6 @@ from bigfix_remote_session_relevance import (
 )
 
 from bigfix_relevance_debugger.analysis import AnalysisView, LevelView
-from bigfix_relevance_debugger.upstream.remote_client_relevance import (
-    SUPPORTED_ARCHS,
-    published_arches,
-    target_platform,
-)
 
 logger = logging.getLogger(__name__)
 
