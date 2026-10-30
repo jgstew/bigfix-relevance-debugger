@@ -1,10 +1,17 @@
 # Mobile spike: iOS (and macOS) proofs of concept — issue #33
 
-Three ways to put `bigfix-relevance-debugger`'s core on iOS, built far enough
-to compare on a real simulator: **Python 3.15's official iOS support
-(SwiftUI host)**, **BeeWare (Toga + Briefcase)** and **Kivy**. All three use
-the same UI-free core, so the differences below are about the toolkits, not
-the BigFix code.
+Four ways to put `bigfix-relevance-debugger` on iOS, built far enough to
+compare on a real simulator:
+
+- **Python 3.15's official iOS support** (SwiftUI host)
+- **BeeWare** (Toga + Briefcase)
+- **Kivy**
+- **The existing NiceGUI app, as is**, in a `WKWebView` (added later; see
+  [below](#nicegui-as-is-nicegui))
+
+The first three use the same UI-free core, so the differences between them
+are about the toolkits, not the BigFix code. The fourth runs the shipped
+desktop app's code, unchanged.
 
 Spike code: nothing here is wired into the shipped app, its tests or its
 package. Built on 2026-10-29 with Xcode 16.2 / iOS 18.3 simulator on macOS
@@ -12,18 +19,19 @@ package. Built on 2026-10-29 with Xcode 16.2 / iOS 18.3 simulator on macOS
 
 ## TL;DR
 
-| | Pure Python 3.15 + SwiftUI | BeeWare (Toga) | Kivy |
-|---|---|---|---|
-| Runs on iOS simulator | **Yes**, smoke 7/7 | **Yes**, smoke 7/7 | **Yes**, smoke 7/7 |
-| Python on iOS | **3.15.2, python.org official framework** | **3.15.2, python.org official framework** (Briefcase fetches it) | 3.11.6, compiled by kivy-ios |
-| Runs on macOS | Only as "Designed for iPad" (needs a signing team) or a separate macOS target | **Yes**, native Cocoa app (packaged `.app` built, 3.15.2) | Yes, desktop window (Python ≤ 3.13: no Kivy wheels for 3.14+) |
-| Looks/feels native | **Most**: SwiftUI `Form`, `List`, tab bar, alerts, iPad top tabs | **Native widgets** (UIKit/AppKit), coarser layout control; iPadOS 18 tab bar overlaps content | No: custom-drawn (OpenGL) widgets; ignores the safe area (Dynamic Island covers a tab) |
-| Editor highlighting | Yes: `UITextView` + analyzer spans | **Yes**: the native text view's `NSTextStorage` + analyzer spans | Yes: `CodeInput` + Pygments lexer driven by the analyzer |
-| Lint squiggles in editor | Yes (dotted underline) | Yes (underline) | No (`CodeInput` can only colour) |
-| Android later | UI rewrite (Kotlin/Compose); core reusable via Chaquopy | **Same code** (`briefcase … android`, Chaquopy) | Same code (Buildozer / python-for-android) |
-| UI language | Swift (+ ~60 lines of C glue) | Python | Python + KV |
-| Python start (sim, incl. core import) | 0.55 s ([About](docs/screenshots/swiftui-iphone-about.png)) | similar (same framework; not timed) | — |
-| Debug `.app` size (sim) | 283 MB (no stdlib pruning yet) | 108 MB | 66 MB (kivy-ios prunes the stdlib) |
+| | Pure Python 3.15 + SwiftUI | BeeWare (Toga) | Kivy | NiceGUI as is |
+|---|---|---|---|---|
+| Runs on iOS simulator | **Yes**, smoke 7/7 | **Yes**, smoke 7/7 | **Yes**, smoke 7/7 | **Yes**: the real debugger page, analyzer + LSP live |
+| Python on iOS | **3.15.2, python.org official framework** | **3.15.2, python.org official framework** (Briefcase fetches it) | 3.11.6, compiled by kivy-ios | **3.15.2, python.org official framework** |
+| Runs on macOS | Only as "Designed for iPad" (needs a signing team) or a separate macOS target | **Yes**, native Cocoa app (packaged `.app` built, 3.15.2) | Yes, desktop window (Python ≤ 3.13: no Kivy wheels for 3.14+) | It already does (`uvx`) |
+| Looks/feels native | **Most**: SwiftUI `Form`, `List`, tab bar, alerts, iPad top tabs | **Native widgets** (UIKit/AppKit), coarser layout control; iPadOS 18 tab bar overlaps content | No: custom-drawn (OpenGL) widgets; ignores the safe area (Dynamic Island covers a tab) | No: a web page (Quasar/Material); good on iPad, cramped on a phone |
+| Editor highlighting | Yes: `UITextView` + analyzer spans | **Yes**: the native text view's `NSTextStorage` + analyzer spans | Yes: `CodeInput` + Pygments lexer driven by the analyzer | **Yes, plus completion and hover**: the app's CodeMirror + the analyzer's language server |
+| Lint squiggles in editor | Yes (dotted underline) | Yes (underline) | No (`CodeInput` can only colour) | Yes (gutter + findings table) |
+| Android later | UI rewrite (Kotlin/Compose); core reusable via Chaquopy | **Same code** (`briefcase … android`, Chaquopy) | Same code (Buildozer / python-for-android) | Same Python code; a small Android WebView host, and pydantic-core built for Android too |
+| UI language | Swift (+ ~60 lines of C glue) | Python | Python + KV | **The existing Python/NiceGUI code** (+ ~90 lines of Swift) |
+| Python start (sim, incl. core import) | 0.55 s ([About](docs/screenshots/swiftui-iphone-about.png)) | similar (same framework; not timed) | — | 2.9–3.2 s until the page answers |
+| Debug `.app` size (sim) | 283 MB (no stdlib pruning yet) | 108 MB | 66 MB (kivy-ios prunes the stdlib) | 337 MB (no pruning; 175 MB is CPython's `test/`) |
+| Compiled deps to build yourself | none | none | Python, SDL2, Kivy (kivy-ios) | **`pydantic-core` (Rust)**: nobody publishes iOS wheels |
 
 **Recommendation: BeeWare/Toga**, with a SwiftUI shell as the fallback if the
 UI ever needs more than Toga offers.
@@ -38,6 +46,12 @@ UI ever needs more than Toga offers.
   and autocorrect.
 - SwiftUI feels the most "iOS/macOS native". The cost is two languages, and
   a second UI to write for Android.
+
+> **Later decision (after this spike):** the chosen direction is SwiftUI over
+> Python 3.15, sharing one headless core with the NiceGUI app; see
+> jgstew/bigfix-relevance-debugger#41 and the upstream issues it lists. The
+> NiceGUI-as-is spike below was added afterwards to answer "could the existing
+> app just run on iOS?"
 
 ## What each PoC does
 
@@ -217,6 +231,66 @@ Findings:
   autoconf/automake/pkg-config from Homebrew.
 - Separate toolchains per platform: kivy-ios for iOS, Buildozer /
   python-for-android for Android.
+
+## NiceGUI as is (`nicegui/`)
+
+**Question:** can the existing NiceGUI app run on iOS unchanged?
+
+**Answer: yes, with two workarounds, neither in this repo's code:**
+
+1. build `pydantic-core` for iOS yourself;
+2. stub out `_multiprocessing` before NiceGUI imports.
+
+Then `bigfix_relevance_debugger.app.main(["--no-browser", "--port", N])` (the exact desktop entry point, from this repo's own wheel) serves the real page on `127.0.0.1` inside the app, and a `WKWebView` shows it. Verified on the iOS 18.3 simulator:
+
+- The page answers **2.9–3.2 s** after launch (Python start, imports, uvicorn).
+- The CodeMirror editor with the analyzer's highlighter and language server, the lint gutter, the findings table with "did you mean", and the dialect/type/complexity chips all work ([iPhone](docs/screenshots/nicegui-iphone-analysis.png), [iPad](docs/screenshots/nicegui-ipad.png)).
+- First-run **auto-discovery ran by itself**, as on desktop:
+  - local qna failed: it **downloaded `BESAgent-11.0.7.61-ubuntu24.arm64.deb` first**, then "ios does not support processes";
+  - Docker failed;
+  - it then **added the `web-eval-rhel` online-evaluator target**, so client relevance can be evaluated through the online evaluator even on iOS.
+
+  Evaluate was **not** clicked (AGENTS.md: never in a real run).
+
+```bash
+cd spikes/mobile/nicegui
+./prepare.sh                 # Python.xcframework, pydantic-core for iOS (Rust), app_packages/ incl. this repo's wheel
+xcodegen generate
+xcodebuild -scheme BigFixRelevanceNiceGUI -destination 'platform=iOS Simulator,name=iPhone 16 Pro' -derivedDataPath build build
+xcrun simctl install booted build/Build/Products/Debug-iphonesimulator/BigFixRelevanceNiceGUI.app
+SIMCTL_CHILD_BFRD_DEMO_TEXT='name of operating sytem' xcrun simctl launch booted com.github.jgstew.bigfix-relevance-nicegui
+```
+
+### What it took
+
+| Blocker | What happens on iOS | Spike workaround | Real fix (upstream) |
+|---|---|---|---|
+| **`pydantic-core`** (FastAPI → pydantic v2) | No iOS wheel on PyPI or BeeWare's index; FastAPI can't import without it | `build_pydantic_core.sh`: rustup + `aarch64-apple-ios[-sim]` targets; `cargo build` with PyO3 cross env vars (`PYO3_CROSS_LIB_DIR` = the framework's `lib-arm64/python3.15`, `-L` to `libpython3.15.dylib` → `@rpath/Python.framework/Python`). maturin refuses (it doesn't treat macOS → iOS as cross). About 1 min per build. | pydantic publishes iOS wheels (cibuildwheel supports iOS; maturin/PyO3 cross support) |
+| **`_multiprocessing`, `_posixshmem`** | CPython for iOS has no fork or subprocesses, so they're absent. NiceGUI imports `multiprocessing.forkserver` / `.synchronize` at import time (for `run.cpu_bound`'s process pool) | `nicegui_ios_host._stub_multiprocessing()`: stub modules whose semaphore raises `NotImplementedError`, which NiceGUI's `run.setup()` already handles ("Failed to initialize ProcessPoolExecutor") | NiceGUI skips the process pool when `_multiprocessing` is missing (iOS, Android, Pyodide) |
+| `orjson` | no iOS wheel | left out; NiceGUI falls back to `json` | `orjson; sys_platform != "ios" and …` in NiceGUI's deps |
+| `uvicorn[standard]` extras (`uvloop`, `httptools`, `watchfiles`, `pyyaml`) | no iOS wheels | left out; plain uvicorn uses asyncio + h11 | marker on the extra in NiceGUI's deps |
+| NiceGUI's `.nicegui/` storage | written relative to the working directory, which is `/` (read-only) on iOS | `chdir` to Application Support + `NICEGUI_STORAGE_PATH` | none needed |
+| http to 127.0.0.1 | App Transport Security | `NSAllowsLocalNetworking` in Info.plist | none needed |
+| qna download during discovery | a wasted ~MB download per first run on a device that can't run it | none (harmless here) | bigfix-remote-client-relevance: skip the local/downloaded qna probe where `subprocess` isn't supported (`sys.platform in ("ios", "android")`) |
+
+`aiohttp`, `multidict` and `markupsafe` **do** ship iOS-simulator wheels on PyPI, and all the BigFix libraries installed unchanged. The client library was installed `--no-deps`, as in the other spikes, until jgstew/bigfix-remote-client-relevance#83 lands.
+
+### Trade-offs vs. the SwiftUI plan
+
+- **Gain: zero UI rework.** Every feature the desktop app has works on iPad immediately, including CodeMirror completion and hover, Breakdown, Export JSON, and the inventory dialog. On iPad it looks like the desktop app, which is a fair fit.
+- **Lose: native feel.** It's a Material/Quasar web page:
+  - no native `Form`s, swipe actions, Dynamic Type, or `SecureField` with password autofill;
+  - on a phone the desktop layout is cramped (the findings table is clipped);
+  - text editing is WebKit's, which is better than Kivy's but not native.
+- **Lose: a heavier, more fragile stack.**
+  - a Rust extension you build yourself for each pydantic release (pydantic pins `pydantic-core` exactly, so a version bump means a rebuild);
+  - stubs for missing stdlib modules;
+  - a local HTTP server and WebSocket inside the app;
+  - 337 MB debug bundle before pruning.
+- **App lifecycle:** iOS suspends a backgrounded app. The NiceGUI page reconnects when the app comes back, but long evaluations stop while it's in the background, as they would in any app. Untested beyond launch.
+- **App Store:** an app whose UI is a local web page is allowed, but review guideline 4.2 (minimum functionality, "just a website") is a risk to plan for. The Xcode 26 / signing constraints below apply equally.
+
+**Where it fits:** a fast way to put the *full* debugger on an iPad, for internal use, TestFlight, or a stopgap while the SwiftUI app (#41) is built. Keep it as an option rather than the main path. It also costs little to keep working once the upstream fixes above land, because it runs the same code as `uvx bigfix-relevance-debugger`.
 
 ## Library findings (candidates for upstream issues)
 

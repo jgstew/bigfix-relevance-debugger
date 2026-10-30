@@ -13,3 +13,10 @@ kivy/.kivy-ios/
 __pycache__/
 *.pyc
 .DS_Store
+nicegui/build/
+nicegui/.cache/
+nicegui/Python.xcframework/
+nicegui/app_packages/
+nicegui/BigFixRelevanceNiceGUI.xcodeproj/
+nicegui/Sources/Info.plist
+nicegui/*.log
