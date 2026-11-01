@@ -172,13 +172,10 @@ class Connection:
 
     @property
     def account(self) -> str:
-        """Its key in the ``SecretStore``: ``secret_account``, plus the scheme
-        when it isn't https, so a password saved for https is never sent over
-        plain http (``secret_account`` keys on host and port, not the scheme)."""
-        config = self.connection_config(None)
-        scheme = config.address.scheme
-        account = secret_account(config)
-        return account if scheme == "https" else f"{scheme}+{account}"
+        """Its key in the ``SecretStore``: ``secret_account``, which prefixes a
+        non-https scheme, so a password saved for https is never sent over
+        plain http."""
+        return secret_account(self.connection_config(None))
 
     @property
     def can_fastquery(self) -> bool:

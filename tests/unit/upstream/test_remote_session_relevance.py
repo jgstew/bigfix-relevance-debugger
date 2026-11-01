@@ -69,3 +69,25 @@ def test_secret_account_tells_servers_and_users_apart():
     }
 
     assert len(accounts) == 4
+
+
+def test_secret_account_prefixes_a_scheme_that_is_not_https():
+    """As in the library's 1.7.0 (commit b35f716): an https password is never
+    found, and sent as cleartext Basic auth, for the same server over http."""
+    https = ConnectionConfig(name="a", backend="rest", server="https://bf:52311", username="u")
+    http = ConnectionConfig(name="a", backend="rest", server="http://bf:52311", username="u")
+
+    assert secret_account(https) == "rest:bf:52311:u"
+    assert secret_account(http) == "http+rest:bf:52311:u"
+
+
+def test_secret_account_uses_the_normalized_server():
+    """Host lowercased, the default port filled in and a trailing /api dropped."""
+    servers = ["bf.example.com", "https://BF.Example.com", "https://bf.example.com:52311/api"]
+
+    accounts = {
+        secret_account(ConnectionConfig(name="a", backend="rest", server=s, username="u"))
+        for s in servers
+    }
+
+    assert accounts == {"rest:bf.example.com:52311:u"}

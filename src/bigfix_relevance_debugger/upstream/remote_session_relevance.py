@@ -51,6 +51,10 @@ def secret_account(conn: ConnectionConfig) -> str:
     """Stable per-connection key: backend, server and username.
 
     Not the name, so renaming a connection keeps its secret, and the same
-    file lines up with each machine's own store entry.
+    file lines up with each machine's own store entry. A non-https scheme is
+    prefixed (``http+rest:...``) so a password saved for https is never found,
+    and sent as cleartext Basic auth, for the same server over http.
     """
-    return f"{conn.backend}:{conn.address.host_port}:{(conn.username or '').lower()}"
+    address = conn.address
+    prefix = "" if address.scheme == "https" else f"{address.scheme}+"
+    return f"{prefix}{conn.backend}:{address.host_port}:{(conn.username or '').lower()}"
