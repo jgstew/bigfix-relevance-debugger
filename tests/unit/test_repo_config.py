@@ -7,6 +7,9 @@ import re
 import tomllib
 from pathlib import Path
 
+import pytest
+from packaging.requirements import Requirement
+
 ROOT = Path(__file__).parents[2]
 
 
@@ -88,3 +91,37 @@ def test_jgstew_dependencies_allow_minor_updates_but_not_the_next_major():
         assert re.search(rf",\s*<\s*{int(floor.group(1)) + 1}(\.0)*\s*$", dep), (
             f"{dep}: needs an upper bound of <{int(floor.group(1)) + 1}"
         )
+
+
+# --- mobile: the headless modules ship to iOS and Android without NiceGUI ----
+
+MOBILE_PLATFORMS = ("arm64-apple-ios", "arm64-apple-ios-simulator", "aarch64-linux-android")
+
+
+def dependencies() -> list[Requirement]:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    return [Requirement(d) for d in project["dependencies"]]
+
+
+@pytest.mark.parametrize(
+    ("sys_platform", "wanted"),
+    [("ios", False), ("android", False), ("darwin", True), ("linux", True), ("win32", True)],
+)
+def test_nicegui_is_desktop_only(sys_platform, wanted):
+    [nicegui] = [r for r in dependencies() if r.name == "nicegui"]
+    assert nicegui.marker is not None
+    assert nicegui.marker.evaluate({"sys_platform": sys_platform}) is wanted
+
+
+def test_only_nicegui_is_left_off_mobile():
+    """The headless modules need every other dependency on iOS and Android too."""
+    assert [r.name for r in dependencies() if r.marker is not None] == ["nicegui"]
+
+
+@pytest.mark.parametrize("path", [".github/workflows/test.yaml", "scripts/ci_local.sh"])
+def test_ci_and_ci_local_resolve_for_every_mobile_platform(path):
+    """AGENTS.md: change test.yaml and ci_local.sh together."""
+    text = (ROOT / path).read_text(encoding="utf-8")
+    assert "--only-binary :all:" in text
+    for platform in MOBILE_PLATFORMS:
+        assert platform in text, f"{path} doesn't resolve for {platform}"
