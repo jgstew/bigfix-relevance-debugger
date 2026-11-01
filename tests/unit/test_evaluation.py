@@ -1383,10 +1383,30 @@ class Router:
         return httpx.MockTransport(handle)
 
 
+class Fixed:
+    """A ``ConnectionSource`` that always hands out ``config``."""
+
+    def __init__(self, config: Config) -> None:
+        self._config = config
+
+    def config(self) -> Config:
+        return self._config
+
+
+class Loads:
+    """A ``ConnectionSource`` over a function, e.g. one handing out configs in turn."""
+
+    def __init__(self, load) -> None:
+        self._load = load
+
+    def config(self) -> Config:
+        return self._load()
+
+
 def session_clients(*conns, router=None, loads=None):
     """``SessionClients`` over the real default factory, with a fake config and server.
 
-    ``loads`` replaces ``load_config``: configs (or exceptions to raise) to
+    ``loads`` replaces the connection source: configs (or exceptions to raise) to
     hand out in turn, the last one repeating. By default it returns ``conns``.
     """
     router = router or Router()
@@ -1401,7 +1421,7 @@ def session_clients(*conns, router=None, loads=None):
 
     def factory(opts):
         client = default_session_client(
-            opts, load=load, transport_factory=router.transport, trust=None
+            opts, source=Loads(load), transport_factory=router.transport, trust=None
         )
         built.append(client)
         return client
@@ -1630,7 +1650,7 @@ async def test_session_client_is_rebuilt_after_nothing_was_configured():
 def test_session_timeouts_reach_every_connection():
     config = Config(connections=(rest_conn("a"), rest_conn("b", connect_timeout=60)))
 
-    client = default_session_client(EvalOptions(timeout_s=12), load=lambda: config, trust=None)
+    client = default_session_client(EvalOptions(timeout_s=12), source=Fixed(config), trust=None)
 
     assert [(c.connect_timeout, c.read_timeout) for c in client.connections] == [
         (SESSION_CONNECT_TIMEOUT_S, 12.0),
@@ -1641,7 +1661,7 @@ def test_session_timeouts_reach_every_connection():
 def test_default_session_client_never_prompts_and_trusts_on_first_use():
     config = Config(connections=(rest_conn("a"),))
 
-    client = default_session_client(EvalOptions(), load=lambda: config)
+    client = default_session_client(EvalOptions(), source=Fixed(config))
 
     assert client._prompt is None
     assert isinstance(client._trust, TrustStore)
@@ -1828,7 +1848,7 @@ def test_the_default_session_clients_use_default_session_client(monkeypatch):
     def fake(opts):
         built.append(opts)
         return default_session_client(
-            opts, load=lambda: Config(connections=(rest_conn("prod"),)), trust=None
+            opts, source=Fixed(Config(connections=(rest_conn("prod"),))), trust=None
         )
 
     monkeypatch.setattr(evaluation, "default_session_client", fake)
@@ -1910,6 +1930,106 @@ def test_session_evaluation_of_an_error():
     assert ev.answers == ()
     assert ev.answer_types == ()
     assert ev.evaluation_time is None
+
+
+def test_session_evaluation_keeps_the_error_code():
+    """``totp_required`` is how a front end knows to ask for a TOTP code."""
+    error = ResultError(
+        kind="authentication", code="totp_required", message="needs a TOTP code", backend="saas"
+    )
+
+    ev = session_evaluation(session_result(error=error))
+
+    assert ev.error_code == "totp_required"
+    assert session_evaluation(session_result()).error_code is None
+
+
+def test_default_session_client_reads_its_connection_source():
+    config = Config(connections=(rest_conn("from-source"),))
+
+    client = default_session_client(EvalOptions(), source=Fixed(config), trust=None)
+
+    assert [c.name for c in client.connections] == ["from-source"]
+
+
+def test_default_session_client_defaults_to_the_library_lookup(monkeypatch):
+    from bigfix_relevance_debugger import connections
+
+    config = Config(connections=(rest_conn("from-library"),))
+    monkeypatch.setattr(connections, "load_config", lambda: config)
+
+    client = default_session_client(EvalOptions(), trust=None)
+
+    assert [c.name for c in client.connections] == ["from-library"]
+
+
+async def test_fast_query_targets_from_app_connections_run_through_a_session_context(
+    tmp_path, monkeypatch
+):
+    """The app's own connections and password reach Fast Query, never the library's file."""
+    import bigfix_remote_session_relevance
+    from bigfix_remote_client_relevance import SessionContext
+    from bigfix_remote_client_relevance.transports import fastquery
+
+    from bigfix_relevance_debugger.connections import AppConnections, Connection
+    from bigfix_relevance_debugger.upstream.remote_session_relevance import MemorySecretStore
+
+    monkeypatch.setattr(fastquery, "POLL_FIRST_S", 0.0)
+
+    def refuse():
+        raise AssertionError("Fast Query read the library's config file")
+
+    monkeypatch.setattr(bigfix_remote_session_relevance, "load_config", refuse)
+    app = AppConnections(tmp_path / "connections.json", MemorySecretStore())
+    app.upsert(
+        Connection(
+            name="lab", backend="rest", server="bf.example", username="op", computer_ids=(11,)
+        ),
+        password="app-pw",
+    )
+    seen: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.method == "POST" and request.url.path == "/api/clientquery":
+            return httpx.Response(
+                200,
+                text='<?xml version="1.0" encoding="UTF-8"?><BESAPI><ClientQuery '
+                'Resource="https://x/api/clientquery/7"><ID>7</ID></ClientQuery></BESAPI>',
+            )
+        if request.url.path == "/api/clientqueryresults/7":
+            return httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "computerID": 11,
+                            "computerName": "web",
+                            "isFailure": False,
+                            "result": "Linux",
+                        }
+                    ]
+                },
+            )
+        return httpx.Response(404)
+
+    session = SessionContext(
+        config=app.config(),
+        trust=TrustStore(trust_on_first_use=False),
+        http_transport=lambda conn: httpx.MockTransport(handle),
+    )
+
+    results = [
+        r
+        async for r in stream_results(
+            "name of operating system", app.fastquery_targets(), EvalOptions(), session=session
+        )
+    ]
+
+    assert [(r.host, r.answers) for r in results] == [("web", ["Linux"])]
+    assert all(
+        r.headers["authorization"] == httpx.BasicAuth("op", "app-pw")._auth_header for r in seen
+    )
 
 
 def session_row(**fields):

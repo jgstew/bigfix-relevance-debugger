@@ -44,10 +44,10 @@ from bigfix_remote_session_relevance import (
     ConfigError,
     SessionRelevanceResult,
     TrustStore,
-    load_config,
 )
 
 from bigfix_relevance_debugger.analysis import AnalysisView, LevelView
+from bigfix_relevance_debugger.connections import ConnectionSource, LibraryConfig
 
 logger = logging.getLogger(__name__)
 
@@ -591,6 +591,9 @@ class SessionEvaluation:
     """The library's ``ResultError.kind`` (``"session_relevance"``,
     ``"authentication"``, ``"connection"``, ``"tls"``, ...), or this app's
     ``"config"``: nothing configured, or the config file is broken."""
+    error_code: str | None = None
+    """The library's ``ResultError.code``, e.g. ``"totp_required"`` (a SaaS
+    account wants a TOTP code) or ``"pin_mismatch"``."""
     elapsed_ms: int | None = None
     """Wall time of the query, including connecting when it had to."""
     connection: str | None = None
@@ -636,6 +639,7 @@ def session_evaluation(result: SessionRelevanceResult) -> SessionEvaluation:
         ),
         error=None if error is None else error.message,
         error_kind=None if error is None else error.kind,
+        error_code=None if error is None else error.code,
         elapsed_ms=None if result.elapsed_ms is None else round(result.elapsed_ms),
         connection=result.connection,
         backend=result.backend,
@@ -662,9 +666,13 @@ def session_config(config: Config, opts: EvalOptions) -> Config:
 
 
 def default_session_client(
-    opts: EvalOptions, *, load: Callable[[], Config] = load_config, **client_kwargs: Any
+    opts: EvalOptions, *, source: ConnectionSource | None = None, **client_kwargs: Any
 ) -> AsyncSessionRelevanceClient:
-    """A client over the library's own config lookup. Raises ``ConfigError``.
+    """A client over ``source``'s connections. Raises ``ConfigError``.
+
+    ``source`` defaults to the library's own config lookup
+    (:class:`~bigfix_relevance_debugger.connections.LibraryConfig`); the
+    mobile app passes its ``AppConnections``.
 
     Never prompts (a missing password is an ``authentication`` result) and
     trusts a self-signed certificate on first use, pinning it and logging a
@@ -675,7 +683,8 @@ def default_session_client(
     client_kwargs.setdefault("prompt", None)
     if "trust" not in client_kwargs:
         client_kwargs["trust"] = TrustStore(trust_on_first_use="auto")
-    return AsyncSessionRelevanceClient(session_config(load(), opts), **client_kwargs)
+    config = (source or LibraryConfig()).config()
+    return AsyncSessionRelevanceClient(session_config(config, opts), **client_kwargs)
 
 
 SessionClientFactory = Callable[[EvalOptions], AsyncSessionRelevanceClient]
