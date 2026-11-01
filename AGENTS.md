@@ -20,17 +20,31 @@ Entry point: `bigfix_relevance_debugger.app:main`, run via
   - `evaluation.py`: target form -> `Target`s, inventory loading, streaming,
     session relevance (`stream_session`) and `run_breakdown`. Async.
   - `log_bridge.py`: library loggers -> UI callback, thread-safe.
+  - `connections.py`: where BigFix connections come from, a
+    `ConnectionSource`: `LibraryConfig` (the session library's own lookup,
+    the desktop default) or `AppConnections` (a JSON file in the app's data
+    dir, never secrets; passwords from a `SecretStore`).
+  - `bridge.py`: the versioned JSON API the iOS app calls,
+    `call(method, args_json) -> str`. See below.
+  - `selfcheck.py`: a credential-free self-check, run by the bridge.
   - `editor.py` + `relevance_codemirror.js`: the relevance editor, NiceGUI's
     CodeMirror wired to the analyzer's language server. See below.
   - `app.py`: the page and `main()`. UI wiring only.
   - `upstream/`: code meant to be donated to the libraries, one module per
-    library (`remote_client_relevance.py`, `relevance_analyzer.py`), each
-    only while it holds something the library hasn't shipped. Empty today:
-    both libraries ship everything donated so far. See below.
+    library (`remote_client_relevance.py`, `relevance_analyzer.py`,
+    `remote_session_relevance.py`), each only while it holds something the
+    library hasn't shipped. Today only `remote_session_relevance.py`: the
+    `SecretStore` of bigfix-remote-session-relevance#32. See below.
 - `tests/unit/`: offline. No Docker, qna, SSH or network.
 
-**Keep NiceGUI out of `analysis.py`, `evaluation.py` and `log_bridge.py`** so
-they can be tested without a browser. Put logic there, not in `app.py`.
+**Keep NiceGUI out of the headless modules** (`analysis.py`, `evaluation.py`,
+`log_bridge.py`, `connections.py`, `bridge.py`, `selfcheck.py`) so they can be
+tested without a browser and ship to iOS, where NiceGUI can't install
+(`pyproject.toml` marks it desktop-only). `tests/unit/test_headless_imports.py`
+enforces it, with asyncssh, cryptography, docker and zstandard blocked too.
+Only `app.py` and `editor.py` import NiceGUI; importing `app` without it
+raises an `ImportError` that points at the bridge. Put logic in the headless
+modules, not in `app.py`.
 
 ## Commands
 
@@ -139,8 +153,11 @@ Windows; Linux containers use the host's architecture). Its smoke steps copy
   event loop: no threads. `stream_session` yields one `SessionEvaluation`
   per deployment, or one `config` result when nothing is configured
   (`"config"` is this app's kind; the rest are the library's
-  `ResultError.kind`). Tests build `SessionClients` over
-  `default_session_client(opts, load=..., transport_factory=..., trust=None)`
+  `ResultError.kind`). `default_session_client(opts, source=...)` reads its
+  connections from a `connections.ConnectionSource`, `LibraryConfig` by
+  default; the bridge passes its `AppConnections`. Tests build
+  `SessionClients` over
+  `default_session_client(opts, source=..., transport_factory=..., trust=None)`
   with fake servers (`httpx.MockTransport`), or monkeypatch
   `app.stream_session` and `app.expected_session_results`.
 - **The session row count is `expected_session_results`**: the library's
@@ -175,6 +192,23 @@ Windows; Linux containers use the host's architecture). Its smoke steps copy
   the page's client), never a bare `asyncio.create_task`. The simulated
   user's `ui.notify` doesn't look the slot up, so `test_app.py`'s autouse
   `app_started` fixture makes it, as a served page does.
+- **The bridge is a contract with the iOS app** (`BRIDGE_VERSION`; a
+  breaking change bumps it). Every call takes and returns one JSON string,
+  `{"version", "ok", "result"}` or `{"version", "ok": false, "error":
+  {"type", "message"}}`, and never raises. It has no BigFix logic of its
+  own: only `analysis`, `evaluation` and `connections`. It owns one asyncio
+  loop on a background thread; `start_run` schedules the run there and
+  `poll_run` long-polls its rows. Its trust is deferred
+  (`TrustStore(trust_on_first_use=False)`): a first-use certificate is
+  refused and listed in `pending_certs` until `trust_cert`. Tests build a
+  `Bridge(data_dir=tmp_path, secrets=MemorySecretStore(),
+  transport_factory=..., selfcheck_network=False)` over `httpx.MockTransport`
+  fakes and `close()` it; its connections are only ever its own
+  `AppConnections`, never the library's file.
+- **Mobile resolution is checked in CI** (`test.yaml`'s `mobile-resolve`, and
+  `scripts/ci_local.sh mobile-resolve`): wheels-only for iOS and Android
+  without NiceGUI, and desktop with it. Every dependency but NiceGUI must
+  install on mobile.
 - **Logging, never print** (ruff `T20`). Library INFO goes to the activity
   log by default and DEBUG with `-v`, matching the library CLI's policy.
 - **Check UI changes in a real run** when Docker is available, e.g. evaluate
