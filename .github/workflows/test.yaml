@@ -61,6 +61,53 @@ jobs:
       - name: pyright
         run: uv run --frozen pyright src tests
 
+  # The iOS app (#41) installs this package's own wheel and imports the
+  # headless modules, so this package must resolve wheels-only for iOS and
+  # Android without NiceGUI (orjson has no mobile wheels; pyproject.toml marks
+  # NiceGUI desktop-only), while desktop still gets it. Resolution only:
+  # nothing is installed and no simulator runs. `uv pip compile` reads
+  # [tool.uv] from pyproject.toml, so exclude-newer applies as for uv.lock.
+  # scripts/ci_local.sh runs the same loops; change both together.
+  mobile-resolve:
+    name: resolves for iOS and Android
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # same install-uv action as above
+      - uses: ./.github/actions/install-uv # zizmor: ignore[self-repository]
+        with:
+          python-version: "3.13"
+
+      # `if grep` rather than `! grep`: bash's errexit ignores a negated
+      # command, so `! grep` could never fail the step.
+      - name: iOS and Android resolve, without NiceGUI or orjson
+        run: |
+          set -euo pipefail
+          for plat in arm64-apple-ios arm64-apple-ios-simulator aarch64-linux-android; do
+            for py in 3.13 3.15; do
+              echo "== $plat / $py"
+              uv pip compile pyproject.toml --quiet --no-header \
+                --python-version "$py" --python-platform "$plat" --only-binary :all: \
+                > "$RUNNER_TEMP/req-$plat-$py.txt"
+              if grep -E '^(nicegui|orjson)==' "$RUNNER_TEMP/req-$plat-$py.txt"; then
+                echo "::error::$plat / $py resolved the desktop UI"
+                exit 1
+              fi
+            done
+          done
+
+      - name: Desktop still gets NiceGUI
+        run: |
+          set -euo pipefail
+          for plat in aarch64-apple-darwin x86_64-unknown-linux-gnu x86_64-pc-windows-msvc; do
+            echo "== $plat"
+            uv pip compile pyproject.toml --quiet --no-header --python-version 3.13 \
+              --python-platform "$plat" | grep '^nicegui=='
+          done
+
   build:
     name: build
     runs-on: ubuntu-latest

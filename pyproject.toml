@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bigfix-relevance-debugger"
-version = "0.6.1"
+version = "0.7.0"
 description = "A browser GUI for BigFix client and session relevance: live static analysis, evaluation with qna and the REST API / BigFix Explorer / Web Reports, and a per-level breakdown."
 readme = "README.md"
 license = "MIT"
@@ -28,10 +28,13 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-    "bigfix-relevance-analyzer>=1.41.0,<2",
-    "bigfix-remote-client-relevance>=1.11.1,<2",
-    "bigfix-remote-session-relevance>=1.4.0,<2",
-    "nicegui[native]>=3.18.0",
+    "bigfix-relevance-analyzer>=1.43.0,<2",
+    "bigfix-remote-client-relevance>=1.12.0,<2",
+    "bigfix-remote-session-relevance>=1.6.0,<2",
+    # The desktop UI (app.py, editor.py). iOS and Android ship the headless
+    # modules with their own UI over bridge.py; NiceGUI can't install there
+    # anyway (orjson has no mobile wheels).
+    'nicegui[native]>=3.18.0; sys_platform != "ios" and sys_platform != "android"',
 ]
 
 [dependency-groups]

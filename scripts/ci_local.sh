@@ -8,6 +8,8 @@
 # Jobs:
 #   test-3.11, test-3.13  test.yaml's `test` matrix, through act
 #   pre-commit            pre-commit.yaml through act, on all files
+#   mobile-resolve        test.yaml's `mobile-resolve` job: resolves for iOS
+#                         and Android without NiceGUI, desktop with it
 #   build                 `uv build` of the wheel the smoke jobs test
 #   smoke-ubuntu          the wheel smoke test in a python:3.13-slim container
 #   smoke-macos           the wheel smoke test natively (macOS hosts only)
@@ -22,8 +24,9 @@
 #     build -> smoke hand-off fails there.
 #   - containers use the host's architecture (arm64 on Apple silicon); CI's
 #     ubuntu-latest is x86_64.
-#   - the smoke steps are copied from test.yaml's `smoke` job; keep them in
-#     step with it.
+#   - the smoke steps are copied from test.yaml's `smoke` job, and
+#     mobile-resolve's from its `mobile-resolve` job; keep them in step.
+#   - mobile-resolve runs outside act with the host's uv: it only resolves.
 #
 # Needs: act, docker (running), uv. Logs go to a temp directory, printed at
 # the end.
@@ -36,7 +39,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 1
 
-ALL_JOBS=(test-3.11 test-3.13 pre-commit build smoke-ubuntu smoke-macos)
+ALL_JOBS=(test-3.11 test-3.13 pre-commit mobile-resolve build smoke-ubuntu smoke-macos)
 ACT_IMAGE="ubuntu-latest=catthehacker/ubuntu:act-latest"
 SMOKE_IMAGE="python:3.13-slim"
 
@@ -182,6 +185,30 @@ smoke_macos() {
     UV_PYTHON=3.13 bash -c "$SMOKE_SCRIPT" smoke "$DIST"
 }
 
+# test.yaml's mobile-resolve job: wheels-only resolution for iOS and Android
+# must leave out NiceGUI (and its orjson); desktop must still get it.
+mobile_resolve() {
+    local plat py req
+    req="$LOGS/mobile-req.txt"
+    for plat in arm64-apple-ios arm64-apple-ios-simulator aarch64-linux-android; do
+        for py in 3.13 3.15; do
+            echo "== $plat / $py"
+            uv pip compile pyproject.toml --quiet --no-header \
+                --python-version "$py" --python-platform "$plat" --only-binary :all: \
+                >"$req" || return 1
+            if grep -E '^(nicegui|orjson)==' "$req"; then
+                echo "$plat / $py resolved the desktop UI" >&2
+                return 1
+            fi
+        done
+    done
+    for plat in aarch64-apple-darwin x86_64-unknown-linux-gnu x86_64-pc-windows-msvc; do
+        echo "== $plat"
+        uv pip compile pyproject.toml --quiet --no-header --python-version 3.13 \
+            --python-platform "$plat" | grep '^nicegui==' || return 1
+    done
+}
+
 echo "uv $UV_VERSION (from .pre-commit-config.yaml), logs in $LOGS"
 
 for python in 3.11 3.13; do
@@ -192,6 +219,10 @@ done
 
 if wants pre-commit; then
     run pre-commit act_job -W .github/workflows/pre-commit.yaml
+fi
+
+if wants mobile-resolve; then
+    run mobile-resolve mobile_resolve
 fi
 
 # The smoke jobs need the wheel, so asking for one builds it.
