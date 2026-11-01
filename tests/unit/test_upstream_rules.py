@@ -14,6 +14,7 @@ UPSTREAM = Path(__file__).parents[2] / "src" / "bigfix_relevance_debugger" / "up
 ALLOWED = {
     "remote_client_relevance.py": "bigfix_remote_client_relevance",
     "relevance_analyzer.py": "bigfix_relevance_analyzer",
+    "remote_session_relevance.py": "bigfix_remote_session_relevance",
 }
 """The library each module may donate to. A module exists only while it has
 something not yet shipped, so a rule can outlive its module."""
