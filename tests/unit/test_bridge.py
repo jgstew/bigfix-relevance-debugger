@@ -22,10 +22,10 @@ from typing import Any
 
 import httpx
 import pytest
+from bigfix_remote_session_relevance import MemorySecretStore
 
 from bigfix_relevance_debugger import bridge
 from bigfix_relevance_debugger.bridge import BRIDGE_VERSION, METHODS, Bridge
-from bigfix_relevance_debugger.upstream.remote_session_relevance import MemorySecretStore
 
 SESSION_FIXTURES = Path(__file__).parent / "fixtures" / "session_rest"
 DEPLOYMENT_QUERY = "sha256 of gather url of bes license"
@@ -253,6 +253,33 @@ def test_module_call_uses_one_shared_bridge(monkeypatch, make_bridge):
     monkeypatch.setattr(bridge, "_default", shared)
 
     assert json.loads(bridge.call("info", "{}"))["result"]["data_dir"] == str(shared.data_dir)
+
+
+@pytest.fixture
+def default_bridge(tmp_path, monkeypatch):
+    """Build the process's bridge for real, in ``tmp_path``; the test fakes its secret store."""
+    monkeypatch.setattr(bridge, "_default", None)
+    monkeypatch.setattr(bridge, "app_data_dir", lambda: tmp_path / "app")
+    yield
+    if bridge._default is not None:
+        bridge._default.close()
+
+
+def test_the_process_bridge_keeps_secrets_in_the_os_store(monkeypatch, default_bridge):
+    """The library's ``default_secret_store()``: the Keychain on iOS and macOS."""
+    os_store = MemorySecretStore()
+    monkeypatch.setattr(bridge, "default_secret_store", lambda: os_store)
+
+    assert bridge._bridge().secrets is os_store
+
+
+def test_the_process_bridge_keeps_secrets_in_memory_without_an_os_store(
+    monkeypatch, default_bridge
+):
+    """Android, or a desktop with no usable keyring: the library finds no store."""
+    monkeypatch.setattr(bridge, "default_secret_store", lambda: None)
+
+    assert isinstance(bridge._bridge().secrets, MemorySecretStore)
 
 
 # --- info, analyze --------------------------------------------------------------------

@@ -24,10 +24,12 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from bigfix_remote_client_relevance import Target
-from bigfix_remote_session_relevance import Config, ConfigError, ConnectionConfig, load_config
-
-from bigfix_relevance_debugger.upstream.remote_session_relevance import (
+from bigfix_remote_session_relevance import (
+    Config,
+    ConfigError,
+    ConnectionConfig,
     SecretStore,
+    load_config,
     secret_account,
 )
 

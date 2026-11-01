@@ -55,8 +55,11 @@ from bigfix_remote_session_relevance import (
     ConfigError,
     ConnectionConfig,
     KnownCerts,
+    MemorySecretStore,
     SaasSessionPool,
+    SecretStore,
     TrustStore,
+    default_secret_store,
     saas_sign_in,
 )
 
@@ -80,10 +83,6 @@ from bigfix_relevance_debugger.evaluation import (
     session_row_wanted,
     stream_results,
     stream_session,
-)
-from bigfix_relevance_debugger.upstream.remote_session_relevance import (
-    MemorySecretStore,
-    SecretStore,
 )
 
 logger = logging.getLogger(__name__)
@@ -697,8 +696,10 @@ def _bridge() -> Bridge:
     """The process's bridge, built at the first call that needs it.
 
     On iOS and Android the session library's own files go in the app's data
-    dir too (``BFRSR_HOME``), unless the host already chose. Secrets are kept
-    in memory until bigfix-remote-session-relevance#32 ships the Keychain store.
+    dir too (``BFRSR_HOME``), unless the host already chose. Secrets go to the
+    session library's ``default_secret_store()`` (the Keychain on iOS and
+    macOS, keyring elsewhere), or stay in memory where it finds none (Android,
+    or a desktop with no usable keyring), so they don't survive a restart.
     """
     global _default
     with _default_lock:
@@ -706,7 +707,8 @@ def _bridge() -> Bridge:
             data_dir = app_data_dir()
             if sys.platform in ("ios", "android"):
                 os.environ.setdefault("BFRSR_HOME", str(data_dir / "session-relevance"))
-            _default = Bridge(data_dir=data_dir, secrets=MemorySecretStore())
+            secrets = default_secret_store() or MemorySecretStore()
+            _default = Bridge(data_dir=data_dir, secrets=secrets)
         return _default
 
 

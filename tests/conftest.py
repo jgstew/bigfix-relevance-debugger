@@ -107,3 +107,18 @@ def _no_real_session_relevance_client(tmp_path, monkeypatch):
 
     monkeypatch.setattr(evaluation, "default_session_client", refuse)
     monkeypatch.setattr(evaluation, "_session_clients", None)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_secret_store(monkeypatch):
+    """Fail loudly instead of reaching the OS password store (Keychain, keyring).
+
+    The bridge's process-wide default asks bigfix-remote-session-relevance's
+    ``default_secret_store()``; a test that builds it must fake that lookup.
+    """
+    from bigfix_relevance_debugger import bridge
+
+    def refuse():
+        raise AssertionError("a test reached the real OS password store")
+
+    monkeypatch.setattr(bridge, "default_secret_store", refuse)

@@ -33,8 +33,8 @@ Entry point: `bigfix_relevance_debugger.app:main`, run via
   - `upstream/`: code meant to be donated to the libraries, one module per
     library (`remote_client_relevance.py`, `relevance_analyzer.py`,
     `remote_session_relevance.py`), each only while it holds something the
-    library hasn't shipped. Today only `remote_session_relevance.py`: the
-    `SecretStore` of bigfix-remote-session-relevance#32. See below.
+    library hasn't shipped. Today there is none (the `SecretStore` shipped
+    in bigfix-remote-session-relevance 1.7.0). See below.
 - `tests/unit/`: offline. No Docker, qna, SSH or network.
 
 **Keep NiceGUI out of the headless modules** (`analysis.py`, `evaluation.py`,
@@ -204,7 +204,10 @@ Windows; Linux containers use the host's architecture). Its smoke steps copy
   `Bridge(data_dir=tmp_path, secrets=MemorySecretStore(),
   transport_factory=..., selfcheck_network=False)` over `httpx.MockTransport`
   fakes and `close()` it; its connections are only ever its own
-  `AppConnections`, never the library's file.
+  `AppConnections`, never the library's file. The process's own bridge keeps
+  passwords in the session library's `default_secret_store()` (Keychain on
+  iOS and macOS), else in memory; `tests/conftest.py` makes that lookup fail
+  loudly, so a test that builds it fakes `bridge.default_secret_store`.
 - **Mobile resolution is checked in CI** (`test.yaml`'s `mobile-resolve`, and
   `scripts/ci_local.sh mobile-resolve`): wheels-only for iOS and Android
   without NiceGUI, and desktop with it. Every dependency but NiceGUI must

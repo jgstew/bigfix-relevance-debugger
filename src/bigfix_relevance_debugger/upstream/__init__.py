@@ -3,9 +3,9 @@
 One module per library, only while there is something to donate to it:
 ``remote_client_relevance`` for bigfix-remote-client-relevance,
 ``relevance_analyzer`` for bigfix-relevance-analyzer and
-``remote_session_relevance`` for bigfix-remote-session-relevance. Today only
-``remote_session_relevance`` (the ``SecretStore`` of its #32). Rules that keep
-a move a copy-paste:
+``remote_session_relevance`` for bigfix-remote-session-relevance. Today there
+is none: the last, ``remote_session_relevance``'s ``SecretStore``, shipped in
+bigfix-remote-session-relevance 1.7.0. Rules that keep a move a copy-paste:
 
 * Import only the stdlib and *that* library's public API (its package
   ``__init__`` or a submodule's ``__all__``) -- never this app's modules,
