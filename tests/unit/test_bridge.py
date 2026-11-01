@@ -211,7 +211,11 @@ def test_an_unknown_method_is_an_error(b):
         ("save_connection", {"connection": {"name": "x"}}),
         ("save_connection", {"connection": rest("x"), "password": 7}),
         ("delete_connection", {"name": "missing"}),
+        ("trust_cert", {"host_port": "nobody.example:443", "sha256": "0" * 64}),
         ("trust_cert", {"host_port": "nobody.example:443"}),
+        ("poll_run", {"run_id": "x", "wait_ms": float("nan")}),
+        ("start_run", {"text": "now", "timeout_s": float("inf")}),
+        ("save_connection", {"connection": rest("x", "ftp://x")}),
         ("saas_sign_in", {"host": "login.bigfix.com"}),
     ],
 )
@@ -615,7 +619,9 @@ def test_a_first_use_certificate_is_pending_until_trusted(make_bridge, tls_root_
     assert pending["host_port"] == tls_root_server
     assert len(pending["sha256"]) == 64 and ":" in pending["fingerprint"]
 
-    ok(b, "trust_cert", host_port=tls_root_server)
+    error = failed(b, "trust_cert", host_port=tls_root_server, sha256="0" * 64)
+    assert error["type"] == "changed"  # not the certificate the user was shown
+    ok(b, "trust_cert", host_port=tls_root_server, sha256=pending["sha256"])
     run_id = ok(b, "start_run", text="now", dialects=["session"])["run_id"]
     polls = drain(b, run_id)
 
@@ -660,3 +666,108 @@ def test_close_stops_the_loop_thread(make_bridge):
     b.close()
 
     assert not thread.is_alive()
+
+
+# --- review fixes -------------------------------------------------------------------------
+
+
+def test_a_broken_connections_file_ends_the_run_with_an_error(b):
+    b.data_dir.mkdir(parents=True, exist_ok=True)
+    (b.data_dir / "connections.json").write_text("{not json", encoding="utf-8")
+
+    run_id = ok(b, "start_run", text="name of operating system", dialects=["client"])["run_id"]
+    last = drain(b, run_id, limit_s=5)[-1]
+
+    assert last["done"] and "connections.json" in last["error"]
+
+
+def test_one_failing_half_does_not_stop_the_other(b, monkeypatch):
+    async def broken(*args, **kwargs):
+        raise RuntimeError("fast query exploded")
+        yield  # an async generator
+
+    monkeypatch.setattr(bridge, "stream_results", broken)
+    save(b, rest("root", computer_ids=[11]))
+
+    run_id = ok(b, "start_run", text="now", dialects=["session", "client"])["run_id"]
+    polls = drain(b, run_id)
+
+    assert [r["dialect"] for r in rows(polls)] == ["session"]
+    assert "fast query exploded" in polls[-1]["error"]
+
+
+def test_a_fast_query_totp_challenge_says_totp_needed(b, monkeypatch):
+    from bigfix_remote_client_relevance import ClientRelevanceResult
+
+    async def challenged(text, targets, opts, **kwargs):
+        yield ClientRelevanceResult(
+            host="web",
+            transport="fastquery",
+            client_relevance=text,
+            error="authentication: this account requires a TOTP code (MFA)",
+            error_kind="transport",
+        )
+
+    monkeypatch.setattr(bridge, "stream_results", challenged)
+    save(b, {**SAAS, "computer_ids": [11]})
+
+    run_id = ok(b, "start_run", text="name of operating system", dialects=["client"])["run_id"]
+
+    assert drain(b, run_id)[-1]["totp_needed"] is True
+
+
+def test_a_run_with_a_code_gives_fast_query_a_fresh_saas_pool(b, monkeypatch):
+    """A remembered totp_required in the old pool would refuse the code unsent."""
+    pools = []
+
+    async def record(text, targets, opts, *, session, **kwargs):
+        pools.append(session.saas_sessions)
+        return
+        yield
+
+    monkeypatch.setattr(bridge, "stream_results", record)
+    save(b, {**SAAS, "computer_ids": [11]})
+
+    for totp in (None, None, "123456"):
+        args = {"text": "x", "dialects": ["client"]} | ({"totp": totp} if totp else {})
+        drain(b, ok(b, "start_run", **args)["run_id"])
+
+    assert pools[0] is pools[1] and pools[2] is not pools[1]
+
+
+def test_the_no_server_row_speaks_to_the_app_not_the_cli(b):
+    run_id = ok(b, "start_run", text="now", dialects=["session"])["run_id"]
+
+    [row] = rows(drain(b, run_id))
+
+    assert "--setup" not in row["error"] and "besapi" not in row["error"]
+    assert "connection" in row["error"].lower()
+
+
+def test_two_polls_racing_a_finishing_run_both_answer(b, servers):
+    release = threading.Event()
+
+    async def held(relevance):
+        while not release.is_set():
+            await asyncio.sleep(0.01)
+        return rest_body("plural_tuples")
+
+    servers.answers["root"] = held
+    save(b, rest("root"))
+    run_id = ok(b, "start_run", text="now", dialects=["session"])["run_id"]
+    replies: list[dict] = []
+    threads = [
+        threading.Thread(
+            target=lambda: replies.append(call(b, "poll_run", run_id=run_id, wait_ms=5000))
+        )
+        for _ in range(2)
+    ]
+    for t in threads:
+        t.start()
+    time.sleep(0.2)
+    release.set()
+    for t in threads:
+        t.join(10)
+
+    assert len(replies) == 2
+    assert all(r["ok"] or r["error"]["type"] == "unknown_run" for r in replies), replies

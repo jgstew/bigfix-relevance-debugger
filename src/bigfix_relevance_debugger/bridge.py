@@ -16,7 +16,7 @@ Methods (args -> result):
 * ``poll_run`` {run_id, wait_ms?} -> rows (new ones only), done, cancelled, error,
   pending_certs [{host_port, sha256, fingerprint}], totp_needed, tally
 * ``cancel_run`` {run_id} -> {}
-* ``trust_cert`` {host_port} -> {}
+* ``trust_cert`` {host_port, sha256} -> {} (only the certificate the user was shown)
 * ``selfcheck`` {} -> lines, passed, skipped, total
 
 Built only on ``analysis``, ``evaluation`` and ``connections``: no BigFix logic
@@ -35,6 +35,7 @@ import dataclasses
 import inspect
 import json
 import logging
+import math
 import os
 import sys
 import threading
@@ -69,6 +70,7 @@ from bigfix_relevance_debugger.connections import (
     app_data_dir,
 )
 from bigfix_relevance_debugger.evaluation import (
+    NO_SESSION_CONFIG,
     AnswerTally,
     EvalOptions,
     ResultRow,
@@ -98,6 +100,10 @@ NO_FASTQUERY = (
     "Add computer ids or a computer query to a REST or BigFix SaaS connection."
 )
 FASTQUERY_HOST = "Fast Query"
+NO_SERVER = (
+    "No BigFix server connection is saved, so session relevance has nowhere to run. "
+    "Add a BigFix SaaS, REST, Explorer or Web Reports connection."
+)
 
 
 class BridgeError(Exception):
@@ -135,8 +141,8 @@ def _optional_text(args: dict[str, Any], key: str) -> str | None:
 
 def _number(args: dict[str, Any], key: str, default: float) -> float:
     value = args.get(key, default)
-    if isinstance(value, bool) or not isinstance(value, int | float):
-        raise _bad(f"{key} must be a number")
+    if isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value):
+        raise _bad(f"{key} must be a finite number")
     return float(value)
 
 
@@ -252,6 +258,10 @@ class _Run:
     changed: asyncio.Event = field(default_factory=asyncio.Event)
     task: asyncio.Task[None] | None = None
 
+    def fail(self, message: str) -> None:
+        self.error = message if self.error is None else f"{self.error}; {message}"
+        self.changed.set()
+
     def add(self, row: ResultRow, *, connection: str | None = None, code: str | None = None):
         self.rows.append(_row(row, connection=connection, error_code=code))
         if row.status != "config":  # how to add a server, not a system's answer
@@ -335,6 +345,7 @@ class Bridge:
             await asyncio.gather(*tasks, return_exceptions=True)
             self._runs.clear()
             await self._clients.aclose()
+            self._saas_pool = None  # its sessions belong to this loop
 
         try:
             asyncio.run_coroutine_threadsafe(shut(), loop).result(10)
@@ -466,6 +477,10 @@ class Bridge:
             auto_both = mode == AUTO and dialects == (SESSION, CLIENT)
 
         code = _OneCode(totp) if totp else None
+        if code is not None:
+            # A remembered totp_required in the old pool would turn the code
+            # away unsent: Fast Query never retries a stored sign-in failure.
+            self._saas_pool = SaasSessionPool()
         if code is not None and SESSION in dialects:
             # A fresh client, built with the code; it then keeps the SaaS session.
             self._next_prompt = code
@@ -495,18 +510,12 @@ class Bridge:
         auto_both: bool,
         fastquery_prompt: _OneCode | None,
     ) -> None:
-        targets = self.connections.fastquery_targets() if CLIENT in dialects else []
-        have_servers = bool(self.connections.load()) if auto_both else False
-
-        async def session() -> None:
-            # Auto added session beside client: no server is worth a row only
-            # when client relevance has nowhere to run either.
-            optional = auto_both and bool(targets)
+        async def session(optional: bool) -> None:
             async for ev in stream_session(text, opts, clients=self._clients):
                 if session_row_wanted(ev, optional=optional):
                     self._add_session(run, ev)
 
-        async def client() -> None:
+        async def client(targets: list, have_servers: bool) -> None:
             if not targets:
                 if not (auto_both and have_servers):
                     run.add(_no_fastquery_row())
@@ -519,25 +528,41 @@ class Bridge:
                 http_transport=self._transport_factory,
             )
             async for result in stream_results(text, targets, opts, session=context):
+                if _asks_for_totp(result.error):
+                    run.totp_needed = True
                 run.add(ResultRow.from_result(result))
 
-        parts: list[Awaitable[None]] = []
-        if SESSION in dialects:
-            parts.append(session())
-        if CLIENT in dialects:
-            parts.append(client())
+        async def guarded(part: Awaitable[None]) -> None:
+            # One half failing must not stop the other: it becomes the run's error.
+            try:
+                await part
+            except Exception as exc:
+                logger.debug("bridge run part failed", exc_info=True)
+                run.fail(f"{type(exc).__name__}: {exc}")
+
         try:
+            targets = self.connections.fastquery_targets() if CLIENT in dialects else []
+            have_servers = bool(self.connections.load()) if auto_both else False
+            parts: list[Awaitable[None]] = []
+            if SESSION in dialects:
+                # Auto added session beside client: no server is worth a row
+                # only when client relevance has nowhere to run either.
+                parts.append(guarded(session(auto_both and bool(targets))))
+            if CLIENT in dialects:
+                parts.append(guarded(client(targets, have_servers)))
             await asyncio.gather(*parts)
         except asyncio.CancelledError:
             run.cancelled = True
-        except Exception as exc:  # a crashed run is reported, not raised
+        except Exception as exc:
             logger.debug("bridge run failed", exc_info=True)
-            run.error = f"{type(exc).__name__}: {exc}"
+            run.fail(f"{type(exc).__name__}: {exc}")
         finally:
             run.done = True
             run.changed.set()
 
     def _add_session(self, run: _Run, ev: SessionEvaluation) -> None:
+        if ev.error_kind == "config" and ev.error == NO_SESSION_CONFIG:
+            ev = dataclasses.replace(ev, error=NO_SERVER)  # the CLI's advice doesn't apply
         if ev.error_code == "totp_required" or (ev.error or "").startswith(TotpNeeded.__name__):
             run.totp_needed = True
         run.add(ResultRow.from_session(ev), connection=ev.connection, code=ev.error_code)
@@ -561,7 +586,7 @@ class Bridge:
                 pass
         new, run.sent = run.rows[run.sent :], len(run.rows)
         if run.done:
-            del self._runs[run.id]
+            self._runs.pop(run.id, None)
         return {
             "rows": new,
             "done": run.done,
@@ -583,7 +608,19 @@ class Bridge:
         return {}
 
     async def _m_trust_cert(self, args: dict[str, Any]) -> dict[str, Any]:
-        host_port = _text(args, "host_port")
+        """Pin the pending certificate, only if it is the one the user was shown (``sha256``)."""
+        host_port, sha256 = _text(args, "host_port"), _text(args, "sha256")
+        pending = self.trust.pending.get(host_port)
+        if pending is None:
+            raise BridgeError(
+                "not_pending", f"{host_port} has no certificate waiting to be trusted"
+            )
+        if pending.sha256.lower() != sha256.strip().lower():
+            raise BridgeError(
+                "changed",
+                f"{host_port} now presents a different certificate than the one shown; "
+                "run again and check the new fingerprint",
+            )
         try:
             self.trust.accept(host_port)
         except KeyError:
@@ -601,6 +638,12 @@ class Bridge:
             data_dir=self.data_dir, secrets=self.secrets, network=self._selfcheck_network
         )
         return selfcheck.report(checks)
+
+
+def _asks_for_totp(error: str | None) -> bool:
+    """A Fast Query row failing on a SaaS TOTP challenge. Its error is text only
+    (the session library's message), so this reads the text."""
+    return error is not None and "totp code" in error.casefold()
 
 
 def _no_fastquery_row() -> ResultRow:

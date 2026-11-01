@@ -48,7 +48,9 @@ def blocked(monkeypatch):
         return real_import(name, globals, locals, fromlist, level)
 
     for mod in list(sys.modules):
-        if mod.split(".")[0] in ("bigfix_relevance_debugger", *BLOCKED):
+        # The libraries too: one that started importing a blocked package at
+        # import time must fail here, not hide behind its cached copy.
+        if mod.split(".")[0].startswith("bigfix_") or mod.split(".")[0] in BLOCKED:
             del sys.modules[mod]
     monkeypatch.setattr(builtins, "__import__", guarded)
     yield
@@ -65,6 +67,10 @@ def test_imports_without_desktop_or_compiled_deps(module, blocked):
 def test_the_guard_blocks(blocked):
     with pytest.raises(ImportError, match="blocked"):
         importlib.import_module("nicegui")
+
+
+def test_the_libraries_are_imported_fresh_too(blocked):
+    assert not [m for m in sys.modules if m.startswith("bigfix_")]
 
 
 def test_the_desktop_app_says_it_needs_nicegui(blocked):

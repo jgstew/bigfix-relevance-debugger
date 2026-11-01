@@ -304,3 +304,31 @@ def test_app_data_dir_elsewhere_is_under_home(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "platform", "linux")
 
     assert app_data_dir() == tmp_path / ".local" / "share" / APP_ID
+
+
+# --- review: scheme, server validation ------------------------------------------------
+
+
+def test_a_password_never_follows_a_connection_to_plain_http(tmp_path):
+    """https -> http keeps host, port and user; the password must still stay behind."""
+    app = store(tmp_path)
+    app.upsert(Connection(name="a", backend="rest", server="https://bf:52311", username="u"), "pw")
+
+    app.upsert(Connection(name="a", backend="rest", server="http://bf:52311", username="u"))
+
+    assert app.config().connections[0].password is None
+
+
+def test_a_new_http_connection_does_not_inherit_an_https_password(tmp_path):
+    app = store(tmp_path)
+    app.upsert(Connection(name="a", backend="rest", server="https://bf:52311", username="u"), "pw")
+
+    app.upsert(Connection(name="b", backend="rest", server="http://bf:52311", username="u"))
+
+    assert [c.password for c in app.config().connections] == ["pw", None]
+
+
+@pytest.mark.parametrize("server", ["ftp://x", "bf.example.com:abc"])
+def test_from_dict_rejects_a_server_the_library_cannot_use(server):
+    with pytest.raises(ConnectionsError):
+        Connection.from_dict({"name": "n", "backend": "rest", "server": server})

@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from bigfix_remote_client_relevance import Target
-from bigfix_remote_session_relevance import Config, ConnectionConfig, load_config
+from bigfix_remote_session_relevance import Config, ConfigError, ConnectionConfig, load_config
 
 from bigfix_relevance_debugger.upstream.remote_session_relevance import (
     SecretStore,
@@ -138,7 +138,7 @@ class Connection:
         context = data.get("use_client_context")
         if context is not None and not isinstance(context, bool):
             raise ConnectionsError("use_client_context must be true, false or null")
-        return cls(
+        conn = cls(
             name=_text(data, "name", required=True),
             backend=backend,
             server=_text(data, "server", required=True),
@@ -148,6 +148,11 @@ class Connection:
             computer_query=_text(data, "computer_query") or None,
             use_client_context=context,
         )
+        try:
+            conn.connection_config(None).address  # noqa: B018 - the library's own check
+        except (ConfigError, ValueError) as exc:
+            raise ConnectionsError(f"server {conn.server!r}: {exc}") from exc
+        return conn
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -167,8 +172,13 @@ class Connection:
 
     @property
     def account(self) -> str:
-        """Its key in the ``SecretStore``."""
-        return secret_account(self.connection_config(None))
+        """Its key in the ``SecretStore``: ``secret_account``, plus the scheme
+        when it isn't https, so a password saved for https is never sent over
+        plain http (``secret_account`` keys on host and port, not the scheme)."""
+        config = self.connection_config(None)
+        scheme = config.address.scheme
+        account = secret_account(config)
+        return account if scheme == "https" else f"{scheme}+{account}"
 
     @property
     def can_fastquery(self) -> bool:
