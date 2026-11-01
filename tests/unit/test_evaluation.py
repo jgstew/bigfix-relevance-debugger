@@ -1624,6 +1624,43 @@ async def test_the_least_recently_used_client_is_closed_past_the_limit(monkeypat
     assert ten._backends and thirty._backends
 
 
+async def test_reset_rebuilds_on_the_next_run_and_closes_idle_clients():
+    """The connections changed (an app saved one): the next run reads them again."""
+    clients = session_clients(
+        loads=[Config(connections=(rest_conn("old"),)), Config(connections=(rest_conn("new"),))]
+    )
+    await collect_session("now", clients=clients)
+
+    clients.reset()
+    await asyncio.sleep(0)
+    [ev] = await collect_session("now", clients=clients)
+
+    old, _new = clients.built
+    assert ev.connection == "new"
+    assert old._backends == {}  # closed: nobody was using it
+
+
+async def test_reset_waits_for_a_stream_still_using_the_client():
+    release = asyncio.Event()
+
+    async def held(relevance):
+        await release.wait()
+        return rest_body("plural_tuples")
+
+    clients = session_clients(rest_conn("prod"), router=Router(prod=held))
+    run = asyncio.create_task(collect_session("now", clients=clients))
+    while not clients.built or not clients.built[0]._backends:
+        await asyncio.sleep(0.01)
+
+    clients.reset()
+    await asyncio.sleep(0)
+    release.set()
+    [ev] = await run
+
+    assert ev.ok  # the run in flight finished on its client
+    assert clients.built[0]._backends == {}  # and then it was closed
+
+
 async def test_session_client_is_rebuilt_after_a_config_failure():
     # The user ran --setup after the first run; no restart needed.
     clients = session_clients(

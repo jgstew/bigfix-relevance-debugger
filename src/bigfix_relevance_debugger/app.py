@@ -31,7 +31,14 @@ from bigfix_remote_client_relevance import (
     results_to_dicts,
 )
 from bigfix_remote_client_relevance.inventory_paths import user_inventory_path
-from nicegui import app as nicegui_app
+
+try:
+    from nicegui import app as nicegui_app
+except ImportError as exc:  # iOS/Android installs leave NiceGUI out (pyproject.toml)
+    raise ImportError(
+        "bigfix_relevance_debugger.app is the desktop UI and needs NiceGUI; "
+        "mobile apps use bigfix_relevance_debugger.bridge"
+    ) from exc
 from nicegui import background_tasks, ui
 from nicegui.events import GenericEventArguments, ValueChangeEventArguments
 

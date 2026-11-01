@@ -755,6 +755,16 @@ class SessionClients:
                 del self._clients[timeout_s]
                 self._retire(client)
 
+    def reset(self) -> None:
+        """Forget every client (the connections changed); the next run builds anew.
+
+        A client a stream is still using is closed when that stream ends.
+        """
+        for client in self._clients.values():
+            self._retire(client)
+        self._clients.clear()
+        self._problem = None
+
     def _retire(self, client: AsyncSessionRelevanceClient) -> None:
         if self._users.get(client):
             self._retired.add(client)
