@@ -115,10 +115,17 @@ def _no_real_secret_store(monkeypatch):
 
     The bridge's process-wide default asks bigfix-remote-session-relevance's
     ``default_secret_store()``; a test that builds it must fake that lookup.
+    The library's own lookups (a ``password_store = "system"`` connection)
+    are refused too. ``pytest.fail`` is not an ``Exception``, so the bridge's
+    error envelope can't swallow it.
     """
+    from bigfix_remote_session_relevance import secrets
+
     from bigfix_relevance_debugger import bridge
 
     def refuse():
-        raise AssertionError("a test reached the real OS password store")
+        pytest.fail("a test reached the real OS password store")
 
     monkeypatch.setattr(bridge, "default_secret_store", refuse)
+    monkeypatch.setattr(secrets, "default_secret_store", refuse)
+    monkeypatch.setattr(secrets, "_probe_default_store", refuse)

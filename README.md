@@ -182,7 +182,9 @@ for session relevance (a session-only expression, or **Session** / **Both**
 in the picker), the session row says so and says what to set up. A config
 you add while the app is running is picked up on the next run. Queries are
 read-only (relevance queries through each interface's query API). Passwords are never prompted for; a connection without
-one shows an `authentication` row.
+one shows an `authentication` row. A connection with `password_store = "system"`
+reads its password from the OS password store (the macOS Keychain, Windows
+Credential Manager, or keyring), as the library's CLI does.
 
 TLS certificates are verified. A server with a certificate no CA vouches for
 (the usual self-signed root server) is trusted on first use: the certificate
