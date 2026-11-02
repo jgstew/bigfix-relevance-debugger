@@ -9,13 +9,18 @@ session library a ``Config``.
   connections): a JSON file in the app's data dir that **never holds a
   secret**; passwords come from a ``SecretStore`` (the Keychain on Apple
   platforms) when the ``Config`` is built.
+* :class:`SystemPasswords`, the desktop's wrapper around a source: a
+  password a connection doesn't bring comes from the OS store, or is typed
+  in the app and saved there once the server accepts it. Never a file.
 
 Free of NiceGUI, like ``analysis`` and ``evaluation``: the mobile apps import it.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -28,10 +33,14 @@ from bigfix_remote_session_relevance import (
     Config,
     ConfigError,
     ConnectionConfig,
+    MemorySecretStore,
     SecretStore,
+    default_secret_store,
     load_config,
     secret_account,
 )
+
+logger = logging.getLogger(__name__)
 
 APP_ID = "com.github.jgstew.bigfix-relevance-debugger"
 """The app's data folder name (and the iOS bundle id's stem)."""
@@ -289,3 +298,119 @@ class AppConnections:
     def fastquery_targets(self) -> list[Target]:
         """A Fast Query target per connection that has computers to query."""
         return [c.fastquery_target() for c in self.load() if c.can_fastquery]
+
+
+class SystemSecrets:
+    """The session library's ``default_secret_store()``, else memory.
+
+    The library answers None for a store it couldn't open *yet* (a keychain
+    locked at launch) and tries again on its next call, so this asks again on
+    every use until it gets one. New secrets then go to that store; one kept
+    in memory meanwhile is still found until it is deleted.
+    """
+
+    def __init__(self) -> None:
+        self._memory = MemorySecretStore()
+        self._store: SecretStore | None = None
+        self.name = self._memory.name
+        self._system()
+
+    def _system(self) -> SecretStore | None:
+        if self._store is None:
+            self._store = default_secret_store()
+            if self._store is not None:
+                self.name = self._store.name
+                logger.info("passwords are kept in %s", self.name)
+        return self._store
+
+    def get(self, account: str) -> str | None:
+        system = self._system()
+        found = system.get(account) if system is not None else None
+        return found if found is not None else self._memory.get(account)
+
+    def set(self, account: str, secret: str) -> None:
+        (self._system() or self._memory).set(account, secret)
+
+    def delete(self, account: str) -> None:
+        self._memory.delete(account)
+        system = self._system()
+        if system is not None:
+            system.delete(account)
+
+
+@dataclass(frozen=True)
+class _Typed:
+    password: str
+    save: bool
+
+
+class SystemPasswords:
+    """``source``'s connections, with passwords kept by the app, never in a file.
+
+    A basic-auth connection with a username and no password of its own
+    (inline, ``password_env``) reads it from ``secrets`` the library's way,
+    as ``password_store = "system"``. One the user typed in the app is used
+    from memory, and saved to ``secrets`` only once the server has accepted
+    it (:meth:`settle`) and only if the user asked to save it.
+    """
+
+    def __init__(self, source: ConnectionSource, secrets: SecretStore) -> None:
+        self.source = source
+        self.secrets = secrets
+        self._typed: dict[str, _Typed] = {}
+
+    @property
+    def store_name(self) -> str:
+        return self.secrets.name
+
+    @staticmethod
+    def can_supply(conn: ConnectionConfig) -> bool:
+        """Whether the app may supply ``conn``'s password: it has none of its own."""
+        return (
+            conn.auth == "basic"
+            and bool(conn.username)
+            and conn.password is None
+            and not conn.password_env
+        )
+
+    def config(self) -> Config:
+        config = self.source.config()
+        return dataclasses.replace(
+            config, connections=tuple(self._with_password(c) for c in config.connections)
+        )
+
+    def _with_password(self, conn: ConnectionConfig) -> ConnectionConfig:
+        if not self.can_supply(conn):
+            return conn
+        typed = self._typed.get(conn.name)
+        if typed is not None:
+            return dataclasses.replace(conn, password=typed.password)
+        return dataclasses.replace(conn, password_store="system")
+
+    def provide(self, name: str, password: str, *, save: bool) -> None:
+        """Use ``password`` for connection ``name`` from now on; save it once it works."""
+        conn = next((c for c in self.source.config().connections if c.name == name), None)
+        if conn is None:
+            raise ConnectionsError(f"no connection named {name!r}")
+        if not self.can_supply(conn):
+            raise ConnectionsError(f"{name} brings its own password or doesn't use one")
+        self._typed[name] = _Typed(password, save)
+
+    def settle(self, name: str, *, accepted: bool) -> str | None:
+        """After a query on ``name``: save a typed password the server ``accepted``
+        (returning the store's name), or forget one it refused."""
+        typed = self._typed.get(name)
+        if typed is None:
+            return None
+        if not accepted:
+            del self._typed[name]
+            return None
+        if not typed.save:
+            return None
+        conn = next((c for c in self.source.config().connections if c.name == name), None)
+        if conn is None:
+            return None
+        self.secrets.set(secret_account(conn), typed.password)
+        # Saved: from here it comes from the store like any other.
+        del self._typed[name]
+        return self.secrets.name
