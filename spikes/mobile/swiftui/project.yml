@@ -1,0 +1,51 @@
+# XcodeGen spec (brew install xcodegen; then `xcodegen generate`).
+# Run ./prepare.sh first: it fetches python.org's Python.xcframework and fills
+# app/ and app_packages/, which are git-ignored.
+name: BigFixRelevance
+options:
+  bundleIdPrefix: com.github.jgstew
+  deploymentTarget:
+    iOS: "17.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+targets:
+  BigFixRelevance:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources
+      # Python code and packages ship as folder references, not compiled.
+      - path: app
+        type: folder
+        buildPhase: resources
+      - path: app_packages
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - framework: Python.xcframework
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.github.jgstew.bigfix-relevance-swiftui
+        INFOPLIST_KEY_CFBundleDisplayName: BigFix Relevance
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        GENERATE_INFOPLIST_FILE: YES
+        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "0.0.1"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/BigFixRelevance-Bridging-Header.h
+        HEADER_SEARCH_PATHS: "$(BUILT_PRODUCTS_DIR)/Python.framework/Headers"
+        # The install script below writes into the bundle; Xcode's script
+        # sandbox would block it.
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+        CODE_SIGN_STYLE: Automatic
+    postBuildScripts:
+      - name: Install Python standard library and convert .so to frameworks
+        basedOnDependencyAnalysis: false
+        script: |
+          set -e
+          source "$PROJECT_DIR/Python.xcframework/build/utils.sh"
+          install_python Python.xcframework app app_packages
