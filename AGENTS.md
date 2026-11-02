@@ -147,7 +147,12 @@ Windows; Linux containers use the host's architecture). Its smoke steps copy
   `~/.besapi.conf`, plus a root server's own credentials). Don't add a
   config file of the app's own: the library's TOML file is shared with its
   CLI, as `~/.bigfix/remote_clients.toml` is for client relevance.
-  `evaluation.SessionClients` holds the one process-wide
+  On the desktop that lookup is wrapped in `connections.SystemPasswords`
+  (`evaluation.desktop_connections()`): a connection with a username and no
+  password of its own reads it from the OS store (`SystemSecrets`, also the
+  bridge's), and one typed in the page's dialog is used from memory and
+  saved there only once the server accepts it. Never write a password to a
+  file. `evaluation.SessionClients` holds the one process-wide
   `AsyncSessionRelevanceClient` (built lazily, rebuilt when the timeout
   changes or after a config failure, closed at shutdown). It runs on the
   event loop: no threads. `stream_session` yields one `SessionEvaluation`
@@ -167,10 +172,24 @@ Windows; Linux containers use the host's architecture). Its smoke steps copy
   it.
 - **Tests must never connect to a real BigFix server.** `tests/conftest.py`
   points HOME, `BFRSR_CONFIG` and the `BES_*` vars at nothing, turns off the
-  local root server lookup, makes `evaluation.default_session_client` fail
-  loudly and resets the shared clients. Test modules import the real
+  local root server lookup and the library's saved SaaS sessions
+  (`BFRSR_SESSION_CACHE=0`), makes `evaluation.default_session_client` fail
+  loudly and resets the shared clients, trust store, desktop connections and
+  SaaS pool. The OS password store fails loudly too: a test that reaches
+  `desktop_connections()` fakes `connections.default_secret_store`. Test modules import the real
   `default_session_client` before that patch, so they can still use it with
   a fake `load`.
+- **Certificates are never trusted silently.** The desktop's one
+  `TrustStore` (`evaluation.desktop_trust()`, pins shared with the CLI) has
+  `ask_trust` as its callback, which asks the dialog of the page whose run
+  started the query: `asking_trust(...)` around the run sets it in a
+  contextvar that the library's tasks inherit. With no page, it refuses. Fast
+  Query targets use the same store through `evaluation.fastquery_session()`
+  (also the bridge's), and only runs with a Fast Query target pass one. The
+  bridge defers instead (`trust_on_first_use=False`). This is the one dialog
+  that asks before a run goes on: a security decision, not an option. Page
+  tests drive it with a fake `stream_session` that awaits
+  `evaluation.ask_trust`.
 - **Tests must never run real discovery.** It writes
   `~/.bigfix/remote_clients.toml`; `tests/conftest.py` makes it fail loudly.
 - **Tests must never ask a real container engine.** The page looks up an

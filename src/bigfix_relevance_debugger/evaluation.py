@@ -119,7 +119,7 @@ class TargetForm:
     """Indexes into the loaded inventory's targets. None when the picker is cleared."""
 
     fastquery: bool = False
-    fastquery_connection: str = ""
+    fastquery_connection: str | None = None
     """A REST or BigFix SaaS connection by name (:func:`fastquery_connections`)."""
     fastquery_computers: str = ""
     """BigFix computer ids, comma-separated."""
@@ -197,7 +197,7 @@ def build_targets(
         )
 
     if form.fastquery:
-        connection = form.fastquery_connection.strip()
+        connection = (form.fastquery_connection or "").strip()
         if not connection:
             raise TargetFormError("Fast Query target needs a BigFix server connection.")
         ids = _computer_ids(form.fastquery_computers)
