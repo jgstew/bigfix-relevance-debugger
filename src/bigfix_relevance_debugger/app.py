@@ -55,6 +55,7 @@ from bigfix_relevance_debugger.analysis import (
     suggestion_fix,
     summarize,
 )
+from bigfix_relevance_debugger.connections import ConnectionsError
 from bigfix_relevance_debugger.editor import RelevanceEditor
 from bigfix_relevance_debugger.evaluation import (
     ARCHES,
@@ -80,6 +81,7 @@ from bigfix_relevance_debugger.evaluation import (
     fastquery_connections,
     fastquery_session,
     forget_changed_certificate,
+    forget_unconfirmed_passwords,
     inventory_table_row,
     is_changed_certificate,
     load_inventory_targets,
@@ -126,13 +128,13 @@ DEBOUNCE_S = 0.3
 FILTER_DEBOUNCE_S = 0.2
 """Each filter change resends the results table, so wait for typing to pause."""
 ARCH_LOOKUP_DEBOUNCE_S = 0.5
+"""The target count looks up an ``auto`` arch once typing in the image field pauses."""
 TRUST_DIALOG_TIMEOUT_S = 600.0
 """A certificate nobody answers for is refused: the library holds other first uses meanwhile."""
 NO_FASTQUERY_CONNECTION = (
     "No REST or BigFix SaaS connection is configured. Run "
     "`uvx bigfix-remote-session-relevance --setup` to add one."
 )
-"""The target count looks up an ``auto`` arch once typing in the image field pauses."""
 SIDE_PANEL_WIDTH = 460
 INVENTORY_FILTER_MIN = 9
 """Hosts it takes for the inventory table to get a filter box."""
@@ -999,9 +1001,12 @@ async def root() -> None:
 
         def forget() -> None:
             dialog.close()
-            host_port = forget_changed_certificate(name)
+            host_port = forget_changed_certificate(name, error=ev.error)
             if host_port is None:
-                ui.notify(f"{name} is no longer configured", type="warning")
+                ui.notify(
+                    f"No certificate is pinned for {name} any more; Evaluate again.",
+                    type="warning",
+                )
                 return
             activity.push(f"forgot the certificate pinned for {host_port}")
             ui.notify(
@@ -1032,12 +1037,18 @@ async def root() -> None:
         if request.connection in asking_password:
             return
         asking_password.add(request.connection)
-        save = {"value": True}
+        save = {"value": request.store is not None}
 
         def sign_in() -> None:
             if not password.value:
                 return
-            provide_password(request.connection, password.value, save=save["value"])
+            try:
+                provide_password(request.connection, password.value, save=save["value"])
+            except ConnectionsError as exc:  # the config changed since
+                ui.notify(str(exc), type="warning")
+                return
+            finally:
+                password.value = ""
             dialog.close()
             activity.push(f"password typed for {request.connection}")
             if state.running:
@@ -1054,16 +1065,26 @@ async def root() -> None:
                 .mark("password-input")
                 .on("keydown.enter", sign_in)
             )
-            ui.checkbox(f"Save in {request.store}", value=True).bind_value(save, "value").mark(
-                "password-save"
-            )
-            ui.label("Saved only once the server accepts it; never in a file.").classes(
-                "text-caption opacity-70"
-            )
+            if request.store is not None:
+                ui.checkbox(f"Save in {request.store}", value=True).bind_value(save, "value").mark(
+                    "password-save"
+                )
+                ui.label("Saved only once the server accepts it; never in a file.").classes(
+                    "text-caption opacity-70"
+                )
+            else:
+                ui.label("Kept in memory until the app quits; never in a file.").classes(
+                    "text-caption opacity-70"
+                )
             with ui.row().classes("w-full justify-end"):
                 ui.button("Cancel", on_click=dialog.close).props("flat")
                 ui.button("Sign in", on_click=sign_in).mark("password-sign-in")
-        dialog.on("hide", lambda: asking_password.discard(request.connection))
+
+        def closed() -> None:
+            asking_password.discard(request.connection)
+            dialog.delete()  # the typed text goes with it
+
+        dialog.on("hide", closed)
         dialog.open()
 
     def after_session_row(ev: SessionEvaluation) -> None:
@@ -1175,11 +1196,20 @@ async def root() -> None:
                 progress_label.set_text(f"{done} / {total}")
 
             def tick() -> None:
-                nonlocal done, total
+                nonlocal done
                 done += 1
-                # Fast Query yields a row per computer that answers: counted as one.
-                total = max(total, done)
                 show_progress()
+
+            client_expected = total - session_expected
+            client_seen = 0
+
+            def client_arrived(row: ResultRow) -> None:
+                nonlocal total, client_seen
+                client_seen += 1
+                if client_seen > client_expected:
+                    # Fast Query yields a row per computer that answers, counted as one.
+                    total += 1
+                arrived(row)
 
             def arrived(row: ResultRow) -> None:
                 state.table_rows.append(results_table_row(len(state.rows), row))
@@ -1221,6 +1251,7 @@ async def root() -> None:
                     # Fewer: connections to one deployment counted once.
                     total -= session_expected - seen
                     show_progress()
+                forget_unconfirmed_passwords()
 
             # The BigFix servers answer alongside qna, so a slow one holds up nothing.
             session_task = in_page(run_session()) if session else None
@@ -1228,7 +1259,7 @@ async def root() -> None:
                 if targets:
                     async for result in stream_results(text, targets, opts, **run_kwargs(targets)):
                         state.results.append(result)
-                        arrived(ResultRow.from_result(result))
+                        client_arrived(ResultRow.from_result(result))
                 if session_task is not None:
                     await session_task
             finally:

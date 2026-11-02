@@ -191,8 +191,11 @@ with `password_store = "system"`. If it has none there either, its row is an
 runs again with it. **Save in Keychain** (on by default) saves it there once
 the server has accepted it, never before and never in a file; untick it to
 keep it in memory until the app quits. Without a usable OS store it stays in
-memory. A BigFix SaaS account that asks for a TOTP code isn't prompted for
-one here yet.
+memory. A password no row could confirm (another connection to the same
+deployment answered instead) is forgotten after the run, so a wrong one isn't
+sent again. A BigFix SaaS password is kept in memory only: a saved SaaS
+session can answer without it, so success doesn't prove it. A SaaS account
+that asks for a TOTP code isn't prompted for one here yet.
 
 **Certificates.** TLS certificates are verified. A server with a certificate
 no CA vouches for (the usual self-signed root server) is **trusted only once
@@ -216,7 +219,9 @@ the connection (the first is picked for you) and give computer ids
 `bes computers whose (name of it starts with "web")`), or both. Each computer
 that answers is a row of its own, so the count shows Fast Query as one system
 until they do. Fast Query hosts in the inventory (`transport = "fastquery"`)
-use the same connections, passwords and certificate dialog.
+use the same connections, passwords and certificate dialog. **Breakdown**
+on a Fast Query target needs exactly one computer id (and no computer query),
+or its levels would mix answers from several computers.
 
 ## Inventory (shared with `bigfix-remote-client-relevance`)
 

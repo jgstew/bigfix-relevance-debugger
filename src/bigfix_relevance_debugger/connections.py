@@ -24,7 +24,7 @@ import logging
 import os
 import sys
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -338,10 +338,16 @@ class SystemSecrets:
             system.delete(account)
 
 
-@dataclass(frozen=True)
+@dataclass
 class _Typed:
-    password: str
+    password: str = field(repr=False)
     save: bool
+    account: str
+    """``secret_account`` when typed: it is never sent to another server or user."""
+    used: bool = False
+    """A client was built with it, so a row from that connection can judge it."""
+    confirmed: bool = False
+    """The server accepted it (and it isn't to be saved): kept in memory."""
 
 
 class SystemPasswords:
@@ -350,8 +356,9 @@ class SystemPasswords:
     A basic-auth connection with a username and no password of its own
     (inline, ``password_env``) reads it from ``secrets`` the library's way,
     as ``password_store = "system"``. One the user typed in the app is used
-    from memory, and saved to ``secrets`` only once the server has accepted
-    it (:meth:`settle`) and only if the user asked to save it.
+    from memory, and saved to ``secrets`` only once a query built with it
+    has been accepted (:meth:`settle`), only if the user asked, and never
+    for BigFix SaaS: a saved SaaS session signs in without the password.
     """
 
     def __init__(self, source: ConnectionSource, secrets: SecretStore) -> None:
@@ -373,6 +380,12 @@ class SystemPasswords:
             and not conn.password_env
         )
 
+    @staticmethod
+    def can_save(conn: ConnectionConfig) -> bool:
+        """Whether a typed password can be saved once it works: not for SaaS,
+        where success may come from a saved session instead."""
+        return conn.backend != "saas"
+
     def config(self) -> Config:
         config = self.source.config()
         return dataclasses.replace(
@@ -383,7 +396,8 @@ class SystemPasswords:
         if not self.can_supply(conn):
             return conn
         typed = self._typed.get(conn.name)
-        if typed is not None:
+        if typed is not None and typed.account == secret_account(conn):
+            typed.used = True
             return dataclasses.replace(conn, password=typed.password)
         return dataclasses.replace(conn, password_store="system")
 
@@ -394,23 +408,30 @@ class SystemPasswords:
             raise ConnectionsError(f"no connection named {name!r}")
         if not self.can_supply(conn):
             raise ConnectionsError(f"{name} brings its own password or doesn't use one")
-        self._typed[name] = _Typed(password, save)
+        self._typed[name] = _Typed(password, save and self.can_save(conn), secret_account(conn))
 
     def settle(self, name: str, *, accepted: bool) -> str | None:
         """After a query on ``name``: save a typed password the server ``accepted``
-        (returning the store's name), or forget one it refused."""
+        (returning the store's name), or forget one it refused. A row from a
+        client built before it was typed says nothing about it."""
         typed = self._typed.get(name)
-        if typed is None:
+        if typed is None or not typed.used or typed.confirmed:
             return None
         if not accepted:
             del self._typed[name]
             return None
         if not typed.save:
+            typed.confirmed = True  # kept in memory until the app quits
             return None
-        conn = next((c for c in self.source.config().connections if c.name == name), None)
-        if conn is None:
-            return None
-        self.secrets.set(secret_account(conn), typed.password)
-        # Saved: from here it comes from the store like any other.
         del self._typed[name]
+        self.secrets.set(typed.account, typed.password)
+        # Saved: from here it comes from the store like any other.
         return self.secrets.name
+
+    def forget_unconfirmed(self) -> None:
+        """After a run: forget typed passwords a client used but no row judged
+        (another connection answered by failover), so a wrong one isn't sent
+        again on every run; the page asks again if needed."""
+        for name, typed in list(self._typed.items()):
+            if typed.used and not typed.confirmed:
+                del self._typed[name]

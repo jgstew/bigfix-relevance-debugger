@@ -3387,7 +3387,7 @@ async def test_a_changed_certificate_offers_to_forget_the_old_one(user, monkeypa
     monkeypatch.setattr(
         app_module,
         "forget_changed_certificate",
-        lambda name: forgot.append(name) or "bf.example:52311",
+        lambda name, *, error: forgot.append(name) or "bf.example:52311",
     )
     await user.open("/")
     await set_text(user, "number of bes computers")
@@ -3515,3 +3515,62 @@ async def test_runs_without_fast_query_pass_no_session_context(user, monkeypatch
 
     await user.should_see("1 / 1")
     assert streamed == [{}]
+
+
+async def test_fast_query_rows_beyond_the_count_grow_the_total_not_eat_the_session_slots(
+    user, monkeypatch
+):
+    gate = asyncio.Event()
+
+    async def session(text, opts, **upstream):
+        await gate.wait()
+        yield SessionEvaluation(text, SERVER, answers=("1",), connection="prod")
+
+    async def fast_query(text, targets, opts, **upstream):
+        for host in ("a", "b", "c"):
+            yield result(host, ["Linux"])
+
+    monkeypatch.setattr(app_module, "stream_session", session)
+    monkeypatch.setattr(app_module, "stream_results", fast_query)
+    monkeypatch.setattr(app_module, "fastquery_connections", lambda: ["lab"])
+    monkeypatch.setattr(app_module, "fastquery_session", object)
+    await user.open("/")
+    await set_text(user, "now")
+    user.find(marker="target-fastquery").click()
+    user.find(marker="fastquery-computers").type("1")
+
+    user.find(marker="evaluate").click()
+
+    # Three Fast Query rows of one counted, and the session row still to come.
+    await user.should_see("3 / 4")
+    gate.set()
+    await user.should_see("4 / 4")
+
+
+async def test_a_saas_password_is_kept_in_memory_with_no_save_box(user, monkeypatch):
+    provided: list[tuple] = []
+    monkeypatch.setattr(app_module, "stream_session", no_password_session([]))
+    monkeypatch.setattr(
+        app_module,
+        "password_request",
+        lambda ev: evaluation.PasswordRequest("prod", "e", "login.bigfix.com", None),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "provide_password",
+        lambda name, password, *, save: provided.append((name, password, save)),
+    )
+    await user.open("/")
+    await set_text(user, "number of bes computers")
+
+    user.find(marker="evaluate").click()
+
+    for _ in range(40):
+        if any("password-input" in e._markers for e in user.client.elements.values()):
+            break
+        await asyncio.sleep(0.05)
+    await user.should_see("Kept in memory")
+    assert not any("password-save" in e._markers for e in user.client.elements.values())
+    user.find(marker="password-input").type("s3cret")
+    user.find(marker="password-sign-in").click()
+    assert provided == [("prod", "s3cret", False)]

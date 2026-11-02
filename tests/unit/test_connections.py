@@ -497,6 +497,7 @@ def test_a_typed_password_is_saved_once_the_server_accepts_it():
     store = OsStore()
     source = passwords(BASIC, secrets=store)
     source.provide("root", "typed", save=True)
+    source.config()  # a client is built with it
 
     saved = source.settle("root", accepted=True)
 
@@ -509,6 +510,7 @@ def test_a_typed_password_not_to_save_stays_in_memory():
     store = OsStore()
     source = passwords(BASIC, secrets=store)
     source.provide("root", "typed", save=False)
+    source.config()  # a client is built with it
 
     assert source.settle("root", accepted=True) is None
     assert store.get(secret_account(BASIC)) is None
@@ -519,6 +521,7 @@ def test_a_refused_typed_password_is_forgotten():
     store = OsStore()
     source = passwords(BASIC, secrets=store)
     source.provide("root", "wrong", save=True)
+    source.config()  # a client is built with it
 
     assert source.settle("root", accepted=False) is None
 
@@ -537,3 +540,62 @@ def test_a_password_is_only_typed_for_a_connection_that_can_take_one():
 
 def test_system_passwords_name_their_store():
     assert passwords(BASIC).store_name == "keychain"
+
+
+def test_a_typed_password_no_client_used_yet_settles_nothing():
+    """Another page's run, on a client built before the password was typed,
+    says nothing about it: neither saved nor forgotten."""
+    store = OsStore()
+    source = passwords(BASIC, secrets=store)
+    source.provide("root", "typed", save=True)
+
+    assert source.settle("root", accepted=True) is None
+    assert source.settle("root", accepted=False) is None
+    assert store.get(secret_account(BASIC)) is None
+    assert source.config().connections[0].password == "typed"  # now used
+    assert source.settle("root", accepted=True) == "keychain"
+
+
+def test_a_saas_password_is_never_saved_on_success():
+    """A saved SaaS session signs in without sending the password, so success
+    doesn't prove it; it stays in memory only."""
+    saas = ConnectionConfig(name="cloud", backend="saas", server="login.bigfix.com", username="e")
+    store = OsStore()
+    source = passwords(saas, secrets=store)
+    source.provide("cloud", "typed", save=True)
+    source.config()
+
+    assert source.settle("cloud", accepted=True) is None
+    assert store.get(secret_account(saas)) is None
+    assert not source.can_save(saas)
+    assert source.can_save(BASIC)
+
+
+def test_a_used_password_no_row_confirmed_is_forgotten():
+    """Failover answered from another connection: the typed one may be wrong,
+    so it isn't sent again run after run."""
+    source = passwords(BASIC)
+    source.provide("root", "typed", save=True)
+    source.config()
+
+    source.forget_unconfirmed()
+
+    assert source.config().connections[0].password_store == "system"
+
+
+def test_a_typed_password_never_follows_a_connection_to_another_server():
+    moved = dataclasses.replace(BASIC, server="other.example.com")
+    fixed = Fixed(BASIC)
+    source = connections.SystemPasswords(fixed, OsStore())
+    source.provide("root", "typed", save=True)
+
+    fixed.conns = (moved,)
+
+    assert source.config().connections[0].password is None
+
+
+def test_a_typed_password_is_not_in_any_repr():
+    source = passwords(BASIC)
+    source.provide("root", "s3cret-typed", save=True)
+
+    assert "s3cret-typed" not in repr(source._typed)

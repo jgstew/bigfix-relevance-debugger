@@ -13,6 +13,7 @@ import dataclasses
 import functools
 import heapq
 import logging
+import re
 from collections import OrderedDict
 from collections.abc import (
     AsyncGenerator,
@@ -822,21 +823,32 @@ def _connection(source: ConnectionSource, name: str):
     return next((c for c in config.connections if c.name == name), None)
 
 
+_CHANGED_CERT = re.compile(r"certificate for (\S+) changed")
+
+
 def forget_changed_certificate(
     connection: str,
     *,
+    error: str | None = None,
     source: ConnectionSource | None = None,
     trust: TrustStore | None = None,
     clients: SessionClients | None = None,
 ) -> str | None:
     """Forget the pin of ``connection``'s server, once the user has checked the
     change out of band; the next run asks about the new certificate as on
-    first use. Returns the host:port forgotten, or None for no such connection."""
-    conn = _connection(source or desktop_connections(), connection)
-    if conn is None:
+    first use. ``error`` is the row's message, which names the host:port the
+    backend pinned (BigFix SaaS pins its API host, not the configured server).
+    Returns the host:port forgotten, or None when nothing was pinned there."""
+    found = _CHANGED_CERT.search(error or "")
+    if found:
+        host_port = found.group(1)
+    else:
+        conn = _connection(source or desktop_connections(), connection)
+        if conn is None:
+            return None
+        host_port = conn.address.host_port
+    if not (trust or desktop_trust()).known.forget(host_port):
         return None
-    host_port = conn.address.host_port
-    (trust or desktop_trust()).known.forget(host_port)
     (clients or session_clients()).reset()
     return host_port
 
@@ -848,8 +860,9 @@ class PasswordRequest:
     connection: str
     username: str
     server: str
-    store: str
-    """Where a saved password goes, e.g. ``keychain``."""
+    store: str | None
+    """Where a saved password goes, e.g. ``keychain``; None when it can't be
+    saved (BigFix SaaS: a saved session may answer without it)."""
 
 
 def password_request(
@@ -864,7 +877,8 @@ def password_request(
     conn = _connection(source.source, ev.connection)
     if conn is None or not source.can_supply(conn):
         return None
-    return PasswordRequest(conn.name, conn.username or "", conn.server, source.store_name)
+    store = source.store_name if source.can_save(conn) else None
+    return PasswordRequest(conn.name, conn.username or "", conn.server, store)
 
 
 def provide_password(
@@ -894,6 +908,13 @@ def settle_password(ev: SessionEvaluation, *, source: SystemPasswords | None = N
     # No desktop connections built yet: nothing was typed, and no need to ask the OS.
     source = source or _desktop_connections
     return None if source is None else source.settle(ev.connection, accepted=accepted)
+
+
+def forget_unconfirmed_passwords(*, source: SystemPasswords | None = None) -> None:
+    """After a run's session rows: a typed password no row judged is forgotten."""
+    source = source or _desktop_connections
+    if source is not None:
+        source.forget_unconfirmed()
 
 
 def fastquery_connections(source: ConnectionSource | None = None) -> list[str]:
@@ -1686,6 +1707,9 @@ async def run_breakdown(
     """
     if not analysis.can_breakdown:
         raise ValueError(analysis.breakdown_disabled_reason or "cannot break down")
+    if target.kind == "fastquery" and (target.computer_query or len(target.computer_ids) != 1):
+        # Each probe would answer once per computer, and levels would mix them.
+        raise ValueError("Breakdown on a Fast Query target needs exactly one computer id.")
 
     # A host can list several qna versions, and its own list beats the
     # run-wide spec, so every probe would answer once per version. Pin the

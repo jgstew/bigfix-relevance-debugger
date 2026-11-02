@@ -2968,3 +2968,47 @@ def test_settling_with_no_password_typed_never_asks_the_os_store():
     (conftest fails a test that reaches the real one)."""
     assert evaluation.settle_password(session_evaluation(session_result())) is None
     assert evaluation._desktop_connections is None
+
+
+def test_forgetting_a_changed_certificate_uses_the_host_the_error_names(tmp_path, os_store):
+    """A SaaS backend pins its API host (api.*), not the configured login.* server."""
+    from bigfix_remote_session_relevance import KnownCerts
+
+    trust = TrustStore(KnownCerts(tmp_path / "known.toml"), callback=evaluation.ask_trust)
+    trust.known.pin(cert("api.bigfix.com:443"), trusted_by="prompt")
+    saas = ConnectionConfig(name="cloud", backend="saas", server="login.bigfix.com", username="e")
+    source = Fixed(Config(connections=(saas,)))
+    error = "certificate for api.bigfix.com:443 changed (pinned sha256 ab…, presented cd…)"
+    clients = SessionClients()
+
+    forgot = evaluation.forget_changed_certificate(
+        "cloud", error=error, source=source, trust=trust, clients=clients
+    )
+
+    assert forgot == "api.bigfix.com:443"
+    assert trust.known.get("api.bigfix.com:443") is None
+    # Nothing pinned there any more: says so rather than claim it forgot.
+    assert (
+        evaluation.forget_changed_certificate(
+            "cloud", error=error, source=source, trust=trust, clients=clients
+        )
+        is None
+    )
+
+
+async def test_breakdown_refuses_a_fast_query_target_over_several_computers():
+    view = summarize("name of operating system")
+    target = Target(kind="fastquery", name="lab", connection="lab", computer_ids=(1, 2))
+
+    with pytest.raises(ValueError, match="one computer"):
+        await run_breakdown(view, target, EvalOptions())
+
+
+def test_a_saas_password_request_offers_no_save(os_store):
+    saas = ConnectionConfig(name="prod", backend="saas", server="login.bigfix.com", username="e")
+    source = desktop_source(saas, secrets=os_store)
+
+    request = evaluation.password_request(no_password_row(), source=source)
+
+    assert request is not None
+    assert request.store is None
