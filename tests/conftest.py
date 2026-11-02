@@ -111,6 +111,10 @@ def _no_real_session_relevance_client(tmp_path, monkeypatch):
 
     monkeypatch.setattr(evaluation, "default_session_client", refuse)
     monkeypatch.setattr(evaluation, "_session_clients", None)
+    # The desktop's process-wide trust store, connections and SaaS pool too.
+    monkeypatch.setattr(evaluation, "_desktop_trust", None)
+    monkeypatch.setattr(evaluation, "_desktop_connections", None)
+    monkeypatch.setattr(evaluation, "_saas_pool", None)
 
 
 @pytest.fixture(autouse=True)

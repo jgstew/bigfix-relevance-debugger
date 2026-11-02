@@ -49,7 +49,6 @@ from typing import Any
 
 import httpx
 from bigfix_relevance_analyzer import highlight
-from bigfix_remote_client_relevance import SessionContext
 from bigfix_remote_session_relevance import (
     AsyncSessionRelevanceClient,
     ConfigError,
@@ -79,6 +78,7 @@ from bigfix_relevance_debugger.evaluation import (
     SessionClients,
     SessionEvaluation,
     default_session_client,
+    fastquery_session,
     session_row_wanted,
     stream_results,
     stream_session,
@@ -518,11 +518,11 @@ class Bridge:
                 if not (auto_both and have_servers):
                     run.add(_no_fastquery_row())
                 return
-            context = SessionContext(
-                config=self.connections.config(),
+            context = fastquery_session(
+                self.connections,
                 trust=self.trust,
-                prompt=fastquery_prompt,
                 saas_sessions=self._pool(),
+                prompt=fastquery_prompt,
                 http_transport=self._transport_factory,
             )
             async for result in stream_results(text, targets, opts, session=context):

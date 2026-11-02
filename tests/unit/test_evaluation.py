@@ -1519,7 +1519,7 @@ async def test_disabled_connections_count_as_none_configured():
     assert ev.error_kind == "config"
 
 
-async def test_session_with_a_broken_config_file_says_why(tmp_path, monkeypatch):
+async def test_session_with_a_broken_config_file_says_why(tmp_path, monkeypatch, os_store):
     broken = tmp_path / "connections.toml"
     broken.write_text("[[connections]\n", encoding="utf-8")
     monkeypatch.setenv("BFRSR_CONFIG", str(broken))
@@ -1693,18 +1693,6 @@ def test_session_timeouts_reach_every_connection():
         (SESSION_CONNECT_TIMEOUT_S, 12.0),
         (SESSION_CONNECT_TIMEOUT_S, 12.0),
     ]
-
-
-def test_default_session_client_never_prompts_and_trusts_on_first_use():
-    config = Config(connections=(rest_conn("a"),))
-
-    client = default_session_client(EvalOptions(), source=Fixed(config))
-
-    assert client._prompt is None
-    assert isinstance(client._trust, TrustStore)
-    assert client._trust.callback is None
-    # Explicit, so the library neither warns nor flips it to refuse in 2.0.
-    assert client._trust.trust_on_first_use == "auto"
 
 
 async def test_leaving_the_stream_early_cancels_the_other_queries():
@@ -1989,7 +1977,7 @@ def test_default_session_client_reads_its_connection_source():
     assert [c.name for c in client.connections] == ["from-source"]
 
 
-def test_default_session_client_defaults_to_the_library_lookup(monkeypatch):
+def test_default_session_client_defaults_to_the_library_lookup(monkeypatch, os_store):
     from bigfix_relevance_debugger import connections
 
     config = Config(connections=(rest_conn("from-library"),))
@@ -2696,3 +2684,287 @@ def test_preview_both_with_a_bad_target_is_still_a_problem():
 
     assert p.problem is not None
     assert "SSH" in p.problem
+
+
+# --- the desktop's trust, passwords and Fast Query --------------------------------------
+
+
+@pytest.fixture
+def os_store(monkeypatch):
+    """Stands in for the Keychain behind the desktop's ``SystemSecrets``."""
+    from bigfix_remote_session_relevance import MemorySecretStore
+
+    from bigfix_relevance_debugger import connections
+
+    class OsStore(MemorySecretStore):
+        name = "keychain"
+
+    store = OsStore()
+    monkeypatch.setattr(connections, "default_secret_store", lambda: store)
+    return store
+
+
+def test_default_session_client_asks_the_page_before_trusting_a_certificate(os_store):
+    config = Config(connections=(rest_conn("a"),))
+
+    client = default_session_client(EvalOptions(), source=Fixed(config))
+
+    assert client._prompt is None
+    trust = client._trust
+    assert isinstance(trust, TrustStore)
+    # Never silent: the callback asks the page's dialog, or refuses with none.
+    assert trust.trust_on_first_use is True
+    assert trust.callback is evaluation.ask_trust
+    # One store for the process: session relevance and Fast Query share pins.
+    assert trust is evaluation.desktop_trust()
+    assert evaluation.fastquery_session().trust is trust
+
+
+def cert(host_port="bf.example:52311"):
+    from bigfix_remote_session_relevance import CertInfo
+
+    return CertInfo(host_port=host_port, sha256="ab" * 32, pem="PEM")
+
+
+async def test_with_no_page_to_ask_a_certificate_is_refused(caplog):
+    with caplog.at_level(logging.WARNING):
+        assert await evaluation.ask_trust(cert()) is False
+
+    assert "bf.example:52311" in caplog.text
+
+
+async def test_the_page_asked_is_the_one_running_the_query():
+    asked: list[str] = []
+
+    async def page(info) -> bool:
+        asked.append(info.host_port)
+        return True
+
+    async def query() -> bool:
+        # The library calls the trust callback deep inside the run's own tasks.
+        return await asyncio.create_task(evaluation.ask_trust(cert()))
+
+    with evaluation.asking_trust(page):
+        assert await asyncio.create_task(query()) is True
+    assert asked == ["bf.example:52311"]
+    assert await evaluation.ask_trust(cert()) is False  # the page left
+
+
+async def test_a_trusted_certificate_is_pinned_and_a_refused_one_is_not(tmp_path, monkeypatch):
+    from bigfix_remote_session_relevance import KnownCerts, ServerAddress
+    from bigfix_remote_session_relevance import trust as trust_module
+
+    async def fetch(host, port, **kwargs):
+        return cert(f"{host}:{port}")
+
+    monkeypatch.setattr(trust_module, "fetch_server_cert", fetch)
+    store = TrustStore(KnownCerts(tmp_path / "known.toml"), callback=evaluation.ask_trust)
+    answers = {"yes.example:52311": True, "no.example:52311": False}
+
+    async def page(info) -> bool:
+        return answers[info.host_port]
+
+    with evaluation.asking_trust(page):
+        assert await store.on_untrusted(ServerAddress("https", "yes.example", 52311))
+        assert not await store.on_untrusted(ServerAddress("https", "no.example", 52311))
+
+    assert store.known.get("yes.example:52311") is not None
+    assert store.known.get("no.example:52311") is None
+
+
+def test_forgetting_a_changed_certificate_drops_its_pin_and_the_clients(tmp_path, os_store):
+    from bigfix_remote_session_relevance import KnownCerts
+
+    trust = TrustStore(KnownCerts(tmp_path / "known.toml"), callback=evaluation.ask_trust)
+    trust.known.pin(cert("bf.example:52311"), trusted_by="prompt")
+    source = Fixed(Config(connections=(rest_conn("prod", "https://bf.example:52311"),)))
+    clients = SessionClients(lambda opts: default_session_client(opts, source=source, trust=None))
+    clients.expected()  # builds one
+
+    forgot = evaluation.forget_changed_certificate(
+        "prod", source=source, trust=trust, clients=clients
+    )
+
+    assert forgot == "bf.example:52311"
+    assert trust.known.get("bf.example:52311") is None
+    assert not clients._clients
+    assert (
+        evaluation.forget_changed_certificate("nope", source=source, trust=trust, clients=clients)
+        is None
+    )
+
+
+def changed_cert_row(**fields):
+    error = ResultError(kind="tls", code="pin_mismatch", backend="rest", message="changed")
+    return session_evaluation(session_result(error=error, **fields))
+
+
+def test_a_changed_certificate_is_recognised():
+    assert evaluation.is_changed_certificate(changed_cert_row())
+    assert not evaluation.is_changed_certificate(session_evaluation(session_result()))
+
+
+# passwords
+
+
+def no_password_row(connection="prod"):
+    error = ResultError(
+        kind="authentication", backend="rest", message="no password available for 'api'"
+    )
+    return session_evaluation(session_result(error=error, connection=connection))
+
+
+def desktop_source(*conns, secrets):
+    from bigfix_relevance_debugger.connections import SystemPasswords
+
+    return SystemPasswords(Fixed(Config(connections=conns)), secrets)
+
+
+def test_an_authentication_failure_asks_for_a_password_the_app_can_supply(os_store):
+    source = desktop_source(rest_conn("prod", password=None), secrets=os_store)
+
+    request = evaluation.password_request(no_password_row(), source=source)
+
+    assert request == evaluation.PasswordRequest(
+        connection="prod", username="api", server=SERVER_URL, store="keychain"
+    )
+
+
+def test_no_password_is_asked_for_a_connection_that_brings_its_own(os_store):
+    source = desktop_source(rest_conn("prod", password_env="BF_PW"), secrets=os_store)
+
+    assert evaluation.password_request(no_password_row(), source=source) is None
+    assert evaluation.password_request(session_evaluation(session_result()), source=source) is None
+
+
+def test_a_typed_password_reaches_the_next_client_and_is_saved_once_it_works(os_store):
+    from bigfix_remote_session_relevance import secret_account
+
+    conn = rest_conn("prod", password=None)
+    source = desktop_source(conn, secrets=os_store)
+    clients = SessionClients(lambda opts: default_session_client(opts, source=source, trust=None))
+    clients.expected()
+
+    evaluation.provide_password("prod", "typed", save=True, source=source, clients=clients)
+
+    assert not clients._clients  # rebuilt with it on the next run
+    client = clients._build(EvalOptions())
+    assert client.connections[0].password == "typed"
+    assert client._secrets is os_store or client._secrets is source.secrets
+    assert evaluation.settle_password(session_evaluation(session_result()), source=source) == (
+        "keychain"
+    )
+    assert os_store.get(secret_account(conn)) == "typed"
+
+
+def test_a_refused_password_is_forgotten_and_a_failed_connection_settles_nothing(os_store):
+    source = desktop_source(rest_conn("prod", password=None), secrets=os_store)
+    source.provide("prod", "typed", save=True)
+    unreachable = session_evaluation(
+        session_result(error=ResultError(kind="connection", backend="rest", message="down"))
+    )
+
+    assert evaluation.settle_password(unreachable, source=source) is None
+    assert source.config().connections[0].password == "typed"
+    assert evaluation.settle_password(no_password_row(), source=source) is None
+    assert source.config().connections[0].password is None
+
+
+def test_the_desktop_default_reads_passwords_from_the_os_store(os_store, monkeypatch):
+    from bigfix_remote_session_relevance import secret_account
+
+    from bigfix_relevance_debugger import connections
+
+    conn = rest_conn("from-library", password=None)
+    monkeypatch.setattr(connections, "load_config", lambda: Config(connections=(conn,)))
+    os_store.set(secret_account(conn), "kept")
+
+    client = default_session_client(EvalOptions(), trust=None)
+
+    assert client.connections[0].password_store == "system"
+    assert client.connections[0].resolve_password(secrets=client._secrets) == "kept"
+
+
+# Fast Query targets
+
+
+FQ_REST = ConnectionConfig(name="lab", backend="rest", server="bf.example", username="op")
+FQ_SAAS = ConnectionConfig(name="cloud", backend="saas", server="login.bigfix.com", username="e")
+FQ_WR = ConnectionConfig(name="wr", backend="webreports", server="wr.example", username="u")
+
+
+def test_fast_query_connections_are_the_rest_and_saas_ones(os_store):
+    source = Fixed(Config(connections=(FQ_REST, FQ_WR, FQ_SAAS)))
+
+    assert evaluation.fastquery_connections(source) == ["lab", "cloud"]
+
+
+def test_fast_query_connections_are_none_when_the_config_is_broken():
+    class Broken:
+        def config(self):
+            raise ConfigError("bad file")
+
+    assert evaluation.fastquery_connections(Broken()) == []
+
+
+def test_build_targets_fast_query():
+    form = TargetForm(
+        fastquery=True,
+        fastquery_connection="lab",
+        fastquery_computers="12, 34 ,",
+        fastquery_query='bes computers whose (name of it starts with "web")',
+    )
+
+    (target,) = build_targets(form)
+
+    assert target == Target(
+        kind="fastquery",
+        name="lab",
+        connection="lab",
+        computer_ids=(12, 34),
+        computer_query='bes computers whose (name of it starts with "web")',
+    )
+
+
+@pytest.mark.parametrize(
+    ("fields", "problem"),
+    [
+        ({"fastquery_connection": ""}, "connection"),
+        ({"fastquery_computers": "", "fastquery_query": " "}, "computer"),
+        ({"fastquery_computers": "12, web"}, "web"),
+    ],
+)
+def test_build_targets_fast_query_needs_a_connection_and_computers(fields, problem):
+    values = {"fastquery_connection": "lab", "fastquery_computers": "12"} | fields
+    form = TargetForm(fastquery=True, **values)
+
+    with pytest.raises(TargetFormError, match=problem):
+        build_targets(form)
+
+
+def test_fast_query_counts_as_an_explicit_target():
+    inventory = [Target(kind="local", name="inv")]
+    form = TargetForm(fastquery=True, fastquery_connection="lab", fastquery_computers="1")
+
+    preview = preview_targets(form, inventory, {}, qna_spec=None, inventory_pending=False)
+
+    # Ticked alone, it runs alone, as Local, Container and SSH do.
+    assert preview.sources == (("fastquery", 1),)
+    assert evaluation.inventory_indexes(form, inventory) == []
+
+
+def test_the_fast_query_session_uses_the_desktop_connections_and_one_saas_pool(os_store):
+    first = evaluation.fastquery_session(Fixed(Config(connections=(FQ_REST,))))
+    second = evaluation.fastquery_session(Fixed(Config(connections=(FQ_REST,))))
+
+    assert first.config is not None
+    assert [c.name for c in first.config.connections] == ["lab"]
+    assert first.saas_sessions is not None
+    assert first.saas_sessions is second.saas_sessions
+
+
+def test_settling_with_no_password_typed_never_asks_the_os_store():
+    """Every session row is settled; until a password is typed, no store is looked up
+    (conftest fails a test that reaches the real one)."""
+    assert evaluation.settle_password(session_evaluation(session_result())) is None
+    assert evaluation._desktop_connections is None
