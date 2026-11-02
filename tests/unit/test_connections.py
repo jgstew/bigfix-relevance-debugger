@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import stat
@@ -384,3 +385,217 @@ def test_secret_account_uses_the_normalized_server():
     }
 
     assert accounts == {"rest:bf.example.com:52311:u"}
+
+
+# --- SystemSecrets -------------------------------------------------------------------
+
+
+class OsStore(MemorySecretStore):
+    """Stands in for the Keychain."""
+
+    name = "keychain"
+
+
+def test_system_secrets_use_the_os_store(monkeypatch):
+    """The library's ``default_secret_store()``: the Keychain on macOS and iOS."""
+    os_store = OsStore()
+    monkeypatch.setattr(connections, "default_secret_store", lambda: os_store)
+
+    secrets = connections.SystemSecrets()
+    secrets.set("a", "pw")
+
+    assert secrets.name == "keychain"
+    assert os_store.get("a") == "pw"
+
+
+def test_system_secrets_stay_in_memory_without_an_os_store(monkeypatch):
+    monkeypatch.setattr(connections, "default_secret_store", lambda: None)
+
+    secrets = connections.SystemSecrets()
+    secrets.set("a", "pw")
+
+    assert secrets.name == "memory"
+    assert secrets.get("a") == "pw"
+
+
+def test_system_secrets_pick_up_an_os_store_that_appears_later(monkeypatch):
+    """A keychain locked at launch: new secrets go to it once found; one kept
+    in memory meanwhile is still found until deleted."""
+    found: list[OsStore] = []
+    monkeypatch.setattr(connections, "default_secret_store", lambda: found[0] if found else None)
+    secrets = connections.SystemSecrets()
+    secrets.set("early", "pw")
+
+    os_store = OsStore()
+    found.append(os_store)
+    secrets.set("late", "pw2")
+
+    assert secrets.name == "keychain"
+    assert os_store.get("late") == "pw2"
+    assert os_store.get("early") is None
+    assert secrets.get("early") == "pw"
+    secrets.delete("early")
+    assert secrets.get("early") is None
+
+
+# --- SystemPasswords -----------------------------------------------------------------
+
+BASIC = ConnectionConfig(name="root", backend="rest", server="bf.example.com", username="api")
+
+
+class Fixed:
+    def __init__(self, *conns: ConnectionConfig) -> None:
+        self.conns = conns
+
+    def config(self) -> Config:
+        return Config(connections=self.conns)
+
+
+def passwords(*conns: ConnectionConfig, secrets=None):
+    return connections.SystemPasswords(Fixed(*conns), secrets or OsStore())
+
+
+def test_system_passwords_read_a_missing_password_from_the_os_store():
+    """A username with no password of its own: the library reads the store
+    (``password_store = "system"``) instead of failing for want of one."""
+    (conn,) = passwords(BASIC).config().connections
+
+    assert conn.password_store == "system"
+    assert conn.password is None
+
+
+@pytest.mark.parametrize(
+    "conn",
+    [
+        dataclasses.replace(BASIC, password="inline"),
+        dataclasses.replace(BASIC, password_env="BF_PW"),
+        dataclasses.replace(BASIC, username=None),
+        dataclasses.replace(BASIC, token="t"),
+        dataclasses.replace(BASIC, credentials="local_root_server"),
+    ],
+    ids=["inline", "env", "no-user", "token", "local-root-server"],
+)
+def test_system_passwords_leave_connections_that_bring_their_own(conn):
+    source = passwords(conn)
+
+    assert source.config().connections == (conn,)
+    assert not source.can_supply(conn)
+
+
+def test_a_typed_password_is_used_in_memory_and_never_saved_before_it_works():
+    store = OsStore()
+    source = passwords(BASIC, secrets=store)
+
+    source.provide("root", "typed", save=True)
+
+    (conn,) = source.config().connections
+    assert conn.password == "typed"
+    assert store.get(secret_account(BASIC)) is None
+
+
+def test_a_typed_password_is_saved_once_the_server_accepts_it():
+    store = OsStore()
+    source = passwords(BASIC, secrets=store)
+    source.provide("root", "typed", save=True)
+    source.config()  # a client is built with it
+
+    saved = source.settle("root", accepted=True)
+
+    assert saved == "keychain"
+    assert store.get(secret_account(BASIC)) == "typed"
+    assert source.settle("root", accepted=True) is None  # once
+
+
+def test_a_typed_password_not_to_save_stays_in_memory():
+    store = OsStore()
+    source = passwords(BASIC, secrets=store)
+    source.provide("root", "typed", save=False)
+    source.config()  # a client is built with it
+
+    assert source.settle("root", accepted=True) is None
+    assert store.get(secret_account(BASIC)) is None
+    assert source.config().connections[0].password == "typed"
+
+
+def test_a_refused_typed_password_is_forgotten():
+    store = OsStore()
+    source = passwords(BASIC, secrets=store)
+    source.provide("root", "wrong", save=True)
+    source.config()  # a client is built with it
+
+    assert source.settle("root", accepted=False) is None
+
+    assert store.get(secret_account(BASIC)) is None
+    assert source.config().connections[0].password_store == "system"
+
+
+def test_a_password_is_only_typed_for_a_connection_that_can_take_one():
+    source = passwords(dataclasses.replace(BASIC, password="inline"))
+
+    with pytest.raises(ConnectionsError, match="root"):
+        source.provide("root", "typed", save=True)
+    with pytest.raises(ConnectionsError, match="nope"):
+        source.provide("nope", "typed", save=True)
+
+
+def test_system_passwords_name_their_store():
+    assert passwords(BASIC).store_name == "keychain"
+
+
+def test_a_typed_password_no_client_used_yet_settles_nothing():
+    """Another page's run, on a client built before the password was typed,
+    says nothing about it: neither saved nor forgotten."""
+    store = OsStore()
+    source = passwords(BASIC, secrets=store)
+    source.provide("root", "typed", save=True)
+
+    assert source.settle("root", accepted=True) is None
+    assert source.settle("root", accepted=False) is None
+    assert store.get(secret_account(BASIC)) is None
+    assert source.config().connections[0].password == "typed"  # now used
+    assert source.settle("root", accepted=True) == "keychain"
+
+
+def test_a_saas_password_is_never_saved_on_success():
+    """A saved SaaS session signs in without sending the password, so success
+    doesn't prove it; it stays in memory only."""
+    saas = ConnectionConfig(name="cloud", backend="saas", server="login.bigfix.com", username="e")
+    store = OsStore()
+    source = passwords(saas, secrets=store)
+    source.provide("cloud", "typed", save=True)
+    source.config()
+
+    assert source.settle("cloud", accepted=True) is None
+    assert store.get(secret_account(saas)) is None
+    assert not source.can_save(saas)
+    assert source.can_save(BASIC)
+
+
+def test_a_used_password_no_row_confirmed_is_forgotten():
+    """Failover answered from another connection: the typed one may be wrong,
+    so it isn't sent again run after run."""
+    source = passwords(BASIC)
+    source.provide("root", "typed", save=True)
+    source.config()
+
+    source.forget_unconfirmed()
+
+    assert source.config().connections[0].password_store == "system"
+
+
+def test_a_typed_password_never_follows_a_connection_to_another_server():
+    moved = dataclasses.replace(BASIC, server="other.example.com")
+    fixed = Fixed(BASIC)
+    source = connections.SystemPasswords(fixed, OsStore())
+    source.provide("root", "typed", save=True)
+
+    fixed.conns = (moved,)
+
+    assert source.config().connections[0].password is None
+
+
+def test_a_typed_password_is_not_in_any_repr():
+    source = passwords(BASIC)
+    source.provide("root", "s3cret-typed", save=True)
+
+    assert "s3cret-typed" not in repr(source._typed)

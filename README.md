@@ -181,20 +181,47 @@ it was skipped and how to configure a server. When you asked
 for session relevance (a session-only expression, or **Session** / **Both**
 in the picker), the session row says so and says what to set up. A config
 you add while the app is running is picked up on the next run. Queries are
-read-only (relevance queries through each interface's query API). Passwords are never prompted for; a connection without
-one shows an `authentication` row. A connection with `password_store = "system"`
-reads its password from the OS password store (the macOS Keychain, Windows
-Credential Manager, or keyring), as the library's CLI does.
+read-only (relevance queries through each interface's query API).
 
-TLS certificates are verified. A server with a certificate no CA vouches for
-(the usual self-signed root server) is trusted on first use: the certificate
-is pinned in `~/.bigfix/.remote_session_known_certs.toml` (shared with the
-library's CLI, so a certificate you already trusted there is trusted here
-too) and the activity log shows a WARNING with its SHA-256 fingerprint. Check
-it against the server. If a pinned certificate later changes, that
-connection shows a `tls` error and doesn't fail over; to accept the new
-certificate, remove its entry from that file (or run the CLI's
-`--forget-cert <host:port>`).
+**Passwords.** A connection with a username and no password of its own (no
+`password` or `password_env`) reads it from the OS password store (the macOS
+Keychain, Windows Credential Manager, or keyring), as the library's CLI does
+with `password_store = "system"`. If it has none there either, its row is an
+`authentication` error and the app asks for the password in a dialog, then
+runs again with it. **Save in Keychain** (on by default) saves it there once
+the server has accepted it, never before and never in a file; untick it to
+keep it in memory until the app quits. Without a usable OS store it stays in
+memory. A password no row could confirm (another connection to the same
+deployment answered instead) is forgotten after the run, so a wrong one isn't
+sent again. A BigFix SaaS password is kept in memory only: a saved SaaS
+session can answer without it, so success doesn't prove it. A SaaS account
+that asks for a TOTP code isn't prompted for one here yet.
+
+**Certificates.** TLS certificates are verified. A server with a certificate
+no CA vouches for (the usual self-signed root server) is **trusted only once
+you say so**: the run stops on a dialog showing its `host:port` and SHA-256
+fingerprint. Compare that with the server's own before clicking **Trust**.
+A trusted certificate is pinned in `~/.bigfix/.remote_session_known_certs.toml`,
+shared with the library's CLI, so one you already trusted there is trusted
+here too, and the reverse. **Don't trust** leaves it unpinned; that row is a
+`tls` error, and the next run asks again. If a pinned certificate later
+changes, that connection shows a `tls` error, doesn't fail over, and the app
+says the certificate changed: **Forget the old certificate** removes the pin
+(as the CLI's `--forget-cert <host:port>` does), and the next run asks about
+the new one as on first use. The same dialog covers Fast Query targets.
+
+### Fast Query
+
+**Fast Query** under **Add targets** sends the client relevance to BigFix
+agents through a REST API or BigFix SaaS connection from the same lookup: pick
+the connection (the first is picked for you) and give computer ids
+(`12, 34`), a computer query (session relevance such as
+`bes computers whose (name of it starts with "web")`), or both. Each computer
+that answers is a row of its own, so the count shows Fast Query as one system
+until they do. Fast Query hosts in the inventory (`transport = "fastquery"`)
+use the same connections, passwords and certificate dialog. **Breakdown**
+on a Fast Query target needs exactly one computer id (and no computer query),
+or its levels would mix answers from several computers.
 
 ## Inventory (shared with `bigfix-remote-client-relevance`)
 
@@ -231,7 +258,7 @@ targets**). The inventory is a checkbox table with each host's kind,
 platform and qna version(s); untick hosts to narrow a run, or use the header
 checkbox for all or none. **Unticking every host means all of them**, the
 same as the default (the table says `none selected: Evaluate runs on all`),
-unless you tick a Local, Container or SSH target, which then runs alone. From 9 hosts it gets a filter box. With many
+unless you tick a Local, Container, SSH or Fast Query target, which then runs alone. From 9 hosts it gets a filter box. With many
 container hosts, the first run against images that aren't cached yet is
 slow; **Max parallel** limits how many targets run at once.
 

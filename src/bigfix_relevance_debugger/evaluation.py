@@ -13,9 +13,19 @@ import dataclasses
 import functools
 import heapq
 import logging
+import re
 from collections import OrderedDict
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping, Sequence
-from contextlib import aclosing, asynccontextmanager
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
+from contextlib import aclosing, asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -26,6 +36,7 @@ from bigfix_remote_client_relevance import (
     SUPPORTED_ARCHS,
     ClientRelevanceResult,
     InventoryError,
+    SessionContext,
     Target,
     count_work,
     evaluate_client_relevance_stream,
@@ -40,14 +51,25 @@ from bigfix_remote_client_relevance.inventory import EmptyInventoryError
 from bigfix_remote_client_relevance.render import display_host
 from bigfix_remote_session_relevance import (
     AsyncSessionRelevanceClient,
+    CertInfo,
     Config,
     ConfigError,
+    SaasSessionPool,
+    SecretStore,
     SessionRelevanceResult,
     TrustStore,
 )
 
 from bigfix_relevance_debugger.analysis import AnalysisView, LevelView
-from bigfix_relevance_debugger.connections import ConnectionSource, LibraryConfig
+from bigfix_relevance_debugger.connections import (
+    FASTQUERY_BACKENDS,
+    AppConnections,
+    ConnectionsError,
+    ConnectionSource,
+    LibraryConfig,
+    SystemPasswords,
+    SystemSecrets,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,9 +119,26 @@ class TargetForm:
     inventory_selected: list[int] | None = field(default_factory=list)
     """Indexes into the loaded inventory's targets. None when the picker is cleared."""
 
+    fastquery: bool = False
+    fastquery_connection: str | None = None
+    """A REST or BigFix SaaS connection by name (:func:`fastquery_connections`)."""
+    fastquery_computers: str = ""
+    """BigFix computer ids, comma-separated."""
+    fastquery_query: str = ""
+    """Session relevance selecting computers, merged with the ids."""
+
 
 def _images(form: TargetForm) -> list[str]:
     return [i.strip() for i in form.container_images.split(",") if i.strip()]
+
+
+def _computer_ids(text: str) -> tuple[int, ...]:
+    ids = []
+    for part in text.replace(",", " ").split():
+        if not part.isdecimal():
+            raise TargetFormError(f"Fast Query computer ids are whole numbers, not {part!r}.")
+        ids.append(int(part))
+    return tuple(ids)
 
 
 def build_targets(
@@ -158,6 +197,24 @@ def build_targets(
             )
         )
 
+    if form.fastquery:
+        connection = (form.fastquery_connection or "").strip()
+        if not connection:
+            raise TargetFormError("Fast Query target needs a BigFix server connection.")
+        ids = _computer_ids(form.fastquery_computers)
+        query = form.fastquery_query.strip() or None
+        if not ids and not query:
+            raise TargetFormError("Fast Query target needs computer ids or a computer query.")
+        targets.append(
+            Target(
+                kind="fastquery",
+                name=connection,
+                connection=connection,
+                computer_ids=ids,
+                computer_query=query,
+            )
+        )
+
     targets.extend(inventory[i] for i in inventory_indexes(form, inventory))
 
     if not targets:
@@ -166,7 +223,7 @@ def build_targets(
 
 
 def _ticked(form: TargetForm) -> bool:
-    return form.local or form.container or form.ssh
+    return form.local or form.container or form.ssh or form.fastquery
 
 
 def inventory_indexes(form: TargetForm, inventory: Sequence[Target]) -> list[int]:
@@ -359,8 +416,7 @@ def waits_for_inventory(form: TargetForm, *, pending: bool) -> bool:
     nothing else is ticked (its hosts will be the default). A first-run
     Local/Container/SSH evaluation starts at once.
     """
-    explicit = form.local or form.container or form.ssh
-    return bool(form.inventory_selected) or (pending and not explicit)
+    return bool(form.inventory_selected) or (pending and not _ticked(form))
 
 
 @dataclass(frozen=True)
@@ -478,7 +534,8 @@ def preview_targets(
     from_inventory = len(inventory_indexes(form, inventory))
     explicit = targets[: len(targets) - from_inventory]
     sources = [("inventory", from_inventory)] + [
-        (kind, sum(1 for t in explicit if t.kind == kind)) for kind in ("local", "container", "ssh")
+        (kind, sum(1 for t in explicit if t.kind == kind))
+        for kind in ("local", "container", "ssh", "fastquery")
     ]
     return TargetPreview(
         systems=len(targets),
@@ -665,26 +722,235 @@ def session_config(config: Config, opts: EvalOptions) -> Config:
     )
 
 
+# --- the desktop's trust, passwords and SaaS sign-ins -------------------------------------
+
+TrustAsker = Callable[[CertInfo], Awaitable[bool]]
+
+_trust_asker: ContextVar[TrustAsker | None] = ContextVar("trust_asker", default=None)
+
+
+async def ask_trust(info: CertInfo) -> bool:
+    """The desktop ``TrustStore``'s callback: ask the page running this query.
+
+    The page sets its dialog with :func:`asking_trust` around its run; the
+    library calls this inside the run's tasks, which inherit it. With no page
+    to ask (a query nobody is watching), the certificate is refused.
+    """
+    asker = _trust_asker.get()
+    if asker is None:
+        logger.warning(
+            "refused the certificate %s presented (sha256 %s): no page to ask",
+            info.host_port,
+            info.sha256,
+        )
+        return False
+    return await asker(info)
+
+
+@contextmanager
+def asking_trust(asker: TrustAsker) -> Iterator[None]:
+    """Queries started inside the block ask ``asker`` about a certificate on first use."""
+    token = _trust_asker.set(asker)
+    try:
+        yield
+    finally:
+        _trust_asker.reset(token)
+
+
+_desktop_trust: TrustStore | None = None
+_desktop_connections: SystemPasswords | None = None
+_saas_pool: SaasSessionPool | None = None
+
+
+def desktop_trust() -> TrustStore:
+    """The process's trust store: pins shared with the library's CLI (``~/.bigfix``),
+    and a certificate no CA vouches for is pinned only once the page's dialog says so."""
+    global _desktop_trust
+    if _desktop_trust is None:
+        _desktop_trust = TrustStore(callback=ask_trust)
+    return _desktop_trust
+
+
+def desktop_connections() -> SystemPasswords:
+    """The process's connections: the library's lookup, with passwords from the OS store."""
+    global _desktop_connections
+    if _desktop_connections is None:
+        _desktop_connections = SystemPasswords(LibraryConfig(), SystemSecrets())
+    return _desktop_connections
+
+
+def _secrets_of(source: ConnectionSource) -> SecretStore | None:
+    if isinstance(source, SystemPasswords | AppConnections):
+        return source.secrets
+    return None
+
+
 def default_session_client(
     opts: EvalOptions, *, source: ConnectionSource | None = None, **client_kwargs: Any
 ) -> AsyncSessionRelevanceClient:
     """A client over ``source``'s connections. Raises ``ConfigError``.
 
-    ``source`` defaults to the library's own config lookup
-    (:class:`~bigfix_relevance_debugger.connections.LibraryConfig`); the
-    mobile app passes its ``AppConnections``.
+    ``source`` defaults to :func:`desktop_connections` (the library's own
+    config lookup, passwords from the OS store); the mobile app passes its
+    ``AppConnections``. Either one's secret store also keeps the library's
+    saved SaaS sessions.
 
-    Never prompts (a missing password is an ``authentication`` result) and
-    trusts a self-signed certificate on first use, pinning it and logging a
-    WARNING with its fingerprint; pins are shared with the library's CLI.
-    That is ``trust_on_first_use="auto"``, chosen explicitly: the library's
-    implicit default warns, and refuses from 2.0.
+    Never prompts (a missing password is an ``authentication`` result: the
+    page asks for it, :func:`password_request`). A certificate no CA vouches
+    for is trusted only if the page's dialog says so (:func:`desktop_trust`).
     """
     client_kwargs.setdefault("prompt", None)
     if "trust" not in client_kwargs:
-        client_kwargs["trust"] = TrustStore(trust_on_first_use="auto")
-    config = (source or LibraryConfig()).config()
+        client_kwargs["trust"] = desktop_trust()
+    source = source or desktop_connections()
+    secrets = _secrets_of(source)
+    if secrets is not None:
+        client_kwargs.setdefault("secrets", secrets)
+    config = source.config()
     return AsyncSessionRelevanceClient(session_config(config, opts), **client_kwargs)
+
+
+def is_changed_certificate(ev: SessionEvaluation) -> bool:
+    """A pinned server presented another certificate: possible interception."""
+    return ev.error_code == "pin_mismatch"
+
+
+def _connection(source: ConnectionSource, name: str):
+    try:
+        config = source.config()
+    except (ConfigError, ConnectionsError, OSError):
+        return None
+    return next((c for c in config.connections if c.name == name), None)
+
+
+_CHANGED_CERT = re.compile(r"certificate for (\S+) changed")
+
+
+def forget_changed_certificate(
+    connection: str,
+    *,
+    error: str | None = None,
+    source: ConnectionSource | None = None,
+    trust: TrustStore | None = None,
+    clients: SessionClients | None = None,
+) -> str | None:
+    """Forget the pin of ``connection``'s server, once the user has checked the
+    change out of band; the next run asks about the new certificate as on
+    first use. ``error`` is the row's message, which names the host:port the
+    backend pinned (BigFix SaaS pins its API host, not the configured server).
+    Returns the host:port forgotten, or None when nothing was pinned there."""
+    found = _CHANGED_CERT.search(error or "")
+    if found:
+        host_port = found.group(1)
+    else:
+        conn = _connection(source or desktop_connections(), connection)
+        if conn is None:
+            return None
+        host_port = conn.address.host_port
+    if not (trust or desktop_trust()).known.forget(host_port):
+        return None
+    (clients or session_clients()).reset()
+    return host_port
+
+
+@dataclass(frozen=True)
+class PasswordRequest:
+    """A connection whose password the page may ask for."""
+
+    connection: str
+    username: str
+    server: str
+    store: str | None
+    """Where a saved password goes, e.g. ``keychain``; None when it can't be
+    saved (BigFix SaaS: a saved session may answer without it)."""
+
+
+def password_request(
+    ev: SessionEvaluation, *, source: SystemPasswords | None = None
+) -> PasswordRequest | None:
+    """What to ask for after ``ev`` failed to sign in, if the app may supply the password."""
+    if ev.error_kind != "authentication" or ev.connection is None:
+        return None
+    if ev.error_code == "totp_required":
+        return None
+    source = source or desktop_connections()
+    conn = _connection(source.source, ev.connection)
+    if conn is None or not source.can_supply(conn):
+        return None
+    store = source.store_name if source.can_save(conn) else None
+    return PasswordRequest(conn.name, conn.username or "", conn.server, store)
+
+
+def provide_password(
+    connection: str,
+    password: str,
+    *,
+    save: bool,
+    source: SystemPasswords | None = None,
+    clients: SessionClients | None = None,
+) -> None:
+    """Use a typed password from the next run on; save it once the server accepts it."""
+    (source or desktop_connections()).provide(connection, password, save=save)
+    (clients or session_clients()).reset()
+
+
+def settle_password(ev: SessionEvaluation, *, source: SystemPasswords | None = None) -> str | None:
+    """After a session row: save a typed password that worked (returning the
+    store's name) or forget one the server refused."""
+    if ev.connection is None:
+        return None
+    if ev.ok:
+        accepted = True
+    elif ev.error_kind == "authentication":
+        accepted = False
+    else:
+        return None  # unreachable, a query error: says nothing about the password
+    # No desktop connections built yet: nothing was typed, and no need to ask the OS.
+    source = source or _desktop_connections
+    return None if source is None else source.settle(ev.connection, accepted=accepted)
+
+
+def forget_unconfirmed_passwords(*, source: SystemPasswords | None = None) -> None:
+    """After a run's session rows: a typed password no row judged is forgotten."""
+    source = source or _desktop_connections
+    if source is not None:
+        source.forget_unconfirmed()
+
+
+def fastquery_connections(source: ConnectionSource | None = None) -> list[str]:
+    """The connections Fast Query can use (REST and BigFix SaaS); none if the config is broken."""
+    try:
+        config = (source or desktop_connections()).config()
+    except (ConfigError, ConnectionsError, OSError):
+        return []
+    return [c.name for c in config.enabled_connections() if c.backend in FASTQUERY_BACKENDS]
+
+
+def fastquery_session(
+    source: ConnectionSource | None = None,
+    *,
+    trust: TrustStore | None = None,
+    saas_sessions: SaasSessionPool | None = None,
+    **context: Any,
+) -> SessionContext:
+    """How Fast Query targets reach their server: ``source``'s connections, the
+    desktop's trust and one SaaS sign-in pool for the process (it belongs to
+    the event loop, and the app has one). ``context`` passes through, e.g.
+    ``prompt`` and ``http_transport``. A broken config leaves the lookup to
+    the library, which reports it per target."""
+    global _saas_pool
+    try:
+        config: Config | None = (source or desktop_connections()).config()
+    except (ConfigError, ConnectionsError, OSError):
+        logger.debug("Fast Query connections could not be read", exc_info=True)
+        config = None
+    if saas_sessions is None:
+        if _saas_pool is None:
+            _saas_pool = SaasSessionPool()
+        saas_sessions = _saas_pool
+    return SessionContext(
+        config=config, trust=trust or desktop_trust(), saas_sessions=saas_sessions, **context
+    )
 
 
 SessionClientFactory = Callable[[EvalOptions], AsyncSessionRelevanceClient]
@@ -1441,6 +1707,9 @@ async def run_breakdown(
     """
     if not analysis.can_breakdown:
         raise ValueError(analysis.breakdown_disabled_reason or "cannot break down")
+    if target.kind == "fastquery" and (target.computer_query or len(target.computer_ids) != 1):
+        # Each probe would answer once per computer, and levels would mix them.
+        raise ValueError("Breakdown on a Fast Query target needs exactly one computer id.")
 
     # A host can list several qna versions, and its own list beats the
     # run-wide spec, so every probe would answer once per version. Pin the

@@ -89,7 +89,9 @@ def _no_real_session_relevance_client(tmp_path, monkeypatch):
     bigfix-remote-session-relevance reads connections from its TOML file,
     the ``BES_*`` env vars and ``~/.besapi.conf``, uses a root server's own
     credentials, writes discovered deployment ids back to its file and pins
-    certificates under ``~/.bigfix``. So HOME and every lookup point at
+    certificates under ``~/.bigfix``, and from 1.8.0 saves BigFix SaaS
+    sessions in the OS password store or a file (off here, as
+    ``BFRSR_SESSION_CACHE=0``). So HOME and every lookup point at
     ``tmp_path``, the default client factory refuses, and the process-wide
     clients are reset so a client one test built can't leak into the next.
     """
@@ -99,6 +101,8 @@ def _no_real_session_relevance_client(tmp_path, monkeypatch):
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setenv("BFRSR_CONFIG", str(tmp_path / "no-session-connections.toml"))
     monkeypatch.setenv("BFRSR_LOCAL_ROOT_SERVER", "0")
+    monkeypatch.setenv("BFRSR_SESSION_CACHE", "0")
+    monkeypatch.setenv("BFRSR_SAAS_SESSIONS", str(tmp_path / "no-saas-sessions.toml"))
     for name in ("BES_ROOT_SERVER", "BES_USER_NAME", "BES_PASSWORD"):
         monkeypatch.delenv(name, raising=False)
 
@@ -107,25 +111,30 @@ def _no_real_session_relevance_client(tmp_path, monkeypatch):
 
     monkeypatch.setattr(evaluation, "default_session_client", refuse)
     monkeypatch.setattr(evaluation, "_session_clients", None)
+    # The desktop's process-wide trust store, connections and SaaS pool too.
+    monkeypatch.setattr(evaluation, "_desktop_trust", None)
+    monkeypatch.setattr(evaluation, "_desktop_connections", None)
+    monkeypatch.setattr(evaluation, "_saas_pool", None)
 
 
 @pytest.fixture(autouse=True)
 def _no_real_secret_store(monkeypatch):
     """Fail loudly instead of reaching the OS password store (Keychain, keyring).
 
-    The bridge's process-wide default asks bigfix-remote-session-relevance's
-    ``default_secret_store()``; a test that builds it must fake that lookup.
+    ``connections.SystemSecrets`` (the bridge's and the desktop's process-wide
+    store) asks bigfix-remote-session-relevance's ``default_secret_store()``;
+    a test that builds one must fake ``connections.default_secret_store``.
     The library's own lookups (a ``password_store = "system"`` connection)
     are refused too. ``pytest.fail`` is not an ``Exception``, so the bridge's
     error envelope can't swallow it.
     """
     from bigfix_remote_session_relevance import secrets
 
-    from bigfix_relevance_debugger import bridge
+    from bigfix_relevance_debugger import connections
 
     def refuse():
         pytest.fail("a test reached the real OS password store")
 
-    monkeypatch.setattr(bridge, "default_secret_store", refuse)
+    monkeypatch.setattr(connections, "default_secret_store", refuse)
     monkeypatch.setattr(secrets, "default_secret_store", refuse)
     monkeypatch.setattr(secrets, "_probe_default_store", refuse)

@@ -49,17 +49,14 @@ from typing import Any
 
 import httpx
 from bigfix_relevance_analyzer import highlight
-from bigfix_remote_client_relevance import SessionContext
 from bigfix_remote_session_relevance import (
     AsyncSessionRelevanceClient,
     ConfigError,
     ConnectionConfig,
     KnownCerts,
-    MemorySecretStore,
     SaasSessionPool,
     SecretStore,
     TrustStore,
-    default_secret_store,
     saas_sign_in,
 )
 
@@ -70,6 +67,7 @@ from bigfix_relevance_debugger.connections import (
     AppConnections,
     Connection,
     ConnectionsError,
+    SystemSecrets,
     app_data_dir,
 )
 from bigfix_relevance_debugger.evaluation import (
@@ -80,6 +78,7 @@ from bigfix_relevance_debugger.evaluation import (
     SessionClients,
     SessionEvaluation,
     default_session_client,
+    fastquery_session,
     session_row_wanted,
     stream_results,
     stream_session,
@@ -519,11 +518,11 @@ class Bridge:
                 if not (auto_both and have_servers):
                     run.add(_no_fastquery_row())
                 return
-            context = SessionContext(
-                config=self.connections.config(),
+            context = fastquery_session(
+                self.connections,
                 trust=self.trust,
-                prompt=fastquery_prompt,
                 saas_sessions=self._pool(),
+                prompt=fastquery_prompt,
                 http_transport=self._transport_factory,
             )
             async for result in stream_results(text, targets, opts, session=context):
@@ -689,44 +688,6 @@ def _method(method: object) -> str:
 # --- the process's bridge ----------------------------------------------------------------
 
 
-class _SystemSecrets:
-    """The session library's ``default_secret_store()``, else memory.
-
-    The library answers None for a store it couldn't open *yet* (a keychain
-    locked at launch) and tries again on its next call, so this asks again on
-    every use until it gets one. New secrets then go to that store; one kept
-    in memory meanwhile is still found until it is deleted.
-    """
-
-    def __init__(self) -> None:
-        self._memory = MemorySecretStore()
-        self._store: SecretStore | None = None
-        self.name = self._memory.name
-        self._system()
-
-    def _system(self) -> SecretStore | None:
-        if self._store is None:
-            self._store = default_secret_store()
-            if self._store is not None:
-                self.name = self._store.name
-                logger.info("passwords are kept in %s", self.name)
-        return self._store
-
-    def get(self, account: str) -> str | None:
-        system = self._system()
-        found = system.get(account) if system is not None else None
-        return found if found is not None else self._memory.get(account)
-
-    def set(self, account: str, secret: str) -> None:
-        (self._system() or self._memory).set(account, secret)
-
-    def delete(self, account: str) -> None:
-        self._memory.delete(account)
-        system = self._system()
-        if system is not None:
-            system.delete(account)
-
-
 _default: Bridge | None = None
 _default_lock = threading.Lock()
 
@@ -746,7 +707,7 @@ def _bridge() -> Bridge:
             data_dir = app_data_dir()
             if sys.platform in ("ios", "android"):
                 os.environ.setdefault("BFRSR_HOME", str(data_dir / "session-relevance"))
-            _default = Bridge(data_dir=data_dir, secrets=_SystemSecrets())
+            _default = Bridge(data_dir=data_dir, secrets=SystemSecrets())
         return _default
 
 

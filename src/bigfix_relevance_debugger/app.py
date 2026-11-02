@@ -31,6 +31,7 @@ from bigfix_remote_client_relevance import (
     results_to_dicts,
 )
 from bigfix_remote_client_relevance.inventory_paths import user_inventory_path
+from bigfix_remote_session_relevance import CertInfo
 
 try:
     from nicegui import app as nicegui_app
@@ -54,6 +55,7 @@ from bigfix_relevance_debugger.analysis import (
     suggestion_fix,
     summarize,
 )
+from bigfix_relevance_debugger.connections import ConnectionsError
 from bigfix_relevance_debugger.editor import RelevanceEditor
 from bigfix_relevance_debugger.evaluation import (
     ARCHES,
@@ -65,20 +67,29 @@ from bigfix_relevance_debugger.evaluation import (
     InventoryLoad,
     LevelResult,
     NoTargetsError,
+    PasswordRequest,
     ResultRow,
     SessionEvaluation,
     TargetForm,
     TargetPreview,
+    asking_trust,
     breakdown_qna_note,
     build_targets,
     choose_breakdown_target,
     close_session_clients,
     expected_session_results,
+    fastquery_connections,
+    fastquery_session,
+    forget_changed_certificate,
+    forget_unconfirmed_passwords,
     inventory_table_row,
+    is_changed_certificate,
     load_inventory_targets,
     needs_discovery,
+    password_request,
     pick_label,
     preview_targets,
+    provide_password,
     resolve_container_arches,
     results_row_details,
     results_summary,
@@ -86,6 +97,7 @@ from bigfix_relevance_debugger.evaluation import (
     run_breakdown,
     session_result_to_dict,
     session_row_wanted,
+    settle_password,
     stream_results,
     stream_session,
     tally_table_row,
@@ -117,6 +129,12 @@ FILTER_DEBOUNCE_S = 0.2
 """Each filter change resends the results table, so wait for typing to pause."""
 ARCH_LOOKUP_DEBOUNCE_S = 0.5
 """The target count looks up an ``auto`` arch once typing in the image field pauses."""
+TRUST_DIALOG_TIMEOUT_S = 600.0
+"""A certificate nobody answers for is refused: the library holds other first uses meanwhile."""
+NO_FASTQUERY_CONNECTION = (
+    "No REST or BigFix SaaS connection is configured. Run "
+    "`uvx bigfix-remote-session-relevance --setup` to add one."
+)
 SIDE_PANEL_WIDTH = 460
 INVENTORY_FILTER_MIN = 9
 """Hosts it takes for the inventory table to get a filter box."""
@@ -557,6 +575,34 @@ async def root() -> None:
                     )
                 ssh_opts.bind_visibility_from(state.form, "ssh")
 
+                ui.checkbox("Fast Query (via a BigFix server)").bind_value(
+                    state.form, "fastquery"
+                ).mark("target-fastquery").on_value_change(lambda e: on_fastquery(bool(e.value)))
+                with ui.column().classes("pl-8 w-full gap-0") as fastquery_opts:
+                    fastquery_picker = (
+                        ui.select([], label="Connection")
+                        .bind_value(state.form, "fastquery_connection")
+                        .classes("w-full")
+                        .mark("fastquery-connection")
+                        .on_value_change(lambda _: refresh_targets())
+                    )
+                    fastquery_missing = (
+                        ui.label(NO_FASTQUERY_CONNECTION)
+                        .classes("text-caption text-warning")
+                        .mark("fastquery-missing")
+                    )
+                    ui.input("Computer ids, comma-separated").bind_value(
+                        state.form, "fastquery_computers"
+                    ).classes("w-full").mark("fastquery-computers").on_value_change(
+                        lambda _: refresh_targets()
+                    )
+                    ui.input("Computer query (session relevance)").bind_value(
+                        state.form, "fastquery_query"
+                    ).classes("w-full").mark("fastquery-query").on_value_change(
+                        lambda _: refresh_targets()
+                    )
+                fastquery_opts.bind_visibility_from(state.form, "fastquery")
+
             with ui.card().classes("w-full"):
                 ui.label("Options").classes("text-subtitle1")
                 ui.input("qna version (blank: latest)", placeholder="11.0.7.61").bind_value(
@@ -897,6 +943,172 @@ async def root() -> None:
             return None
         return targets, opts
 
+    # --- certificates, passwords and Fast Query ---------------------------------
+
+    def on_fastquery(ticked: bool) -> None:
+        """Ticked: list the connections Fast Query can use, picking the first for you."""
+        if ticked:
+            names = fastquery_connections()
+            current = state.form.fastquery_connection
+            fastquery_picker.set_options(
+                names, value=current if current in names else (names[0] if names else None)
+            )
+            fastquery_missing.set_visibility(not names)
+        refresh_targets()
+
+    async def ask_about_certificate(info: CertInfo) -> bool:
+        """The trust dialog: called by the library, inside this page's run, on a
+        certificate no CA vouches for. A security decision, so it asks."""
+        if client.is_deleted:
+            return False
+        with client, ui.dialog().props("persistent") as dialog, ui.card().classes("w-[36rem]"):
+            ui.label("Trust this server's certificate?").classes("text-h6")
+            ui.label(info.host_port).classes("text-subtitle1").mark("trust-host")
+            ui.label(
+                "No certificate authority vouches for it. Compare its SHA-256 fingerprint "
+                "with the server's own before trusting it: once trusted it is pinned, and "
+                "any other certificate from this server is refused."
+            ).classes("text-body2")
+            ui.label(f"SHA-256 {info.fingerprint}").classes("bfrd-mono text-caption").style(
+                "word-break: break-all"
+            ).mark("trust-fingerprint")
+            with ui.row().classes("w-full justify-end"):
+                ui.button("Don't trust", on_click=lambda: dialog.submit(False)).props("flat").mark(
+                    "trust-no"
+                )
+                ui.button("Trust", on_click=lambda: dialog.submit(True)).props(
+                    "color=negative"
+                ).mark("trust-yes")
+        dialog.open()
+        try:
+            trusted = bool(await asyncio.wait_for(dialog, TRUST_DIALOG_TIMEOUT_S))
+        except TimeoutError:
+            trusted = False
+        finally:
+            if not client.is_deleted:
+                dialog.delete()
+        activity.push(
+            f"{'trusted' if trusted else 'refused'} the certificate of {info.host_port} "
+            f"(sha256 {info.sha256})"
+        )
+        return trusted
+
+    def offer_to_forget_certificate(ev: SessionEvaluation) -> None:
+        """A pinned server presented another certificate: say so, and offer to forget the pin."""
+        name = ev.connection
+        if name is None:
+            return
+
+        def forget() -> None:
+            dialog.close()
+            host_port = forget_changed_certificate(name, error=ev.error)
+            if host_port is None:
+                ui.notify(
+                    f"No certificate is pinned for {name} any more; Evaluate again.",
+                    type="warning",
+                )
+                return
+            activity.push(f"forgot the certificate pinned for {host_port}")
+            ui.notify(
+                f"Forgot the certificate pinned for {host_port}. Evaluate again to check "
+                "the new one's fingerprint.",
+                type="info",
+                multi_line=True,
+            )
+
+        with ui.dialog() as dialog, ui.card().classes("w-[36rem]"):
+            ui.label(f"The certificate of {name} changed").classes("text-h6")
+            ui.label(ev.error or "").classes("text-body2 bfrd-mono").style("word-break: break-all")
+            ui.label(
+                "This can mean someone is intercepting the connection. Forget the old "
+                "certificate only if you know the server's certificate was replaced."
+            ).classes("text-body2")
+            with ui.row().classes("w-full justify-end"):
+                ui.button("Keep the old one", on_click=dialog.close).props("flat").mark("cert-keep")
+                ui.button("Forget the old certificate", on_click=forget).props(
+                    "color=negative"
+                ).mark("cert-forget")
+        dialog.open()
+
+    asking_password: set[str] = set()
+
+    def ask_for_password(request: PasswordRequest) -> None:
+        """A connection with no password of its own failed to sign in: ask for one."""
+        if request.connection in asking_password:
+            return
+        asking_password.add(request.connection)
+        save = {"value": request.store is not None}
+
+        def sign_in() -> None:
+            if not password.value:
+                return
+            try:
+                provide_password(request.connection, password.value, save=save["value"])
+            except ConnectionsError as exc:  # the config changed since
+                ui.notify(str(exc), type="warning")
+                return
+            finally:
+                password.value = ""
+            dialog.close()
+            activity.push(f"password typed for {request.connection}")
+            if state.running:
+                ui.notify("The next Evaluate signs in with it.", type="info")
+            else:
+                evaluate()
+
+        with ui.dialog() as dialog, ui.card().classes("w-96"):
+            ui.label(f"Sign in to {request.connection}").classes("text-h6")
+            ui.label(f"{request.username} on {request.server}").classes("text-caption")
+            password = (
+                ui.input("Password", password=True, password_toggle_button=True)
+                .classes("w-full")
+                .mark("password-input")
+                .on("keydown.enter", sign_in)
+            )
+            if request.store is not None:
+                ui.checkbox(f"Save in {request.store}", value=True).bind_value(save, "value").mark(
+                    "password-save"
+                )
+                ui.label("Saved only once the server accepts it; never in a file.").classes(
+                    "text-caption opacity-70"
+                )
+            else:
+                ui.label("Kept in memory until the app quits; never in a file.").classes(
+                    "text-caption opacity-70"
+                )
+            with ui.row().classes("w-full justify-end"):
+                ui.button("Cancel", on_click=dialog.close).props("flat")
+                ui.button("Sign in", on_click=sign_in).mark("password-sign-in")
+
+        def closed() -> None:
+            asking_password.discard(request.connection)
+            dialog.delete()  # the typed text goes with it
+
+        dialog.on("hide", closed)
+        dialog.open()
+
+    def after_session_row(ev: SessionEvaluation) -> None:
+        """Save a typed password that worked; offer what a failed sign-in or pin needs."""
+        saved = settle_password(ev)
+        if saved:
+            activity.push(f"password for {ev.connection} saved in {saved}")
+            ui.notify(f"Password for {ev.connection} saved in {saved}", type="positive")
+        if ev.ok:
+            return
+        if is_changed_certificate(ev):
+            offer_to_forget_certificate(ev)
+        elif ev.error_kind == "authentication":
+            request = password_request(ev)
+            if request is not None:
+                ask_for_password(request)
+
+    def run_kwargs(targets: list[Target]) -> dict[str, Any]:
+        """Fast Query targets reach their server through the desktop's connections,
+        trust and SaaS sign-ins; nothing else needs them."""
+        if any(t.kind == "fastquery" for t in targets):
+            return {"session": fastquery_session()}
+        return {}
+
     def in_page(work: Awaitable[T]) -> asyncio.Task[T]:
         """A task that can update this page: ``ui.notify`` and new elements need
         a slot, and NiceGUI keeps the slot stack per task, so a fresh task has
@@ -951,6 +1163,11 @@ async def root() -> None:
         session = SESSION in view.run_dialects
 
         async def job() -> None:
+            # Queries started below (and the tasks they start) ask this page's dialog.
+            with asking_trust(ask_about_certificate):
+                await run(client=client, session=session)
+
+        async def run(*, client: bool, session: bool) -> None:
             collected = await collect(client=client, session=session)
             if collected is None:
                 return
@@ -982,6 +1199,17 @@ async def root() -> None:
                 nonlocal done
                 done += 1
                 show_progress()
+
+            client_expected = total - session_expected
+            client_seen = 0
+
+            def client_arrived(row: ResultRow) -> None:
+                nonlocal total, client_seen
+                client_seen += 1
+                if client_seen > client_expected:
+                    # Fast Query yields a row per computer that answers, counted as one.
+                    total += 1
+                arrived(row)
 
             def arrived(row: ResultRow) -> None:
                 state.table_rows.append(results_table_row(len(state.rows), row))
@@ -1018,18 +1246,20 @@ async def root() -> None:
                     where = f"{ev.connection} ({ev.backend})" if ev.connection else ev.host
                     activity.push(f"session relevance on {where}: {outcome}")
                     arrived(ResultRow.from_session(ev))
+                    after_session_row(ev)
                 if seen < session_expected:
                     # Fewer: connections to one deployment counted once.
                     total -= session_expected - seen
                     show_progress()
+                forget_unconfirmed_passwords()
 
             # The BigFix servers answer alongside qna, so a slow one holds up nothing.
             session_task = in_page(run_session()) if session else None
             try:
                 if targets:
-                    async for result in stream_results(text, targets, opts):
+                    async for result in stream_results(text, targets, opts, **run_kwargs(targets)):
                         state.results.append(result)
-                        arrived(ResultRow.from_result(result))
+                        client_arrived(ResultRow.from_result(result))
                 if session_task is not None:
                     await session_task
             finally:
@@ -1139,6 +1369,10 @@ async def root() -> None:
             return
 
         async def job() -> None:
+            with asking_trust(ask_about_certificate):
+                await run()
+
+        async def run() -> None:
             collected = await collect()
             if collected is None:
                 return
@@ -1156,7 +1390,7 @@ async def root() -> None:
                 ui.label(f"Breakdown on {target.label} ...").classes("text-subtitle1")
                 ui.label(reason).classes("text-caption opacity-70").mark("breakdown-reason")
                 ui.spinner()
-            levels = await run_breakdown(view, target, opts)
+            levels = await run_breakdown(view, target, opts, **run_kwargs([target]))
             breakdown_box.clear()
             state.breakdown_text = view.text
             with breakdown_box:

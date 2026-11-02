@@ -3285,3 +3285,292 @@ async def test_answer_summary_is_rebuilt_only_when_it_changes(user, monkeypatch)
 
     await pick(user, "Linux Debian 11")  # the picked row's highlight changes
     assert len(calls) == 1
+
+
+# --- certificates, passwords and Fast Query (issue 41 §3) --------------------------------
+
+
+def a_cert(host_port="bf.example:52311"):
+    from bigfix_remote_session_relevance import CertInfo
+
+    return CertInfo(host_port=host_port, sha256="ab" * 32, pem="PEM")
+
+
+def asking_session(decisions: list[bool]):
+    """A stream_session that asks the trust callback, as the library does on first use."""
+
+    async def stream_session(text, opts, **upstream):
+        trusted = await evaluation.ask_trust(a_cert())
+        decisions.append(trusted)
+        if trusted:
+            yield SessionEvaluation(text, SERVER, answers=("1",), connection="prod")
+        else:
+            yield SessionEvaluation(
+                text, SERVER, error="certificate refused", error_kind="tls", connection="prod"
+            )
+
+    return stream_session
+
+
+async def clicked(user, marker: str, timeout: float = 2.0) -> None:
+    """Click ``marker`` once it appears (a dialog opens from a task)."""
+    for _ in range(int(timeout / 0.05)):
+        found = [e for e in user.client.elements.values() if marker in e._markers]
+        if found and found[0].visible:
+            user.find(marker=marker).click()
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"{marker} never appeared")
+
+
+async def test_a_first_use_certificate_asks_with_its_fingerprint(user, monkeypatch):
+    decisions: list[bool] = []
+    monkeypatch.setattr(app_module, "stream_session", asking_session(decisions))
+    await user.open("/")
+    await set_text(user, "number of bes computers")
+
+    user.find(marker="evaluate").click()
+
+    await clicked(user, "trust-yes")
+    await user.should_see("1 / 1")
+    assert decisions == [True]
+    await user.should_see("bf.example:52311")
+    [row] = results_table(user).rows
+    assert row["ok"] is True
+
+
+async def test_a_refused_certificate_is_not_trusted(user, monkeypatch):
+    decisions: list[bool] = []
+    monkeypatch.setattr(app_module, "stream_session", asking_session(decisions))
+    await user.open("/")
+    await set_text(user, "number of bes computers")
+
+    user.find(marker="evaluate").click()
+
+    await clicked(user, "trust-no")
+    await user.should_see("1 / 1")
+    assert decisions == [False]
+
+
+async def test_the_trust_dialog_shows_the_sha256_fingerprint(user, monkeypatch):
+    decisions: list[bool] = []
+    monkeypatch.setattr(app_module, "stream_session", asking_session(decisions))
+    await user.open("/")
+    await set_text(user, "number of bes computers")
+
+    user.find(marker="evaluate").click()
+
+    for _ in range(40):
+        if any("trust-fingerprint" in e._markers for e in user.client.elements.values()):
+            break
+        await asyncio.sleep(0.05)
+    [label] = [e for e in user.client.elements.values() if "trust-fingerprint" in e._markers]
+    assert a_cert().fingerprint in label.text
+    user.find(marker="trust-no").click()
+    await user.should_see("1 / 1")
+
+
+async def test_a_changed_certificate_offers_to_forget_the_old_one(user, monkeypatch):
+    forgot: list[str] = []
+    monkeypatch.setattr(
+        app_module,
+        "stream_session",
+        fake_session(
+            [],
+            "prod",
+            answers=(),
+            error="certificate for bf.example:52311 changed",
+            error_kind="tls",
+            error_code="pin_mismatch",
+        ),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "forget_changed_certificate",
+        lambda name, *, error: forgot.append(name) or "bf.example:52311",
+    )
+    await user.open("/")
+    await set_text(user, "number of bes computers")
+
+    user.find(marker="evaluate").click()
+
+    await clicked(user, "cert-forget")
+    assert forgot == ["prod"]
+    await notified(user, "bf.example:52311")
+
+
+def no_password_session(calls: list[str]):
+    return fake_session(
+        calls,
+        "prod",
+        answers=(),
+        error="no password available for 'api'",
+        error_kind="authentication",
+    )
+
+
+async def test_a_missing_password_is_asked_for_and_kept(user, monkeypatch):
+    calls: list[str] = []
+    provided: list[tuple] = []
+    monkeypatch.setattr(app_module, "stream_session", no_password_session(calls))
+    monkeypatch.setattr(
+        app_module,
+        "password_request",
+        lambda ev: evaluation.PasswordRequest("prod", "api", "bf.example", "keychain"),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "provide_password",
+        lambda name, password, *, save: provided.append((name, password, save)),
+    )
+    monkeypatch.setattr(app_module, "settle_password", lambda ev: None)
+    await user.open("/")
+    await set_text(user, "number of bes computers")
+
+    user.find(marker="evaluate").click()
+
+    for _ in range(40):
+        if any("password-input" in e._markers for e in user.client.elements.values()):
+            break
+        await asyncio.sleep(0.05)
+    await user.should_see("Save in keychain")
+    user.find(marker="password-input").type("s3cret")
+    user.find(marker="password-sign-in").click()
+    assert provided == [("prod", "s3cret", True)]
+    # It runs again with the password, rather than wait for another click.
+    for _ in range(40):
+        if len(calls) == 2:
+            break
+        await asyncio.sleep(0.05)
+    assert len(calls) == 2
+
+
+async def test_a_saved_password_is_reported(user, monkeypatch):
+    monkeypatch.setattr(app_module, "stream_session", fake_session([], "prod"))
+    monkeypatch.setattr(app_module, "settle_password", lambda ev: "keychain")
+    await user.open("/")
+    await set_text(user, "number of bes computers")
+
+    user.find(marker="evaluate").click()
+
+    await notified(user, "saved in keychain")
+
+
+async def test_fast_query_targets_from_a_configured_connection(user, monkeypatch):
+    streamed: list[tuple[list[Target], dict]] = []
+
+    async def fake_stream(text, targets, opts, **upstream):
+        streamed.append((targets, upstream))
+        yield result("web", ["Linux"])
+
+    monkeypatch.setattr(app_module, "stream_results", fake_stream)
+    monkeypatch.setattr(app_module, "fastquery_connections", lambda: ["lab", "cloud"])
+    context = object()
+    monkeypatch.setattr(app_module, "fastquery_session", lambda: context)
+    await user.open("/")
+    await set_text(user, "name of operating system")
+
+    user.find(marker="target-fastquery").click()
+    # The first connection is picked for you; computers are yours to name.
+    [picker] = user.find(marker="fastquery-connection").elements
+    assert picker.value == "lab"
+    assert list(picker.options) == ["lab", "cloud"]
+    user.find(marker="fastquery-computers").type("12, 34")
+    user.find(marker="evaluate").click()
+
+    await user.should_see("1 / 1")
+    [(targets, upstream)] = streamed
+    assert targets == [
+        Target(kind="fastquery", name="lab", connection="lab", computer_ids=(12, 34))
+    ]
+    assert upstream == {"session": context}
+
+
+async def test_fast_query_without_a_connection_says_how_to_add_one(user, monkeypatch):
+    monkeypatch.setattr(app_module, "fastquery_connections", list)
+    await user.open("/")
+
+    user.find(marker="target-fastquery").click()
+
+    await user.should_see("--setup")
+
+
+async def test_runs_without_fast_query_pass_no_session_context(user, monkeypatch):
+    streamed: list[dict] = []
+
+    async def fake_stream(text, targets, opts, **upstream):
+        streamed.append(upstream)
+        yield result("local", ["a"])
+
+    def refuse():
+        raise AssertionError("no Fast Query target: no SessionContext needed")
+
+    monkeypatch.setattr(app_module, "stream_results", fake_stream)
+    monkeypatch.setattr(app_module, "fastquery_session", refuse)
+    await user.open("/")
+    await set_text(user, "name of operating system")
+    user.find(marker="target-local").click()
+
+    user.find(marker="evaluate").click()
+
+    await user.should_see("1 / 1")
+    assert streamed == [{}]
+
+
+async def test_fast_query_rows_beyond_the_count_grow_the_total_not_eat_the_session_slots(
+    user, monkeypatch
+):
+    gate = asyncio.Event()
+
+    async def session(text, opts, **upstream):
+        await gate.wait()
+        yield SessionEvaluation(text, SERVER, answers=("1",), connection="prod")
+
+    async def fast_query(text, targets, opts, **upstream):
+        for host in ("a", "b", "c"):
+            yield result(host, ["Linux"])
+
+    monkeypatch.setattr(app_module, "stream_session", session)
+    monkeypatch.setattr(app_module, "stream_results", fast_query)
+    monkeypatch.setattr(app_module, "fastquery_connections", lambda: ["lab"])
+    monkeypatch.setattr(app_module, "fastquery_session", object)
+    await user.open("/")
+    await set_text(user, "now")
+    user.find(marker="target-fastquery").click()
+    user.find(marker="fastquery-computers").type("1")
+
+    user.find(marker="evaluate").click()
+
+    # Three Fast Query rows of one counted, and the session row still to come.
+    await user.should_see("3 / 4")
+    gate.set()
+    await user.should_see("4 / 4")
+
+
+async def test_a_saas_password_is_kept_in_memory_with_no_save_box(user, monkeypatch):
+    provided: list[tuple] = []
+    monkeypatch.setattr(app_module, "stream_session", no_password_session([]))
+    monkeypatch.setattr(
+        app_module,
+        "password_request",
+        lambda ev: evaluation.PasswordRequest("prod", "e", "login.bigfix.com", None),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "provide_password",
+        lambda name, password, *, save: provided.append((name, password, save)),
+    )
+    await user.open("/")
+    await set_text(user, "number of bes computers")
+
+    user.find(marker="evaluate").click()
+
+    for _ in range(40):
+        if any("password-input" in e._markers for e in user.client.elements.values()):
+            break
+        await asyncio.sleep(0.05)
+    await user.should_see("Kept in memory")
+    assert not any("password-save" in e._markers for e in user.client.elements.values())
+    user.find(marker="password-input").type("s3cret")
+    user.find(marker="password-sign-in").click()
+    assert provided == [("prod", "s3cret", False)]
