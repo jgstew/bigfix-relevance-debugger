@@ -22,10 +22,10 @@ from typing import Any
 
 import httpx
 import pytest
+from bigfix_remote_session_relevance import MemorySecretStore
 
 from bigfix_relevance_debugger import bridge
 from bigfix_relevance_debugger.bridge import BRIDGE_VERSION, METHODS, Bridge
-from bigfix_relevance_debugger.upstream.remote_session_relevance import MemorySecretStore
 
 SESSION_FIXTURES = Path(__file__).parent / "fixtures" / "session_rest"
 DEPLOYMENT_QUERY = "sha256 of gather url of bes license"
@@ -253,6 +253,68 @@ def test_module_call_uses_one_shared_bridge(monkeypatch, make_bridge):
     monkeypatch.setattr(bridge, "_default", shared)
 
     assert json.loads(bridge.call("info", "{}"))["result"]["data_dir"] == str(shared.data_dir)
+
+
+@pytest.fixture
+def default_bridge(tmp_path, monkeypatch):
+    """Build the process's bridge for real, in ``tmp_path``; the test fakes its secret store."""
+    monkeypatch.setattr(bridge, "_default", None)
+    monkeypatch.setattr(bridge, "app_data_dir", lambda: tmp_path / "app")
+    yield
+    if bridge._default is not None:
+        bridge._default.close()
+
+
+class OsStore(MemorySecretStore):
+    """Stands in for the Keychain."""
+
+    name = "keychain"
+
+
+def test_the_process_bridge_keeps_secrets_in_the_os_store(monkeypatch, default_bridge):
+    """The library's ``default_secret_store()``: the Keychain on iOS and macOS."""
+    os_store = OsStore()
+    monkeypatch.setattr(bridge, "default_secret_store", lambda: os_store)
+
+    secrets = bridge._bridge().secrets
+    secrets.set("a", "pw")
+
+    assert secrets.name == "keychain"
+    assert os_store.get("a") == "pw"
+    assert ok(bridge._bridge(), "info")["secrets"] == "keychain"
+
+
+def test_the_process_bridge_keeps_secrets_in_memory_without_an_os_store(
+    monkeypatch, default_bridge
+):
+    """Android, or a desktop with no usable keyring: the library finds no store."""
+    monkeypatch.setattr(bridge, "default_secret_store", lambda: None)
+
+    secrets = bridge._bridge().secrets
+    secrets.set("a", "pw")
+
+    assert secrets.name == "memory"
+    assert secrets.get("a") == "pw"
+
+
+def test_the_process_bridge_picks_up_an_os_store_that_appears_later(monkeypatch, default_bridge):
+    """A keychain locked at launch: the library finds none, then finds it on a later
+    call. New secrets go to it; one kept in memory meanwhile is still found."""
+    found: list[OsStore] = []
+    monkeypatch.setattr(bridge, "default_secret_store", lambda: found[0] if found else None)
+    secrets = bridge._bridge().secrets
+    secrets.set("early", "pw")
+
+    os_store = OsStore()
+    found.append(os_store)
+    secrets.set("late", "pw2")
+
+    assert secrets.name == "keychain"
+    assert os_store.get("late") == "pw2"
+    assert os_store.get("early") is None
+    assert secrets.get("early") == "pw"
+    secrets.delete("early")
+    assert secrets.get("early") is None
 
 
 # --- info, analyze --------------------------------------------------------------------

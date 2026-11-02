@@ -2007,9 +2007,9 @@ async def test_fast_query_targets_from_app_connections_run_through_a_session_con
     import bigfix_remote_session_relevance
     from bigfix_remote_client_relevance import SessionContext
     from bigfix_remote_client_relevance.transports import fastquery
+    from bigfix_remote_session_relevance import MemorySecretStore
 
     from bigfix_relevance_debugger.connections import AppConnections, Connection
-    from bigfix_relevance_debugger.upstream.remote_session_relevance import MemorySecretStore
 
     monkeypatch.setattr(fastquery, "POLL_FIRST_S", 0.0)
 

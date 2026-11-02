@@ -8,7 +8,12 @@ import stat
 import sys
 
 import pytest
-from bigfix_remote_session_relevance import Config, ConnectionConfig
+from bigfix_remote_session_relevance import (
+    Config,
+    ConnectionConfig,
+    MemorySecretStore,
+    secret_account,
+)
 
 from bigfix_relevance_debugger import connections
 from bigfix_relevance_debugger.connections import (
@@ -19,10 +24,6 @@ from bigfix_relevance_debugger.connections import (
     ConnectionSource,
     LibraryConfig,
     app_data_dir,
-)
-from bigfix_relevance_debugger.upstream.remote_session_relevance import (
-    MemorySecretStore,
-    secret_account,
 )
 
 SAAS = Connection(name="saas", backend="saas", server="login.bigfix.com", username="me@x.com")
@@ -332,3 +333,54 @@ def test_a_new_http_connection_does_not_inherit_an_https_password(tmp_path):
 def test_from_dict_rejects_a_server_the_library_cannot_use(server):
     with pytest.raises(ConnectionsError):
         Connection.from_dict({"name": "n", "backend": "rest", "server": server})
+
+
+# --- secret keys: the library's secret_account, unchanged from 0.7.0's copy ---------------
+# A changed key would lose every saved password, so these pin it.
+
+
+def test_secret_account_is_backend_server_and_username_not_the_name():
+    a = ConnectionConfig(name="a", backend="rest", server="bf.example.com", username="Admin")
+    renamed = ConnectionConfig(name="b", backend="rest", server="bf.example.com", username="admin")
+
+    assert secret_account(a) == secret_account(renamed) == "rest:bf.example.com:52311:admin"
+
+
+def test_secret_account_tells_servers_and_users_apart():
+    base = ConnectionConfig(name="a", backend="rest", server="bf.example.com", username="u")
+    accounts = {
+        secret_account(base),
+        secret_account(
+            ConnectionConfig(name="a", backend="rest", server="x.example", username="u")
+        ),
+        secret_account(
+            ConnectionConfig(name="a", backend="rest", server="bf.example.com", username="v")
+        ),
+        secret_account(
+            ConnectionConfig(name="a", backend="webreports", server="bf.example.com", username="u")
+        ),
+    }
+
+    assert len(accounts) == 4
+
+
+def test_secret_account_prefixes_a_scheme_that_is_not_https():
+    """As in the library's 1.7.0 (commit b35f716): an https password is never
+    found, and sent as cleartext Basic auth, for the same server over http."""
+    https = ConnectionConfig(name="a", backend="rest", server="https://bf:52311", username="u")
+    http = ConnectionConfig(name="a", backend="rest", server="http://bf:52311", username="u")
+
+    assert secret_account(https) == "rest:bf:52311:u"
+    assert secret_account(http) == "http+rest:bf:52311:u"
+
+
+def test_secret_account_uses_the_normalized_server():
+    """Host lowercased, the default port filled in and a trailing /api dropped."""
+    servers = ["bf.example.com", "https://BF.Example.com", "https://bf.example.com:52311/api"]
+
+    accounts = {
+        secret_account(ConnectionConfig(name="a", backend="rest", server=s, username="u"))
+        for s in servers
+    }
+
+    assert accounts == {"rest:bf.example.com:52311:u"}

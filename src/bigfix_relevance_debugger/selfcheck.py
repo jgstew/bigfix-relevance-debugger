@@ -17,11 +17,15 @@ from pathlib import Path
 from typing import Any
 
 from bigfix_relevance_analyzer import highlight
-from bigfix_remote_session_relevance import AsyncSessionRelevanceClient, Config, TrustStore
+from bigfix_remote_session_relevance import (
+    AsyncSessionRelevanceClient,
+    Config,
+    SecretStore,
+    TrustStore,
+)
 
 from bigfix_relevance_debugger.analysis import summarize
 from bigfix_relevance_debugger.evaluation import EvalOptions, SessionClients, stream_session
-from bigfix_relevance_debugger.upstream.remote_session_relevance import SecretStore
 
 PASS, FAIL, SKIP = "PASS", "FAIL", "SKIP"
 TLS_HOST = "login.bigfix.com"
